@@ -1,0 +1,28 @@
+# 動的な値を含むURIを安定したroute名へ正規化します。
+[[routes]]
+pattern = "^/(etag|base|dynamic|fallback-users)/[^/]+$"
+replace = "/$1/:key"
+
+[[routes]]
+pattern = "^/api/user/[^/]+/icon$"
+replace = "/api/user/:name/icon"
+
+[[routes]]
+pattern = "^/api/user/[^/]+/(livestream|livestreams|statistics|theme)$"
+replace = "/api/user/:name/$1"
+
+[[routes]]
+pattern = "^/api/user/[^/]+$"
+replace = "/api/user/:name"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+$"
+replace = "/api/livestream/:id"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/(livecomment|reaction|enter|exit|statistics|report|moderate|ngwords)$"
+replace = "/api/livestream/:id/$1"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/livecomment/[0-9]+/report$"
+replace = "/api/livestream/:id/livecomment/:comment_id/report"

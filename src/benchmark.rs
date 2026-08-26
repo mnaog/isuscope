@@ -1,0 +1,367 @@
+use crate::{
+    config::{BenchmarkConfig, BenchmarkMode, LoadedConfig},
+    model::{BenchmarkResult, LogRef},
+    process,
+    shutdown::Shutdown,
+};
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use regex::Regex;
+use serde_json::Value;
+use std::{
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{Arc, Mutex},
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+};
+
+pub struct BenchmarkExecution {
+    pub result: BenchmarkResult,
+    pub logs: Vec<LogRef>,
+}
+
+#[derive(Default)]
+struct Observation {
+    score: Option<i64>,
+    passed: Option<bool>,
+    messages: Vec<String>,
+    initialize_started_at: Option<chrono::DateTime<Utc>>,
+    initialize_finished_at: Option<chrono::DateTime<Utc>>,
+}
+
+pub async fn execute(
+    config: &LoadedConfig,
+    run_dir: &Path,
+    shutdown: Shutdown,
+) -> BenchmarkExecution {
+    match config.config.benchmark.mode {
+        BenchmarkMode::Command => match execute_command(config, run_dir, shutdown).await {
+            Ok(execution) => execution,
+            Err(error) => BenchmarkExecution {
+                result: BenchmarkResult {
+                    mode: "command".into(),
+                    command: config.config.benchmark.command.clone(),
+                    passed: Some(false),
+                    error: Some(format!("{error:#}")),
+                    ..Default::default()
+                },
+                logs: Vec::new(),
+            },
+        },
+        BenchmarkMode::External => match execute_external(&config.config.benchmark).await {
+            Ok(result) => BenchmarkExecution {
+                result,
+                logs: Vec::new(),
+            },
+            Err(error) => BenchmarkExecution {
+                result: BenchmarkResult {
+                    mode: "external".into(),
+                    passed: Some(false),
+                    error: Some(format!("{error:#}")),
+                    ..Default::default()
+                },
+                logs: Vec::new(),
+            },
+        },
+    }
+}
+
+async fn execute_command(
+    config: &LoadedConfig,
+    run_dir: &Path,
+    mut shutdown: Shutdown,
+) -> Result<BenchmarkExecution> {
+    let benchmark = &config.config.benchmark;
+    let (program, args) = benchmark
+        .command
+        .split_first()
+        .context("benchmark.command must not be empty in command mode")?;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(config.benchmark_working_dir())
+        .envs(&benchmark.env)
+        .env("ISUSCOPE_BENCHMARK_PROTOCOL", "v1")
+        .env("ISUSCOPE_PROJECT_ROOT", &config.project_root)
+        .env("ISUSCOPE_RUN_DIR", run_dir)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    process::configure_group(&mut command);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "cannot start benchmark command `{}`",
+            benchmark.command.join(" ")
+        )
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("benchmark stdout was not captured")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("benchmark stderr was not captured")?;
+    let score_pattern = Regex::new(&benchmark.score_pattern)
+        .context("benchmark.score_pattern is not a valid regular expression")?;
+    let observation = Arc::new(Mutex::new(Observation::default()));
+    let stdout_raw = run_dir.join("tmp/benchmark-stdout.log");
+    let stderr_raw = run_dir.join("tmp/benchmark-stderr.log");
+    let stdout_task = tokio::spawn(capture_lines(
+        stdout,
+        stdout_raw.clone(),
+        false,
+        observation.clone(),
+        score_pattern.clone(),
+        benchmark.clone(),
+    ));
+    let stderr_task = tokio::spawn(capture_lines(
+        stderr,
+        stderr_raw.clone(),
+        true,
+        observation.clone(),
+        score_pattern,
+        benchmark.clone(),
+    ));
+    let (status, interrupted) = tokio::select! {
+        status = child.wait() => {
+            (status.context("cannot wait for benchmark process")?, false)
+        }
+        _ = shutdown.cancelled() => {
+            let status = process::terminate_group(&mut child)
+                .await
+                .context("cannot terminate interrupted benchmark process group")?;
+            (status, true)
+        }
+    };
+    stdout_task.await.context("stdout capture task failed")??;
+    stderr_task.await.context("stderr capture task failed")??;
+
+    let mut logs = Vec::new();
+    compress_log(&stdout_raw, &run_dir.join("logs/benchmark-stdout.zst"))?;
+    logs.push(LogRef {
+        id: "benchmark-stdout".into(),
+        kind: "benchmark-stdout".into(),
+        node: None,
+    });
+    compress_log(&stderr_raw, &run_dir.join("logs/benchmark-stderr.zst"))?;
+    logs.push(LogRef {
+        id: "benchmark-stderr".into(),
+        kind: "benchmark-stderr".into(),
+        node: None,
+    });
+
+    let observation = Arc::try_unwrap(observation)
+        .map_err(|_| anyhow::anyhow!("benchmark observation is still shared"))?
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("benchmark observation lock is poisoned"))?;
+    let passed = if interrupted || !status.success() {
+        Some(false)
+    } else {
+        observation
+            .passed
+            .or(Some(status.success() && observation.score.is_some()))
+    };
+    Ok(BenchmarkExecution {
+        result: BenchmarkResult {
+            mode: "command".into(),
+            command: benchmark.command.clone(),
+            exit_code: status.code(),
+            score: observation.score,
+            passed,
+            interrupted,
+            messages: observation.messages,
+            initialize_started_at: observation.initialize_started_at,
+            initialize_finished_at: observation.initialize_finished_at,
+            error: if interrupted {
+                Some("interrupted by signal".into())
+            } else if !status.success() {
+                Some(format!("benchmark command exited with {status}"))
+            } else {
+                None
+            },
+        },
+        logs,
+    })
+}
+
+async fn capture_lines<R>(
+    reader: R,
+    path: PathBuf,
+    stderr: bool,
+    observation: Arc<Mutex<Observation>>,
+    score_pattern: Regex,
+    config: BenchmarkConfig,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut file = tokio::fs::File::create(path).await?;
+    while let Some(line) = lines.next_line().await? {
+        file.write_all(line.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        if config.stream_output {
+            if stderr {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        }
+        observe_line(&line, &score_pattern, &config, &observation);
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+fn observe_line(
+    line: &str,
+    score_pattern: &Regex,
+    config: &BenchmarkConfig,
+    observation: &Arc<Mutex<Observation>>,
+) {
+    let mut observation = match observation.lock() {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    if observation.initialize_started_at.is_none() && line.contains(&config.initialize_start_marker)
+    {
+        observation.initialize_started_at = Some(Utc::now());
+    }
+    if observation.initialize_started_at.is_some()
+        && observation.initialize_finished_at.is_none()
+        && line.contains(&config.initialize_finish_marker)
+    {
+        observation.initialize_finished_at = Some(Utc::now());
+    }
+    if let Some(captures) = score_pattern.captures(line)
+        && let Some(value) = captures
+            .get(1)
+            .and_then(|capture| capture.as_str().parse().ok())
+    {
+        observation.score = Some(value);
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(line) {
+        if value.get("type").and_then(Value::as_str) == Some("isuscope.event") {
+            match value.get("name").and_then(Value::as_str) {
+                Some("initialize-started") if observation.initialize_started_at.is_none() => {
+                    observation.initialize_started_at = Some(Utc::now());
+                }
+                Some("initialize-finished")
+                    if observation.initialize_started_at.is_some()
+                        && observation.initialize_finished_at.is_none() =>
+                {
+                    observation.initialize_finished_at = Some(Utc::now());
+                }
+                _ => {}
+            }
+        }
+        if let Some(score) = value.get("score").and_then(Value::as_i64) {
+            observation.score = Some(score);
+        }
+        if let Some(passed) = value.get("pass").and_then(Value::as_bool) {
+            observation.passed = Some(passed);
+        }
+        if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+            observation.messages.extend(
+                messages
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned),
+            );
+        }
+    }
+}
+
+async fn execute_external(_config: &BenchmarkConfig) -> Result<BenchmarkResult> {
+    println!("collectors armed; start the benchmark from the contest portal");
+    prompt("Press Enter after the benchmark has finished: ")?;
+    let score = prompt("Score (empty if unavailable): ")?;
+    let score = if score.trim().is_empty() {
+        None
+    } else {
+        Some(score.trim().parse().context("score must be an integer")?)
+    };
+    let result = prompt("Result [pass/fail]: ")?;
+    let passed = match result.trim().to_ascii_lowercase().as_str() {
+        "pass" | "p" => Some(true),
+        "fail" | "f" => Some(false),
+        _ => bail!("result must be `pass` or `fail`"),
+    };
+    Ok(BenchmarkResult {
+        mode: "external".into(),
+        score,
+        passed,
+        ..Default::default()
+    })
+}
+
+fn prompt(message: &str) -> Result<String> {
+    print!("{message}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input)
+}
+
+pub fn compress_log(source: &Path, destination: &Path) -> Result<()> {
+    let mut input = fs::File::open(source)?;
+    let output = fs::File::create(destination)?;
+    zstd::stream::copy_encode(&mut input, output, 3)?;
+    fs::remove_file(source)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> BenchmarkConfig {
+        BenchmarkConfig {
+            mode: BenchmarkMode::Command,
+            command: vec![],
+            working_dir: None,
+            env: Default::default(),
+            stream_output: false,
+            score_pattern: r"スコア:\s*([0-9]+)".into(),
+            initialize_start_marker: "初期化を行います".into(),
+            initialize_finish_marker: "整合性チェック".into(),
+        }
+    }
+
+    #[test]
+    fn parses_japanese_score_and_failure_json() {
+        let observation = Arc::new(Mutex::new(Observation::default()));
+        let regex = Regex::new(&config().score_pattern).unwrap();
+        observe_line("スコア: 954885", &regex, &config(), &observation);
+        observe_line(
+            r#"{"type":"isuscope.event","name":"initialize-started"}"#,
+            &regex,
+            &config(),
+            &observation,
+        );
+        observe_line(
+            r#"{"type":"isuscope.event","name":"initialize-finished"}"#,
+            &regex,
+            &config(),
+            &observation,
+        );
+        observe_line(
+            r#"{"pass":false,"score":0,"messages":["initialize failed"]}"#,
+            &regex,
+            &config(),
+            &observation,
+        );
+        let value = observation.lock().unwrap();
+        assert_eq!(value.score, Some(0));
+        assert_eq!(value.passed, Some(false));
+        assert_eq!(value.messages, vec!["initialize failed"]);
+        assert!(value.initialize_started_at.is_some());
+        assert!(value.initialize_finished_at.is_some());
+    }
+}

@@ -1,0 +1,115 @@
+# このファイルを<ISUCONプロジェクト>/.isuscope/config.tomlへコピーします。
+data_dir = ".isuscope"
+
+[source]
+repo = "."
+# Git管理外の大きな計測データなどをsource tree digestから除外します。
+exclude = [".pprotein"]
+
+[benchmark]
+mode = "command"
+command = [
+  "/home/isucon/bench",
+  "run",
+  "--target", "https://pipe.u.isucon.local",
+]
+# ベンチ出力は圧縮ログへ保存されます。端末にも表示したい場合だけtrueにします。
+# stream_output = true
+# 省略可能です。デフォルトはプロジェクトルートです。
+# working_dir = "."
+
+[ssh]
+user = "ubuntu"
+identity_file = "/path/to/key.pem"
+connect_timeout_seconds = 5
+
+[[nodes]]
+name = "isu1"
+host = "192.0.2.1"
+roles = ["edge", "dns"]
+
+[[nodes]]
+name = "isu2"
+host = "192.0.2.2"
+roles = ["app", "db"]
+
+[[nodes]]
+name = "isu3"
+host = "192.0.2.3"
+roles = ["edge"]
+
+# 両方のrunで使う低負荷collectorです。ベンチ中には常駐せず、前後の
+# /proc/stat差分からCPU、終了時の/proc/meminfoからmemoryを記録します。
+[[collectors]]
+name = "system-resource-mark"
+phase = "before"
+transport = "ssh"
+roles = ["app"]
+modes = ["run", "discovery-run"]
+command = [
+  "sh", "-c",
+  "awk '/^cpu / { idle=$5+$6; total=0; for (i=2; i<=NF; i++) total+=$i; print total, idle }' /proc/stat > /tmp/isuscope-{run_id}.system",
+]
+timeout_seconds = 10
+max_output_bytes = 1048576
+
+[[collectors]]
+name = "system-resource-read"
+phase = "after"
+transport = "ssh"
+roles = ["app"]
+modes = ["run", "discovery-run"]
+command = [
+  "sh", "-c",
+  "set -eu; read before_total before_idle < /tmp/isuscope-{run_id}.system; set -- $(awk '/^cpu / { idle=$5+$6; total=0; for (i=2; i<=NF; i++) total+=$i; print total, idle }' /proc/stat); after_total=$1; after_idle=$2; cpu=$(awk -v bt=$before_total -v bi=$before_idle -v at=$after_total -v ai=$after_idle 'BEGIN { dt=at-bt; if (dt<=0) print 0; else printf \"%.6f\", 100*(dt-(ai-bi))/dt }'); memory=$(awk '/MemTotal:/ { total=$2 } /MemAvailable:/ { available=$2 } END { printf \"%.0f\", (total-available)*1024 }' /proc/meminfo); printf '{\"type\":\"metric\",\"name\":\"host.cpu_percent\",\"value\":%s,\"unit\":\"percent\"}\\n' \"$cpu\"; printf '{\"type\":\"metric\",\"name\":\"host.memory_used_bytes\",\"value\":%s,\"unit\":\"bytes\"}\\n' \"$memory\"; rm -f /tmp/isuscope-{run_id}.system",
+]
+timeout_seconds = 10
+max_output_bytes = 1048576
+
+# discovery-run開始前にaccess logのinodeとbyte offsetだけを記録します。
+[[collectors]]
+name = "nginx-access-mark"
+phase = "before"
+transport = "ssh"
+roles = ["edge"]
+modes = ["discovery-run"]
+command = [
+  "sudo", "sh", "-c",
+  "stat -c '%i %s' /var/log/nginx/access.log > /tmp/isuscope-{run_id}.offset",
+]
+timeout_seconds = 10
+max_output_bytes = 1048576
+required = true
+
+# ベンチ終了後に増えた部分だけを回収します。ベンチ中にSSH転送しないため、
+# 暗号化・network帯域がスコアへ影響するのを避けられます。
+[[collectors]]
+name = "nginx-access-read"
+phase = "after"
+transport = "ssh"
+roles = ["edge"]
+modes = ["discovery-run"]
+command = [
+  "sudo", "sh", "-c",
+  "set -eu; read inode offset < /tmp/isuscope-{run_id}.offset; current=$(stat -c %i /var/log/nginx/access.log); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset + 1)) /var/log/nginx/access.log; elif [ -f /var/log/nginx/access.log.1 ] && [ \"$inode\" = \"$(stat -c %i /var/log/nginx/access.log.1)\" ]; then tail -c +$((offset + 1)) /var/log/nginx/access.log.1; cat /var/log/nginx/access.log; else echo 'access log rotated and original inode was not found' >&2; exit 1; fi; rm -f /tmp/isuscope-{run_id}.offset",
+]
+timeout_seconds = 90
+max_output_bytes = 1073741824
+
+# すべての差分ログを回収した後、匿名viewer単位の遷移を計算します。
+# 先にexamples/routes-isupipe.tomlを.isuscope/routes.tomlへコピーしてください。
+[[collectors]]
+name = "user-transition"
+phase = "after"
+transport = "local"
+modes = ["discovery-run"]
+command = [
+  "isuscope", "__transition",
+  "--run-dir", "{run_dir}",
+  "--prefix", "nginx-access-read-",
+  "--rules", ".isuscope/routes.toml",
+  "--time-field", "ts",
+  "--session-field", "viewer",
+]
+timeout_seconds = 30
+max_output_bytes = 104857600

@@ -1,0 +1,23 @@
+# `isuscope init`が生成する最小構成です。AIまたは担当者が実環境に合わせて編集します。
+data_dir = ".isuscope/data"
+
+[source]
+repo = "."
+exclude = [".pprotein"]
+
+[tooling]
+# 当日実装したベンチアダプターと問題固有scriptを各runへ保存します。
+include = ["benchmark.sh", "fingerprint.sh"]
+
+[benchmark]
+mode = "command"
+# 当日の起動方法はbenchmark.shだけに実装します。入出力契約は同script冒頭を参照します。
+command = [".isuscope/benchmark.sh"]
+working_dir = "."
+stream_output = false
+
+[ssh]
+user = "ubuntu"
+connect_timeout_seconds = 5
+
+# [[nodes]]と[[collectors]]はSETUP.mdの手順に従って追加します。
