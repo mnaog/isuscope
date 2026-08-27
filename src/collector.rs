@@ -9,6 +9,7 @@ use crate::{
     transition::RouteNormalizer,
 };
 use anyhow::{Context, Result};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -348,10 +349,17 @@ async fn finalize(
             &stdout_destination,
             parser,
             routes.is_file().then_some(routes.as_path()),
+            benchmark_interval(run_dir),
         ) {
             Ok(parsed) => metrics.extend(parsed),
             Err(error) => compression_errors.push(format!("standard output parse failed: {error}")),
         }
+    }
+    for metric in &mut metrics {
+        metric
+            .labels
+            .entry("collector".into())
+            .or_insert_with(|| spec.collector.name.clone());
     }
     if let Some(node) = &spec.node {
         for metric in &mut metrics {
@@ -469,6 +477,7 @@ pub(crate) fn parse_protocol(
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    timestamp: parse_metric_timestamp(value.get("timestamp")),
                     labels,
                 });
             }
@@ -518,10 +527,26 @@ pub(crate) fn parse_protocol(
     Ok((metrics, fingerprints, transitions))
 }
 
+fn parse_metric_timestamp(value: Option<&Value>) -> Option<chrono::DateTime<chrono::Utc>> {
+    match value? {
+        Value::String(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|value| value.with_timezone(&chrono::Utc)),
+        Value::Number(value) => {
+            let seconds = value.as_f64()?;
+            let whole = seconds.floor() as i64;
+            let nanos = ((seconds - whole as f64) * 1_000_000_000.0).round() as u32;
+            chrono::DateTime::from_timestamp(whole, nanos)
+        }
+        _ => None,
+    }
+}
+
 fn parse_standard_output(
     path: &Path,
     parser: CollectorParser,
     routes: Option<&Path>,
+    interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
 ) -> Result<Vec<Metric>> {
     let input = fs::File::open(path)?;
     let mut decoder = zstd::stream::read::Decoder::new(input)?;
@@ -530,9 +555,72 @@ fn parse_standard_output(
     decoder.read_to_string(&mut raw)?;
     match parser {
         CollectorParser::AlpJson => parse_alp_json(&raw, routes),
+        CollectorParser::MysqlSlow => Ok(parse_mysql_slow_series(&raw, interval)),
         CollectorParser::SlpJson => parse_slp_json(&raw),
-        CollectorParser::Sysstat => Ok(parse_sysstat(&raw)),
+        CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
     }
+}
+
+fn benchmark_interval(run_dir: &Path) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
+    let manifest: crate::model::RunManifest =
+        serde_json::from_slice(&fs::read(run_dir.join("run.json")).ok()?).ok()?;
+    Some((
+        manifest.benchmark.started_at?,
+        manifest.benchmark.finished_at?,
+    ))
+}
+
+fn parse_mysql_slow_series(
+    raw: &str,
+    interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+) -> Vec<Metric> {
+    let mut timestamp = None;
+    let mut buckets = BTreeMap::<chrono::DateTime<Utc>, (u64, f64)>::new();
+    for line in raw.lines() {
+        if let Some(value) = line.strip_prefix("# Time: ") {
+            timestamp = chrono::DateTime::parse_from_rfc3339(value.trim())
+                .ok()
+                .map(|value| value.with_timezone(&Utc));
+        } else if let Some(rest) = line.strip_prefix("# Query_time: ")
+            && let (Some(at), Some(seconds)) = (
+                timestamp,
+                rest.split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<f64>().ok()),
+            )
+            && interval.is_none_or(|(start, end)| at >= start && at <= end)
+            && let Some(bucket) = chrono::DateTime::from_timestamp(at.timestamp() / 5 * 5, 0)
+        {
+            let values = buckets.entry(bucket).or_default();
+            values.0 += 1;
+            values.1 += seconds * 1_000.0;
+        }
+    }
+    let labels = BTreeMap::from([
+        ("engine".into(), "mysql".into()),
+        ("digest".into(), "all".into()),
+    ]);
+    buckets
+        .into_iter()
+        .flat_map(|(timestamp, (calls, duration))| {
+            [
+                Metric {
+                    name: "db.query.calls".into(),
+                    value: calls as f64,
+                    unit: "queries".into(),
+                    timestamp: Some(timestamp),
+                    labels: labels.clone(),
+                },
+                Metric {
+                    name: "db.query.total_duration".into(),
+                    value: duration,
+                    unit: "ms".into(),
+                    timestamp: Some(timestamp),
+                    labels: labels.clone(),
+                },
+            ]
+        })
+        .collect()
 }
 
 fn json_records(raw: &str) -> Result<Vec<Value>> {
@@ -597,6 +685,7 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
                 name: "http.requests".into(),
                 value: requests,
                 unit: "requests".into(),
+                timestamp: None,
                 labels: labels.clone(),
             });
         }
@@ -607,6 +696,7 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
                 name: "http.request_duration".into(),
                 value: p95_seconds * 1000.0,
                 unit: "ms".into(),
+                timestamp: None,
                 labels,
             });
         }
@@ -634,6 +724,7 @@ fn parse_slp_json(raw: &str) -> Result<Vec<Metric>> {
                 name: "db.query.calls".into(),
                 value: calls,
                 unit: "queries".into(),
+                timestamp: None,
                 labels: labels.clone(),
             });
         }
@@ -642,6 +733,7 @@ fn parse_slp_json(raw: &str) -> Result<Vec<Metric>> {
                 name: "db.query.total_duration".into(),
                 value: total_seconds * 1000.0,
                 unit: "ms".into(),
+                timestamp: None,
                 labels,
             });
         }
@@ -652,11 +744,19 @@ fn parse_slp_json(raw: &str) -> Result<Vec<Metric>> {
     Ok(metrics)
 }
 
-fn parse_sysstat(raw: &str) -> Vec<Metric> {
+fn parse_sysstat(
+    raw: &str,
+    interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+) -> Vec<Metric> {
     let mut cpu_header: Option<Vec<String>> = None;
     let mut disk_header: Option<Vec<String>> = None;
     let mut cpu = (0.0_f64, 0_u64);
     let mut disks = BTreeMap::<String, (f64, u64, f64, u64)>::new();
+    let date = regex::Regex::new(r"\b(\d{2}/\d{2}/\d{2})\b")
+        .ok()
+        .and_then(|pattern| pattern.captures(raw))
+        .and_then(|capture| NaiveDate::parse_from_str(&capture[1], "%m/%d/%y").ok());
+    let mut metrics = Vec::new();
     for line in raw.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.contains(&"CPU") && fields.contains(&"%idle") {
@@ -671,8 +771,22 @@ fn parse_sysstat(raw: &str) -> Vec<Metric> {
                 && let Some(idle) =
                     idle_index.and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
             {
-                cpu.0 += 100.0 - idle;
+                let value = 100.0 - idle;
+                let timestamp = sysstat_timestamp(date, &fields);
+                if !within_interval(timestamp, interval) {
+                    continue;
+                }
+                cpu.0 += value;
                 cpu.1 += 1;
+                if let Some(timestamp) = timestamp {
+                    metrics.push(Metric {
+                        name: "host.cpu_percent".into(),
+                        value,
+                        unit: "percent".into(),
+                        timestamp: Some(timestamp),
+                        labels: BTreeMap::new(),
+                    });
+                }
             }
         }
         if fields.contains(&"DEV") && fields.contains(&"await") {
@@ -687,30 +801,56 @@ fn parse_sysstat(raw: &str) -> Vec<Metric> {
             continue;
         }
         let device = fields[dev_index].to_string();
-        let values = disks.entry(device).or_default();
+        let values = disks.entry(device.clone()).or_default();
         if let Some(value) = header
             .iter()
             .position(|field| field == "await")
             .and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
         {
+            let timestamp = sysstat_timestamp(date, &fields);
+            if !within_interval(timestamp, interval) {
+                continue;
+            }
             values.0 += value;
             values.1 += 1;
+            if let Some(timestamp) = timestamp {
+                metrics.push(Metric {
+                    name: "host.disk_await".into(),
+                    value,
+                    unit: "ms".into(),
+                    timestamp: Some(timestamp),
+                    labels: BTreeMap::from([("device".into(), device.clone())]),
+                });
+            }
         }
         if let Some(value) = header
             .iter()
             .position(|field| field == "%util")
             .and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
         {
+            let timestamp = sysstat_timestamp(date, &fields);
+            if !within_interval(timestamp, interval) {
+                continue;
+            }
             values.2 += value;
             values.3 += 1;
+            if let Some(timestamp) = timestamp {
+                metrics.push(Metric {
+                    name: "host.disk_util_percent".into(),
+                    value,
+                    unit: "percent".into(),
+                    timestamp: Some(timestamp),
+                    labels: BTreeMap::from([("device".into(), device.clone())]),
+                });
+            }
         }
     }
-    let mut metrics = Vec::new();
     if cpu.1 > 0 {
         metrics.push(Metric {
             name: "host.cpu_percent".into(),
             value: cpu.0 / cpu.1 as f64,
             unit: "percent".into(),
+            timestamp: None,
             labels: BTreeMap::new(),
         });
     }
@@ -721,6 +861,7 @@ fn parse_sysstat(raw: &str) -> Vec<Metric> {
                 name: "host.disk_await".into(),
                 value: await_sum / await_count as f64,
                 unit: "ms".into(),
+                timestamp: None,
                 labels: labels.clone(),
             });
         }
@@ -729,11 +870,30 @@ fn parse_sysstat(raw: &str) -> Vec<Metric> {
                 name: "host.disk_util_percent".into(),
                 value: util_sum / util_count as f64,
                 unit: "percent".into(),
+                timestamp: None,
                 labels,
             });
         }
     }
     metrics
+}
+
+fn within_interval(
+    timestamp: Option<chrono::DateTime<Utc>>,
+    interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+) -> bool {
+    interval.is_none_or(|(start, end)| timestamp.is_some_and(|at| at >= start && at <= end))
+}
+
+fn sysstat_timestamp(date: Option<NaiveDate>, fields: &[&str]) -> Option<chrono::DateTime<Utc>> {
+    let value = match fields.get(1).copied() {
+        Some("AM" | "PM") => format!("{} {}", fields.first()?, fields[1]),
+        _ => fields.first()?.to_string(),
+    };
+    let time = NaiveTime::parse_from_str(&value, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(&value, "%I:%M:%S %p"))
+        .ok()?;
+    Some(Utc.from_utc_datetime(&NaiveDateTime::new(date?, time)))
 }
 
 fn expand(
@@ -893,7 +1053,7 @@ mod tests {
     #[test]
     fn standard_json_adapters_emit_bottleneck_metrics() {
         let alp = parse_alp_json(
-            r#"[{"count":12,"method":"GET","uri":"/items/:id","p95":0.125}]"#,
+            include_str!("../tests/fixtures/alp-json-current.json"),
             None,
         )
         .unwrap();
@@ -906,10 +1066,7 @@ mod tests {
                 .any(|metric| metric.name == "http.request_duration" && metric.value == 125.0)
         );
 
-        let slp = parse_slp_json(
-            r#"[{"count":4,"fingerprint":"SELECT * FROM items WHERE id = ?","total_time":0.8}]"#,
-        )
-        .unwrap();
+        let slp = parse_slp_json(include_str!("../tests/fixtures/slp-json-current.json")).unwrap();
         assert!(
             slp.iter()
                 .any(|metric| metric.name == "db.query.calls" && metric.value == 4.0)
@@ -954,7 +1111,8 @@ mod tests {
     #[test]
     fn sysstat_adapter_uses_during_samples() {
         let metrics = parse_sysstat(
-            "Average: CPU %user %nice %system %iowait %steal %idle\nAverage: all 1.00 0.00 2.00 0.00 0.00 97.00\nAverage: all 2.00 0.00 4.00 0.00 0.00 94.00\nAverage: DEV tps rkB/s wkB/s dkB/s areq-sz aqu-sz await %util\nAverage: nvme0n1 10.0 1.0 2.0 0.0 3.0 0.1 4.5 70.0\nAverage: nvme0n1 10.0 1.0 2.0 0.0 3.0 0.1 5.5 90.0\n",
+            include_str!("../tests/fixtures/sysstat-sysstat12-12h.txt"),
+            None,
         );
         assert!(
             metrics
@@ -970,6 +1128,56 @@ mod tests {
             metrics
                 .iter()
                 .any(|metric| metric.name == "host.disk_util_percent" && metric.value == 80.0)
+        );
+    }
+
+    #[test]
+    fn sysstat_adapter_preserves_sample_timestamps() {
+        let metrics = parse_sysstat(
+            include_str!("../tests/fixtures/sysstat-sysstat12-24h.txt"),
+            Some((
+                "2026-08-27T12:00:01Z".parse().unwrap(),
+                "2026-08-27T12:00:01Z".parse().unwrap(),
+            )),
+        );
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "host.cpu_percent"
+                && metric.timestamp.map(|at| at.to_rfc3339())
+                    == Some("2026-08-27T12:00:01+00:00".into())
+        }));
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| { metric.name == "host.disk_await" && metric.timestamp.is_some() })
+        );
+        assert!(
+            metrics
+                .iter()
+                .filter_map(|metric| metric.timestamp)
+                .all(|at| {
+                    at == "2026-08-27T12:00:01Z"
+                        .parse::<chrono::DateTime<Utc>>()
+                        .unwrap()
+                })
+        );
+    }
+
+    #[test]
+    fn mysql_slow_log_is_bucketed() {
+        let metrics = parse_mysql_slow_series(
+            include_str!("../tests/fixtures/mysql-slow-8.0.log"),
+            Some((
+                "2026-08-27T12:00:00Z".parse().unwrap(),
+                "2026-08-27T12:00:05Z".parse().unwrap(),
+            )),
+        );
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "db.query.calls" && metric.value == 2.0 && metric.timestamp.is_some()
+        }));
+        assert!(
+            metrics.iter().any(|metric| {
+                metric.name == "db.query.total_duration" && metric.value == 350.0
+            })
         );
     }
 }

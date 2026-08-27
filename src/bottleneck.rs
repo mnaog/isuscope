@@ -247,6 +247,7 @@ mod tests {
             name: name.into(),
             value,
             unit: "ms".into(),
+            timestamp: None,
             labels: labels
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

@@ -1,0 +1,4 @@
+[
+  {"count":12,"method":"GET","uri":"/items/:id","p95":0.125},
+  {"count":3,"method":"POST","uri":"/items","p95":0.250}
+]

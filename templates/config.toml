@@ -23,11 +23,18 @@ connect_timeout_seconds = 5
 # [[nodes]]はSETUP.mdの手順に従って追加します。roleを指定しない以下の
 # 標準collectorは、設定した全nodeでrun/discovery-runの両方に対して動きます。
 
+# /procだけを使うため、remoteへの追加package導入なしで1秒ごとの基本host時系列を取ります。
+[[collectors]]
+name = "host-sampler"
+phase = "during"
+transport = "ssh"
+command = ["sh", "-c", "set -eu\nread_cpu() { awk '/^cpu / { total=0; for(i=2;i<=NF;i++)total+=$i; print total, $5+$6 }' /proc/stat; }\nset -- $(read_cpu); pt=$1; pi=$2\nwhile :; do\n sleep 1; set -- $(read_cpu); t=$1; i=$2; dt=$((t-pt)); di=$((i-pi))\n cpu=$(awk -v dt=$dt -v di=$di 'BEGIN { if(dt<=0)print 0; else printf \"%.6f\",100*(dt-di)/dt }')\n mem=$(awk '/MemTotal:/{t=$2}/MemAvailable:/{a=$2}END{print (t-a)*1024}' /proc/meminfo)\n load=$(awk '{print $1}' /proc/loadavg); ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n printf '{\"type\":\"metric\",\"name\":\"host.cpu_percent\",\"value\":%s,\"unit\":\"percent\",\"timestamp\":\"%s\"}\\n' \"$cpu\" \"$ts\"\n printf '{\"type\":\"metric\",\"name\":\"host.memory_used_bytes\",\"value\":%s,\"unit\":\"bytes\",\"timestamp\":\"%s\"}\\n' \"$mem\" \"$ts\"\n printf '{\"type\":\"metric\",\"name\":\"host.load1\",\"value\":%s,\"unit\":\"load\",\"timestamp\":\"%s\"}\\n' \"$load\" \"$ts\"\n pt=$t; pi=$i\ndone"]
+
 [[collectors]]
 name = "sysstat"
 phase = "during"
 transport = "ssh"
-command = ["sh", "-c", "command -v sar >/dev/null 2>&1 || exit 75; exec env LC_ALL=C sar -u -d 1"]
+command = ["sh", "-c", "command -v sar >/dev/null 2>&1 || exit 75; exec env LC_ALL=C TZ=UTC sar -u -d 1"]
 parser = "sysstat"
 unavailable_exit_codes = [75]
 
@@ -59,9 +66,24 @@ unavailable_exit_codes = [75]
 name = "alp"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; test -r /var/log/nginx/access.log || exit 75; test -r /tmp/isuscope-{run_id}.alp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.alp.offset; test \"$(stat -c %i /var/log/nginx/access.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/nginx/access.log > /tmp/isuscope-{run_id}.alp.log; alp ltsv --file /tmp/isuscope-{run_id}.alp.log --output json; rm -f /tmp/isuscope-{run_id}.alp.offset /tmp/isuscope-{run_id}.alp.log"]
+command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; test -r /var/log/nginx/access.log || exit 75; test -r /tmp/isuscope-{run_id}.alp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.alp.offset; test \"$(stat -c %i /var/log/nginx/access.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/nginx/access.log > /tmp/isuscope-{run_id}.alp.log; alp ltsv --file /tmp/isuscope-{run_id}.alp.log --output json; rm -f /tmp/isuscope-{run_id}.alp.log"]
 parser = "alp-json"
 unavailable_exit_codes = [75]
+
+# 同じaccess log差分を回収し、local helperが正規化route別の5秒bucketへ変換します。
+[[collectors]]
+name = "nginx-series-read"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", "test -r /var/log/nginx/access.log || exit 75; test -r /tmp/isuscope-{run_id}.alp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.alp.offset; test \"$(stat -c %i /var/log/nginx/access.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/nginx/access.log; rm -f /tmp/isuscope-{run_id}.alp.offset"]
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "nginx-series"
+phase = "after"
+transport = "local"
+command = ["isuscope", "__transition", "--series-only", "--run-dir", "{run_dir}", "--prefix", "nginx-series-read-", "--rules", ".isuscope/routes.toml"]
+timeout_seconds = 30
 
 [[collectors]]
 name = "slp-mark"
@@ -74,6 +96,15 @@ unavailable_exit_codes = [75]
 name = "slp"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; test -r /var/log/mysql/mysql-slow.log || exit 75; test -r /tmp/isuscope-{run_id}.slp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.slp.offset; test \"$(stat -c %i /var/log/mysql/mysql-slow.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/mysql/mysql-slow.log > /tmp/isuscope-{run_id}.slp.log; slp --format json /tmp/isuscope-{run_id}.slp.log; rm -f /tmp/isuscope-{run_id}.slp.offset /tmp/isuscope-{run_id}.slp.log"]
+command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; test -r /var/log/mysql/mysql-slow.log || exit 75; test -r /tmp/isuscope-{run_id}.slp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.slp.offset; test \"$(stat -c %i /var/log/mysql/mysql-slow.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/mysql/mysql-slow.log > /tmp/isuscope-{run_id}.slp.log; slp --format json /tmp/isuscope-{run_id}.slp.log; rm -f /tmp/isuscope-{run_id}.slp.log"]
 parser = "slp-json"
+unavailable_exit_codes = [75]
+
+# MySQL slow logを5秒bucketのquery数・合計時間へ変換します。slp-markのoffsetを共有します。
+[[collectors]]
+name = "mysql-slow-series"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", "test -r /var/log/mysql/mysql-slow.log || exit 75; test -r /tmp/isuscope-{run_id}.slp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.slp.offset; test \"$(stat -c %i /var/log/mysql/mysql-slow.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/mysql/mysql-slow.log; rm -f /tmp/isuscope-{run_id}.slp.offset"]
+parser = "mysql-slow"
 unavailable_exit_codes = [75]

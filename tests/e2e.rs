@@ -153,7 +153,7 @@ name = "calculated"
 phase = "after"
 transport = "local"
 modes = ["discovery-run"]
-command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"cpu\",\"value\":12.5,\"unit\":\"percent\"}' '{\"type\":\"fingerprint\",\"name\":\"app.binary.sha256\",\"value\":\"abc123\"}' '{\"type\":\"transition\",\"from\":\"GET /a\",\"to\":\"GET /b\",\"count\":7}'"]
+command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '%s\\n' '{\"type\":\"metric\",\"name\":\"cpu\",\"value\":12.5,\"unit\":\"percent\",\"timestamp\":\"2026-08-27T12:34:56.789Z\"}' '{\"type\":\"fingerprint\",\"name\":\"app.binary.sha256\",\"value\":\"abc123\"}' '{\"type\":\"transition\",\"from\":\"GET /a\",\"to\":\"GET /b\",\"count\":7}'"]
 "#,
     )
     .unwrap();
@@ -186,6 +186,24 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"cpu\",\"
                 .get::<_, i64>(0))
             .unwrap(),
         2
+    );
+    let labels: String = database
+        .query_row(
+            "SELECT labels_json FROM metrics WHERE name='cpu'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(labels.contains("\"collector\":\"calculated\""));
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT observed_at FROM metrics WHERE name='cpu'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "2026-08-27T12:34:56.789+00:00"
     );
     assert_eq!(
         database
@@ -230,17 +248,33 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"cpu\",\"
     assert!(show_stdout.contains("view    zstd -dc -- "));
 
     let runs = config_dir.join("runs");
-    let run_dir = fs::read_dir(runs)
+    let run_dir = fs::read_dir(&runs)
         .unwrap()
         .filter_map(Result::ok)
         .find(|entry| entry.file_name() != ".incomplete")
         .unwrap()
         .path();
-    assert!(run_dir.join("tooling/config.toml").is_file());
-    assert!(run_dir.join("tooling/isuscope-version.txt").is_file());
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
-    assert_eq!(manifest["schema_version"], 3);
+    database
+        .execute(
+            "UPDATE metrics SET observed_at=?1 WHERE name='cpu'",
+            [manifest["benchmark"]["started_at"].as_str().unwrap()],
+        )
+        .unwrap();
+    let series = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["series", "latest"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(series.status.success());
+    let series_stdout = String::from_utf8(series.stdout).unwrap();
+    assert!(series_stdout.contains("bucket 5s"));
+    assert!(series_stdout.contains("CPU A/M%"));
+    assert!(series_stdout.contains("0-"));
+    assert!(run_dir.join("tooling/config.toml").is_file());
+    assert!(run_dir.join("tooling/isuscope-version.txt").is_file());
+    assert_eq!(manifest["schema_version"], 4);
     assert_eq!(manifest["tooling"]["isuscope_version"], "0.4.0");
     assert_eq!(
         manifest["tooling"]["config_sha256"].as_str().unwrap().len(),

@@ -129,6 +129,11 @@ impl Store {
         Ok(staging)
     }
 
+    /// Persist in-progress metadata needed by after collectors.
+    pub fn checkpoint(&self, manifest: &RunManifest) -> Result<()> {
+        write_manifest(&self.staging_dir(&manifest.id), manifest)
+    }
+
     pub fn finish(
         &mut self,
         manifest: &RunManifest,
@@ -164,8 +169,8 @@ impl Store {
         }
         for metric in metrics {
             transaction.execute(
-                "INSERT INTO metrics (run_id, name, value, unit, labels_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![manifest.id, metric.name, metric.value, metric.unit, serde_json::to_string(&metric.labels)?],
+                "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
             )?;
         }
         for fingerprint in fingerprints {
@@ -257,18 +262,28 @@ impl Store {
 
     pub fn metrics(&self, id: &str) -> Result<Vec<Metric>> {
         let mut statement = self.connection.prepare(
-            "SELECT name, value, unit, labels_json FROM metrics WHERE run_id=?1 ORDER BY id",
+            "SELECT name, value, unit, observed_at, labels_json FROM metrics WHERE run_id=?1 ORDER BY COALESCE(observed_at, ''), id",
         )?;
         let rows = statement.query_map([id], |row| {
-            let labels: String = row.get(3)?;
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, labels))
+            let labels: String = row.get(4)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get::<_, Option<String>>(3)?,
+                labels,
+            ))
         })?;
         rows.map(|row| {
-            let (name, value, unit, labels_json) = row?;
+            let (name, value, unit, timestamp, labels_json) = row?;
             Ok(Metric {
                 name,
                 value,
                 unit,
+                timestamp: timestamp
+                    .map(|value| value.parse())
+                    .transpose()
+                    .context("invalid metric timestamp")?,
                 labels: serde_json::from_str(&labels_json).context("invalid metric labels")?,
             })
         })
@@ -368,8 +383,8 @@ impl Store {
         }
         for metric in metrics {
             transaction.execute(
-                "INSERT INTO metrics (run_id, name, value, unit, labels_json) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![manifest.id, metric.name, metric.value, metric.unit, serde_json::to_string(&metric.labels)?],
+                "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
             )?;
         }
         for fingerprint in fingerprints {
@@ -432,6 +447,18 @@ fn structured_records_from_logs(
                     .or_insert_with(|| node.clone());
             }
         }
+        if let Some(collector_name) = log
+            .kind
+            .strip_prefix("collector:")
+            .and_then(|kind| kind.strip_suffix(":stdout"))
+        {
+            for metric in &mut parsed_metrics {
+                metric
+                    .labels
+                    .entry("collector".into())
+                    .or_insert_with(|| collector_name.to_owned());
+            }
+        }
         metrics.extend(parsed_metrics);
         fingerprints.extend(parsed_fingerprints);
         transitions.extend(parsed_transitions);
@@ -444,6 +471,7 @@ fn structured_records_from_logs(
             name: "benchmark.initialize_duration".into(),
             value: (end - start).num_microseconds().unwrap_or_default() as f64 / 1_000.0,
             unit: "ms".into(),
+            timestamp: None,
             labels: Default::default(),
         });
     }
@@ -486,6 +514,7 @@ fn migrate(connection: &Connection) -> Result<()> {
             name TEXT NOT NULL,
             value REAL NOT NULL,
             unit TEXT NOT NULL,
+            observed_at TEXT,
             labels_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS metrics_run_name ON metrics(run_id, name);
@@ -516,9 +545,18 @@ fn migrate(connection: &Connection) -> Result<()> {
             exit_code INTEGER,
             error TEXT
         );
-        PRAGMA user_version = 2;
+        PRAGMA user_version = 3;
         ",
     )?;
+    let has_observed_at = connection
+        .prepare("PRAGMA table_info(metrics)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|column| column == "observed_at");
+    if !has_observed_at {
+        connection.execute("ALTER TABLE metrics ADD COLUMN observed_at TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -533,7 +571,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let manifest = RunManifest {
-            schema_version: 3,
+            schema_version: 4,
             id: "01a03df2-ecb2-72b3-aa1f-c952d3dd102b".into(),
             mode: RunMode::Run,
             state: RunState::Running,

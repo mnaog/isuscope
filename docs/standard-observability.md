@@ -62,3 +62,13 @@ ALP adapterと行動遷移helperは同じ`routes.toml`を使います。ALPが�
 4. 同じtooling fingerprintを持つrun間で候補の増減を比較する。
 
 この順序なら、推測だけの総合点を先に作らず、観測データと欠測状態を正しく蓄積してからランキングを拡張できます。
+
+## 時系列
+
+`host-sampler`は追加packageなしで`/proc`からCPU使用率、使用memory、load averageを1秒間隔で記録します。sysstatが利用できる環境では、CPUとdiskの各`sar` sampleもUTCの観測時刻付きで保存し、従来のrun全体平均もbottleneck判定用に残します。
+
+行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logは`mysql-slow-series`が5秒bucketのquery数と合計実行時間へ変換します。bucket値には`timestamp`があり、`isuscope series`またはSQLiteから参照できます。
+
+after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
+
+parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式とMySQL 8.0 slow log形式のfixtureを使用します。実環境で採取した完全な出力による対応versionの確定は引き続きTODOで追跡します。

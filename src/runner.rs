@@ -59,7 +59,7 @@ pub async fn execute(
     });
     let started_at = Utc::now();
     let mut manifest = RunManifest {
-        schema_version: 3,
+        schema_version: 4,
         id: id.clone(),
         mode,
         state: RunState::Running,
@@ -132,6 +132,7 @@ pub async fn execute(
         let execution = benchmark::execute(&config, &staging, shutdown.clone()).await;
         manifest.benchmark = execution.result;
         manifest.logs.extend(execution.logs);
+        store.checkpoint(&manifest)?;
 
         let during = collector::stop_during(running, &staging).await;
         absorb(
@@ -162,6 +163,7 @@ pub async fn execute(
             name: "benchmark.initialize_duration".into(),
             value: (end - start).num_microseconds().unwrap_or_default() as f64 / 1_000.0,
             unit: "ms".into(),
+            timestamp: None,
             labels: Default::default(),
         });
     }
