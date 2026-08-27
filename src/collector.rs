@@ -1163,6 +1163,30 @@ mod tests {
     }
 
     #[test]
+    fn sysstat_adapter_accepts_supported_ubuntu_package_versions() {
+        let fixtures = [
+            include_str!("../tests/fixtures/sysstat-ubuntu-20.04-sysstat-12.2.0.txt"),
+            include_str!("../tests/fixtures/sysstat-ubuntu-22.04-sysstat-12.5.2.txt"),
+            include_str!("../tests/fixtures/sysstat-ubuntu-24.04-sysstat-12.6.1.txt"),
+        ];
+        for fixture in fixtures {
+            let metrics = parse_sysstat(fixture, None);
+            assert!(
+                metrics
+                    .iter()
+                    .any(|metric| { metric.name == "host.cpu_percent" && metric.value > 0.0 })
+            );
+            assert!(metrics.iter().any(|metric| {
+                metric.name == "host.disk_await" && metric.labels.contains_key("device")
+            }));
+            assert!(metrics.iter().any(|metric| {
+                metric.name == "host.disk_util_percent" && metric.labels.contains_key("device")
+            }));
+            assert!(metrics.iter().all(|metric| metric.value.is_finite()));
+        }
+    }
+
+    #[test]
     fn mysql_slow_log_is_bucketed() {
         let metrics = parse_mysql_slow_series(
             include_str!("../tests/fixtures/mysql-slow-8.0.log"),
@@ -1179,5 +1203,26 @@ mod tests {
                 metric.name == "db.query.total_duration" && metric.value == 350.0
             })
         );
+    }
+
+    #[test]
+    fn mysql_8_0_46_full_slow_log_is_bucketed() {
+        let metrics = parse_mysql_slow_series(
+            include_str!("../tests/fixtures/mysql-slow-8.0.46-docker.log"),
+            Some((
+                "2026-08-27T10:42:55Z".parse().unwrap(),
+                "2026-08-27T10:42:56Z".parse().unwrap(),
+            )),
+        );
+        assert_eq!(metrics.len(), 2);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "db.query.calls"
+                && metric.value == 12.0
+                && metric.timestamp.map(|at| at.to_rfc3339())
+                    == Some("2026-08-27T10:42:55+00:00".into())
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "db.query.total_duration" && (metric.value - 76.872).abs() < 0.001
+        }));
     }
 }

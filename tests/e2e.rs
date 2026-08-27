@@ -91,8 +91,27 @@ fn init_is_non_interactive_and_preserves_existing_files() {
             .contains(".isuscope/benchmark.sh")
     );
     let generated = fs::read_to_string(&config).unwrap();
+    assert!(generated.contains("$log.1"));
+    assert!(generated.contains("access log rotated and original inode was not found"));
+    assert!(generated.contains("slow log rotated and original inode was not found"));
     let parsed: toml::Value = toml::from_str(&generated).unwrap();
     let collectors = parsed["collectors"].as_array().unwrap();
+    for name in ["alp", "nginx-series-read", "slp", "mysql-slow-series"] {
+        let collector = collectors
+            .iter()
+            .find(|collector| collector["name"].as_str() == Some(name))
+            .unwrap();
+        let command = collector["command"].as_array().unwrap();
+        let script = command[2].as_str().unwrap();
+        assert!(
+            Command::new("sh")
+                .args(["-n", "-c", script])
+                .status()
+                .unwrap()
+                .success(),
+            "invalid shell syntax in {name}"
+        );
+    }
     for name in [
         "sysstat",
         "perf-record",
@@ -481,7 +500,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         "collectors preserve benchmark evidence"
     );
     assert_eq!(manifest["analysis_status"], "pending");
-    assert_eq!(manifest["tooling"]["isuscope_version"], "0.6.0");
+    assert_eq!(manifest["tooling"]["isuscope_version"], "0.6.1");
     assert_eq!(
         manifest["tooling"]["config_sha256"].as_str().unwrap().len(),
         64

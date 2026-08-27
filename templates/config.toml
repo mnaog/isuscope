@@ -73,7 +73,7 @@ unavailable_exit_codes = [75]
 name = "alp"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; test -r /var/log/nginx/access.log || exit 75; test -r /tmp/isuscope-{run_id}.alp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.alp.offset; test \"$(stat -c %i /var/log/nginx/access.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/nginx/access.log > /tmp/isuscope-{run_id}.alp.log; alp ltsv --file /tmp/isuscope-{run_id}.alp.log --output json; rm -f /tmp/isuscope-{run_id}.alp.log"]
+command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; log=/var/log/nginx/access.log; marker=/tmp/isuscope-{run_id}.alp.offset; output=/tmp/isuscope-{run_id}.alp.log; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\" > \"$output\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\" > \"$output\"; cat \"$log\" >> \"$output\"; else echo 'access log rotated and original inode was not found' >&2; exit 75; fi; alp ltsv --file \"$output\" --output json; rm -f \"$output\""]
 parser = "alp-json"
 unavailable_exit_codes = [75]
 
@@ -82,7 +82,7 @@ unavailable_exit_codes = [75]
 name = "nginx-series-read"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "test -r /var/log/nginx/access.log || exit 75; test -r /tmp/isuscope-{run_id}.alp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.alp.offset; test \"$(stat -c %i /var/log/nginx/access.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/nginx/access.log; rm -f /tmp/isuscope-{run_id}.alp.offset"]
+command = ["sh", "-c", "log=/var/log/nginx/access.log; marker=/tmp/isuscope-{run_id}.alp.offset; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\"; cat \"$log\"; else echo 'access log rotated and original inode was not found' >&2; exit 75; fi; rm -f \"$marker\""]
 unavailable_exit_codes = [75]
 
 [[collectors]]
@@ -103,7 +103,7 @@ unavailable_exit_codes = [75]
 name = "slp"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; test -r /var/log/mysql/mysql-slow.log || exit 75; test -r /tmp/isuscope-{run_id}.slp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.slp.offset; test \"$(stat -c %i /var/log/mysql/mysql-slow.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/mysql/mysql-slow.log > /tmp/isuscope-{run_id}.slp.log; slp --format json /tmp/isuscope-{run_id}.slp.log; rm -f /tmp/isuscope-{run_id}.slp.log"]
+command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; log=/var/log/mysql/mysql-slow.log; marker=/tmp/isuscope-{run_id}.slp.offset; output=/tmp/isuscope-{run_id}.slp.log; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\" > \"$output\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\" > \"$output\"; cat \"$log\" >> \"$output\"; else echo 'slow log rotated and original inode was not found' >&2; exit 75; fi; slp --format json \"$output\"; rm -f \"$output\""]
 parser = "slp-json"
 unavailable_exit_codes = [75]
 
@@ -112,6 +112,6 @@ unavailable_exit_codes = [75]
 name = "mysql-slow-series"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "test -r /var/log/mysql/mysql-slow.log || exit 75; test -r /tmp/isuscope-{run_id}.slp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.slp.offset; test \"$(stat -c %i /var/log/mysql/mysql-slow.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/mysql/mysql-slow.log; rm -f /tmp/isuscope-{run_id}.slp.offset"]
+command = ["sh", "-c", "log=/var/log/mysql/mysql-slow.log; marker=/tmp/isuscope-{run_id}.slp.offset; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\"; cat \"$log\"; else echo 'slow log rotated and original inode was not found' >&2; exit 75; fi; rm -f \"$marker\""]
 parser = "mysql-slow"
 unavailable_exit_codes = [75]

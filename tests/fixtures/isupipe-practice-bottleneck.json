@@ -1,0 +1,56 @@
+[
+  {
+    "name": "http.requests",
+    "value": 3887.0,
+    "unit": "requests",
+    "labels": {"node": "app2", "method": "POST", "route": "/api/icon"}
+  },
+  {
+    "name": "http.request_duration",
+    "value": 41.0,
+    "unit": "ms",
+    "labels": {"node": "app2", "method": "POST", "route": "/api/icon", "quantile": "0.95"}
+  },
+  {
+    "name": "http.requests",
+    "value": 38.0,
+    "unit": "requests",
+    "labels": {"node": "app1", "method": "POST", "route": "/api/livestream/:id/moderate"}
+  },
+  {
+    "name": "http.request_duration",
+    "value": 2002.0,
+    "unit": "ms",
+    "labels": {"node": "app1", "method": "POST", "route": "/api/livestream/:id/moderate", "quantile": "0.95"}
+  },
+  {
+    "name": "http.requests",
+    "value": 151.0,
+    "unit": "requests",
+    "labels": {"node": "app2", "method": "GET", "route": "/api/livestream"}
+  },
+  {
+    "name": "http.request_duration",
+    "value": 502.0,
+    "unit": "ms",
+    "labels": {"node": "app2", "method": "GET", "route": "/api/livestream", "quantile": "0.95"}
+  },
+  {
+    "name": "host.cpu_percent",
+    "value": 23.3319,
+    "unit": "percent",
+    "labels": {"node": "app1"}
+  },
+  {
+    "name": "host.cpu_percent",
+    "value": 39.5886,
+    "unit": "percent",
+    "labels": {"node": "app2"}
+  },
+  {
+    "name": "host.cpu_percent",
+    "value": 23.5496,
+    "unit": "percent",
+    "labels": {"node": "app3"}
+  }
+]

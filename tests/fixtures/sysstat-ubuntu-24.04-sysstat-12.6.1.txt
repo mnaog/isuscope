@@ -1,0 +1,22 @@
+Linux 6.10.14-linuxkit (fixture-u2404) 	08/27/26 	_aarch64_	(8 CPU)
+
+10:40:58        CPU     %user     %nice   %system   %iowait    %steal     %idle
+10:40:59        all      3.02      0.00      1.76      4.15      0.00     91.08
+
+10:40:58          DEV       tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util
+10:40:59          vda   2692.00     36.00  42244.00 252520.00    109.51      0.48      0.14     33.70
+10:40:59          vdb      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+10:40:59        CPU     %user     %nice   %system   %iowait    %steal     %idle
+10:41:00        all      0.12      0.00      0.25      0.00      0.00     99.63
+
+10:40:59          DEV       tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util
+10:41:00          vda      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+10:41:00          vdb      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00
+
+Average:        CPU     %user     %nice   %system   %iowait    %steal     %idle
+Average:        all      1.57      0.00      1.00      2.07      0.00     95.37
+
+Average:          DEV       tps     rkB/s     wkB/s     dkB/s   areq-sz    aqu-sz     await     %util
+Average:          vda   1339.30     17.91  21016.92 125631.84    109.51      0.24      0.14     16.77
+Average:          vdb      0.00      0.00      0.00      0.00      0.00      0.00      0.00      0.00

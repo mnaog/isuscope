@@ -10,7 +10,8 @@ version=$(target/release/isuscope --version | awk '{print $2}')
 host=$(rustc -vV | awk '/^host:/ {print $2}')
 bundle="isuscope-${version}-${host}"
 temporary=$(mktemp -d "${DIST_DIR}.tmp.XXXXXX")
-trap 'rm -rf -- "${temporary}"' EXIT
+verification=$(mktemp -d "${DIST_DIR}.verify.XXXXXX")
+trap 'rm -rf -- "${temporary}" "${verification}"' EXIT
 install -m 0755 target/release/isuscope "${temporary}/isuscope"
 mkdir -p "${temporary}/docs"
 cp README.md LICENSE "${temporary}/"
@@ -22,4 +23,10 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   shasum -a 256 "${DIST_DIR}/${bundle}.tar.gz" >"${DIST_DIR}/${bundle}.tar.gz.sha256"
 fi
+tar -C "${verification}" -xzf "${DIST_DIR}/${bundle}.tar.gz"
+test "$("${verification}/isuscope" --version)" = "isuscope ${version}"
+test -f "${verification}/README.md"
+test -f "${verification}/LICENSE"
+test -f "${verification}/docs/contest-day.md"
 echo "created ${DIST_DIR}/${bundle}.tar.gz"
+echo "verified ${bundle} (binary and documentation)"

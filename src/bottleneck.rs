@@ -288,4 +288,51 @@ mod tests {
             vec!["http", "database", "cpu", "host"]
         );
     }
+
+    #[test]
+    fn isupipe_practice_run_keeps_real_world_candidate_order() {
+        let metrics: Vec<Metric> = serde_json::from_str(include_str!(
+            "../tests/fixtures/isupipe-practice-bottleneck.json"
+        ))
+        .unwrap();
+        let report = rank(&metrics);
+        let candidates = report
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.category,
+                    candidate.node.as_str(),
+                    candidate.target.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates,
+            vec![
+                ("http", "app2", "POST /api/icon"),
+                ("host", "app2", "cpu"),
+                ("host", "app3", "cpu"),
+                ("host", "app1", "cpu"),
+                ("http", "app1", "POST /api/livestream/:id/moderate"),
+            ]
+        );
+        assert_eq!(
+            report
+                .coverage
+                .iter()
+                .map(|coverage| (coverage.category, coverage.available))
+                .collect::<Vec<_>>(),
+            vec![
+                ("http", true),
+                ("database", false),
+                ("cpu", false),
+                ("host", true),
+            ]
+        );
+        assert_eq!(
+            report.candidates[0].evidence,
+            "requests=3887 p95=41.00ms impact=159367.00ms"
+        );
+    }
 }

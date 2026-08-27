@@ -1,0 +1,64 @@
+/usr/sbin/mysqld, Version: 8.0.46 (MySQL Community Server - GPL). started with:
+Tcp port: 3306  Unix socket: /var/run/mysqld/mysqld.sock
+Time                 Id Command    Argument
+# Time: 2026-08-27T10:42:55.822312Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.000106  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1787827375;
+select @@version_comment limit 1;
+# Time: 2026-08-27T10:42:55.822396Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.000035  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1787827375;
+SELECT VERSION();
+# Time: 2026-08-27T10:42:55.827877Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.005420  Lock_time: 0.000003 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1787827375;
+CREATE DATABASE fixture;
+# Time: 2026-08-27T10:42:55.827986Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.000058  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1787827375;
+SELECT DATABASE();
+# Time: 2026-08-27T10:42:55.828108Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.000083  Lock_time: 0.000001 Rows_sent: 1  Rows_examined: 1
+use fixture;
+SET timestamp=1787827375;
+# administrator command: Init DB;
+# Time: 2026-08-27T10:42:55.867041Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.038881  Lock_time: 0.000006 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1787827375;
+CREATE TABLE items (id BIGINT PRIMARY KEY, value VARCHAR(255), KEY value_idx(value));
+# Time: 2026-08-27T10:42:55.872912Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.005829  Lock_time: 0.000002 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1787827375;
+INSERT INTO items VALUES (1,'alpha'),(2,'beta'),(3,'gamma');
+# Time: 2026-08-27T10:42:55.873038Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.000094  Lock_time: 0.000001 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1787827375;
+SELECT * FROM items WHERE id=2;
+# Time: 2026-08-27T10:42:55.873170Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.000095  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1787827375;
+SELECT COUNT(*) FROM items WHERE value LIKE 'a%';
+# Time: 2026-08-27T10:42:55.893878Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.020669  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1787827375;
+SELECT SLEEP(0.02);
+# Time: 2026-08-27T10:42:55.899534Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.005601  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 1
+SET timestamp=1787827375;
+UPDATE items SET value='delta' WHERE id=3;
+# Time: 2026-08-27T10:42:55.899552Z
+# User@Host: root[root] @ localhost []  Id:     8
+# Query_time: 0.000001  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 1
+SET timestamp=1787827375;
+# administrator command: Quit;

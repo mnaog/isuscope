@@ -71,4 +71,6 @@ ALP adapterと行動遷移helperは同じ`routes.toml`を使います。ALPが�
 
 after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
 
-parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式とMySQL 8.0 slow log形式のfixtureを使用します。実環境で採取した完全な出力による対応versionの確定は引き続きTODOで追跡します。
+parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式とMySQL 8.0 slow log形式のfixtureを使用します。公式Ubuntu Docker imageから、Ubuntu 20.04のsysstat 12.2.0、22.04の12.5.2、24.04の12.6.1、およびMySQL 8.0.46の完全な出力も採取して固定しています。fixtureの由来は`tests/fixtures/README.md`に記録します。Dockerでは保証できないperfとhost kernelの互換性、およびalp/slpの実環境versionはTODOで追跡します。
+
+標準log collectorは、計測中に対象fileが`.1`へrenameされた場合、記録したinodeを照合して旧fileのoffset以降と新fileを連結します。既にgzip圧縮されたrotation、複数回rotation、旧inodeを保持しないcopytruncateは`unavailable`となるため、ベンチ起動時のrotationをoffset記録より前に済ませる構成を優先します。
