@@ -10,6 +10,7 @@ isuscope analyze latest --verdict supported --analysis "観測結果と判断"
 isuscope discovery-run --hypothesis "ボトルネックがDBからHTTPへ移ったはず"
 isuscope show [latest|RUN_ID]
 isuscope bottleneck [latest|RUN_ID]
+isuscope metrics [latest|RUN_ID]
 isuscope series [latest|RUN_ID]
 ```
 
@@ -157,7 +158,9 @@ isuscope bottleneck
 isuscope bottleneck 8c9f021a
 ```
 
-HTTP、database、CPU、host saturationのカテゴリごとに候補を作り、観測できた各カテゴリの首位を残してから、カテゴリ内で正規化した深刻度で最大5件を表示します。異なる単位の生値は加算しません。表示番号はカテゴリ横断の改善優先順位ではありません。各候補には根拠、source、改善後に確認するmetricを表示し、未観測カテゴリもcoverageへ`unavailable`として明示します。改善により支配的なボトルネックは移動するため、これは原因の断定ではなく、runごとに更新される次の調査対象です。
+HTTP、database、CPU、host saturationのカテゴリごとに候補を作り、観測できた各カテゴリの首位を残してから、カテゴリ内で正規化した深刻度で最大5件を表示します。異なる単位の生値は加算しません。表示番号はカテゴリ横断の改善優先順位ではありません。各候補には根拠、source、改善後に確認するmetricと`strength`を表示します。`summary-only`はrun全体の集約値だけ、`direct`は同じ対象の時系列も取得済み、`corroborated`は同じnode・5秒bucketでhost高負荷も観測したことを表します。相関は因果の証明ではありません。
+
+coverageにはカテゴリの有無だけでなく、関連collectorごとのnode、`complete` / `unavailable` / `failed`とerrorも表示します。集約値は候補の順位、時刻付きmetricは裏付けに役割を分離しており、同じアクセスログ由来のALP集約と5秒seriesを二重加算しません。
 
 ## Benchmark parserと後処理
 
@@ -340,14 +343,21 @@ metricへ任意の`timestamp`を付けると、RFC 3339文字列またはUnix秒
 時刻付きmetricはCLIから5秒bucketの表として確認できます。画面や常駐serverは不要です。
 
 ```console
+isuscope metrics latest
 isuscope series latest
+isuscope series latest --metric http.requests --node app1 --label route=/api/livestream/:id --bucket 10
+isuscope series latest --metric db.query.total_duration --from 20 --to 60
 ```
 
-`series`はUTCの5秒境界で揃えたmetricをbenchmark区間で切り出し、開始からの相対秒とともにnodeごとのhost、HTTP、database指標を表形式で並べます。先頭・末尾の部分bucketは実際の区間を表示します。1秒のhost sampleは平均・最大へ集約し、HTTPとdatabaseのcountは合計します。欠測は`-`で表示します。
+`metrics`はmetric名、行数、時刻付き行数、単位、時刻範囲、labelの種類・cardinality・例を一覧にします。最初にこれを実行すると、SQLiteのschemaを知らなくても指定可能なfilterを確認できます。
+
+引数なしの`series`はUTCの5秒境界で揃えたmetricをbenchmark区間で切り出し、開始からの相対秒とともにnodeごとのhost、HTTP、database指標を表形式で並べます。`--metric`を1回以上指定すると任意metricの汎用表になり、`--node`、複数の`--label key=value`、`--from`、`--to`、`--bucket`で絞り込み・再集約できます。count、duration合計、bytes、sample countは合計し、gaugeは平均します。p95などのquantileは元sampleなしには再計算できないため、明示的に`max-of-quantile`として表示します。欠測は`-`です。
 
 表の前には標準時系列collectorごとの`complete` / `unavailable` / `failed`、exit code、errorを表示します。各metricには生成したcollector名が記録され、CPUは`host-sampler`を優先し、利用できない場合だけsysstatへfallbackするため二重集計しません。HTTP、MySQL、sysstat parserはbenchmark区間外のsampleを除外します。
 
 `isuscope init`の標準構成では、追加package不要の`host-sampler`が`/proc`からCPU、memory、load averageを1秒間隔で取得します。利用可能ならsysstatも各CPU/disk sampleを時系列化します。discovery用access logとMySQL slow logは5秒bucketのHTTP/DB metricへ変換できます。
+
+保存データは自動削除しません。実際のISUCON13練習データ18 runではSQLite約64 MiB、run配下約133 MiB、合計約197 MiBでした。古いrunを機械的に消すより、`doctor`のdisk空き容量確認を使い、必要になった時だけ正本のrunディレクトリとSQLite索引を一緒に保全・整理します。
 
 `fingerprint`は文字列値をSQLiteへ保存します。app binary、設定、service unit、OSやtool versionなど、スコア取得時のremote実体を記録する用途です。
 

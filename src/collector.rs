@@ -559,7 +559,115 @@ fn parse_standard_output(
         CollectorParser::SlpJson => parse_slp_json(&raw),
         CollectorParser::SlpTsv => parse_slp_tsv(&raw),
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
+        CollectorParser::PerfScript => parse_perf_script(&raw),
     }
+}
+
+fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
+    let start = raw
+        .lines()
+        .find_map(|line| line.strip_prefix("# isuscope-perf-start "))
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .context("perf script output has no valid isuscope start marker")?;
+    let time_pattern = regex::Regex::new(r"(?P<time>[0-9]+(?:[.][0-9]+)?):")?;
+    let symbol_pattern = regex::Regex::new(r"(?P<symbol>.+?)\s+\((?P<dso>[^()]*)\)\s*$")?;
+    let mut buckets = BTreeMap::<(chrono::DateTime<Utc>, String, String, String), u64>::new();
+    let mut parsed_lines = 0_u64;
+    for line in raw.lines().filter(|line| !line.starts_with('#')) {
+        let Some(time_capture) = time_pattern.captures(line) else {
+            continue;
+        };
+        let Some(time_match) = time_capture.name("time") else {
+            continue;
+        };
+        let Some(symbol_capture) = symbol_pattern.captures(line) else {
+            continue;
+        };
+        let relative = time_match.as_str().parse::<f64>()?;
+        let wall = start + relative;
+        let seconds = wall.floor() as i64;
+        let nanos = ((wall - wall.floor()) * 1_000_000_000.0).round() as u32;
+        let Some(at) = chrono::DateTime::from_timestamp(seconds, nanos.min(999_999_999)) else {
+            continue;
+        };
+        let prefix = line[..time_match.start()].trim();
+        let process = prefix
+            .split_whitespace()
+            .take_while(|part| {
+                !(part.chars().all(|character| character.is_ascii_digit())
+                    || part.starts_with('[') && part.ends_with(']'))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let binary = symbol_capture
+            .name("dso")
+            .map(|value| value.as_str().trim())
+            .unwrap_or("-");
+        let raw_symbol = symbol_capture
+            .name("symbol")
+            .map(|value| value.as_str().trim())
+            .unwrap_or("-");
+        let after_event = raw_symbol
+            .rsplit_once(": ")
+            .map_or(raw_symbol, |(_, value)| value);
+        let mut symbol_fields = after_event.splitn(2, char::is_whitespace);
+        let first = symbol_fields.next().unwrap_or("-");
+        let symbol = if first.chars().all(|character| character.is_ascii_hexdigit()) {
+            symbol_fields.next().unwrap_or("-").trim()
+        } else {
+            after_event
+        };
+        let Some(bucket) = chrono::DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) else {
+            continue;
+        };
+        *buckets
+            .entry((
+                bucket,
+                if process.is_empty() { "-" } else { &process }.into(),
+                binary.into(),
+                symbol.into(),
+            ))
+            .or_default() += 1;
+        parsed_lines += 1;
+    }
+    if raw
+        .lines()
+        .any(|line| !line.starts_with('#') && !line.trim().is_empty())
+        && parsed_lines == 0
+    {
+        anyhow::bail!("perf script output contained samples but none matched the supported format");
+    }
+    let mut totals = BTreeMap::<chrono::DateTime<Utc>, u64>::new();
+    for ((at, _, _, _), count) in &buckets {
+        *totals.entry(*at).or_default() += count;
+    }
+    Ok(buckets
+        .into_iter()
+        .flat_map(|((timestamp, process, binary, symbol), count)| {
+            let labels = BTreeMap::from([
+                ("process".into(), process),
+                ("binary".into(), binary),
+                ("symbol".into(), symbol),
+            ]);
+            let percent = count as f64 / totals[&timestamp] as f64 * 100.0;
+            [
+                Metric {
+                    name: "cpu.sample_count".into(),
+                    value: count as f64,
+                    unit: "samples".into(),
+                    timestamp: Some(timestamp),
+                    labels: labels.clone(),
+                },
+                Metric {
+                    name: "cpu.sample_percent".into(),
+                    value: percent,
+                    unit: "percent".into(),
+                    timestamp: Some(timestamp),
+                    labels,
+                },
+            ]
+        })
+        .collect())
 }
 
 fn benchmark_interval(run_dir: &Path) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
@@ -575,53 +683,185 @@ fn parse_mysql_slow_series(
     raw: &str,
     interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
 ) -> Vec<Metric> {
-    let mut timestamp = None;
-    let mut buckets = BTreeMap::<chrono::DateTime<Utc>, (u64, f64)>::new();
+    #[derive(Default)]
+    struct Event {
+        timestamp: Option<chrono::DateTime<Utc>>,
+        duration_ms: Option<f64>,
+        query: Vec<String>,
+    }
+    #[derive(Default)]
+    struct Stats {
+        calls: u64,
+        total_ms: f64,
+        durations_ms: Vec<f64>,
+    }
+    fn flush(
+        event: &mut Event,
+        interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+        buckets: &mut BTreeMap<(chrono::DateTime<Utc>, String), Stats>,
+        aggregate: &mut BTreeMap<String, Stats>,
+    ) {
+        let (Some(at), Some(duration_ms)) = (event.timestamp, event.duration_ms) else {
+            *event = Event::default();
+            return;
+        };
+        if interval.is_some_and(|(start, end)| at < start || at > end) {
+            *event = Event::default();
+            return;
+        }
+        let query = event
+            .query
+            .iter()
+            .map(String::as_str)
+            .filter(|line| {
+                let line = line.trim_start();
+                !line.starts_with("SET timestamp=")
+                    && !line.starts_with("use ")
+                    && !line.starts_with("# administrator command:")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let digest = normalize_sql_digest(&query);
+        if digest.is_empty() {
+            *event = Event::default();
+            return;
+        }
+        if let Some(bucket) = chrono::DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) {
+            let stats = buckets.entry((bucket, digest.clone())).or_default();
+            stats.calls += 1;
+            stats.total_ms += duration_ms;
+        }
+        let stats = aggregate.entry(digest).or_default();
+        stats.calls += 1;
+        stats.total_ms += duration_ms;
+        stats.durations_ms.push(duration_ms);
+        *event = Event::default();
+    }
+
+    let mut event = Event::default();
+    let mut buckets = BTreeMap::<(chrono::DateTime<Utc>, String), Stats>::new();
+    let mut aggregate = BTreeMap::<String, Stats>::new();
     for line in raw.lines() {
         if let Some(value) = line.strip_prefix("# Time: ") {
-            timestamp = chrono::DateTime::parse_from_rfc3339(value.trim())
+            flush(&mut event, interval, &mut buckets, &mut aggregate);
+            event.timestamp = chrono::DateTime::parse_from_rfc3339(value.trim())
                 .ok()
                 .map(|value| value.with_timezone(&Utc));
-        } else if let Some(rest) = line.strip_prefix("# Query_time: ")
-            && let (Some(at), Some(seconds)) = (
-                timestamp,
-                rest.split_whitespace()
-                    .next()
-                    .and_then(|value| value.parse::<f64>().ok()),
-            )
-            && interval.is_none_or(|(start, end)| at >= start && at <= end)
-            && let Some(bucket) = chrono::DateTime::from_timestamp(at.timestamp() / 5 * 5, 0)
-        {
-            let values = buckets.entry(bucket).or_default();
-            values.0 += 1;
-            values.1 += seconds * 1_000.0;
+        } else if let Some(rest) = line.strip_prefix("# Query_time: ") {
+            event.duration_ms = rest
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<f64>().ok())
+                .map(|seconds| seconds * 1_000.0);
+        } else if event.duration_ms.is_some() && !line.starts_with("# User@Host:") {
+            event.query.push(line.to_owned());
         }
     }
-    let labels = BTreeMap::from([
-        ("engine".into(), "mysql".into()),
-        ("digest".into(), "all".into()),
-    ]);
-    buckets
-        .into_iter()
-        .flat_map(|(timestamp, (calls, duration))| {
-            [
-                Metric {
-                    name: "db.query.calls".into(),
-                    value: calls as f64,
-                    unit: "queries".into(),
-                    timestamp: Some(timestamp),
-                    labels: labels.clone(),
-                },
-                Metric {
-                    name: "db.query.total_duration".into(),
-                    value: duration,
-                    unit: "ms".into(),
-                    timestamp: Some(timestamp),
-                    labels: labels.clone(),
-                },
-            ]
-        })
-        .collect()
+    flush(&mut event, interval, &mut buckets, &mut aggregate);
+    let mut metrics = Vec::new();
+    for ((timestamp, digest), stats) in buckets {
+        let labels = BTreeMap::from([("engine".into(), "mysql".into()), ("digest".into(), digest)]);
+        metrics.extend([
+            Metric {
+                name: "db.query.calls".into(),
+                value: stats.calls as f64,
+                unit: "queries".into(),
+                timestamp: Some(timestamp),
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.total_duration".into(),
+                value: stats.total_ms,
+                unit: "ms".into(),
+                timestamp: Some(timestamp),
+                labels,
+            },
+        ]);
+    }
+    for (digest, mut stats) in aggregate {
+        let labels = BTreeMap::from([("engine".into(), "mysql".into()), ("digest".into(), digest)]);
+        stats.durations_ms.sort_by(f64::total_cmp);
+        let p95 = percentile_value(&stats.durations_ms, 0.95);
+        metrics.extend([
+            Metric {
+                name: "db.query.calls".into(),
+                value: stats.calls as f64,
+                unit: "queries".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.total_duration".into(),
+                value: stats.total_ms,
+                unit: "ms".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            },
+        ]);
+        if let Some(p95) = p95 {
+            metrics.push(Metric {
+                name: "db.query.p95_duration".into(),
+                value: p95,
+                unit: "ms".into(),
+                timestamp: None,
+                labels,
+            });
+        }
+    }
+    metrics
+}
+
+fn percentile_value(sorted: &[f64], quantile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = (quantile * sorted.len() as f64).ceil() as usize;
+    sorted.get(rank.saturating_sub(1)).copied()
+}
+
+fn normalize_sql_digest(query: &str) -> String {
+    let mut output = String::new();
+    let mut chars = query.chars().peekable();
+    let mut pending_space = false;
+    while let Some(character) = chars.next() {
+        if character.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if pending_space && !output.ends_with('(') && !output.ends_with(',') {
+            output.push(' ');
+        }
+        pending_space = false;
+        if matches!(character, '\'' | '"') {
+            let quote = character;
+            let mut escaped = false;
+            for next in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                } else if next == '\\' {
+                    escaped = true;
+                } else if next == quote {
+                    break;
+                }
+            }
+            output.push('?');
+        } else if character.is_ascii_digit() {
+            while chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '.' | 'x' | 'X'))
+            {
+                chars.next();
+            }
+            output.push('?');
+        } else {
+            output.extend(character.to_lowercase());
+        }
+        if output.len() >= 512 {
+            output.truncate(512);
+            break;
+        }
+    }
+    output.trim().trim_end_matches(';').trim().to_owned()
 }
 
 fn json_records(raw: &str) -> Result<Vec<Value>> {
@@ -1015,10 +1255,31 @@ fn make_spec(
     run_id: &str,
     run_dir: &Path,
 ) -> Result<ExecutionSpec> {
+    let route_matching_groups = if collector
+        .command
+        .iter()
+        .any(|argument| argument.contains("{route_matching_groups}"))
+    {
+        let path = config.project_root.join(".isuscope/routes.toml");
+        Some(
+            RouteNormalizer::load(path.is_file().then_some(path.as_path()))?
+                .alp_matching_groups()?,
+        )
+    } else {
+        None
+    };
     let expanded = collector
         .command
         .iter()
-        .map(|argument| replace_placeholders(argument, run_id, run_dir, node))
+        .map(|argument| {
+            replace_placeholders(
+                argument,
+                run_id,
+                run_dir,
+                node,
+                route_matching_groups.as_deref(),
+            )
+        })
         .collect::<Vec<_>>();
     let (program, args) = expanded
         .split_first()
@@ -1079,6 +1340,7 @@ fn replace_placeholders(
     run_id: &str,
     run_dir: &Path,
     node: Option<&NodeConfig>,
+    route_matching_groups: Option<&str>,
 ) -> String {
     value
         .replace("{run_id}", run_id)
@@ -1090,6 +1352,10 @@ fn replace_placeholders(
         .replace(
             "{host}",
             node.map(|node| node.host.as_str()).unwrap_or("localhost"),
+        )
+        .replace(
+            "{route_matching_groups}",
+            route_matching_groups.unwrap_or_default(),
         )
 }
 
@@ -1215,6 +1481,23 @@ mod tests {
         );
         assert!(parse_slp_tsv("").unwrap().is_empty());
         assert!(parse_slp_tsv("not tsv").is_err());
+    }
+
+    #[test]
+    fn perf_script_is_bucketed_by_symbol_and_process() {
+        let metrics =
+            parse_perf_script(include_str!("../tests/fixtures/perf-script-series.txt")).unwrap();
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "cpu.sample_count"
+                && metric.value == 2.0
+                && metric.labels.get("process").map(String::as_str) == Some("nginx")
+                && metric.timestamp.is_some()
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "cpu.sample_count"
+                && metric.value == 1.0
+                && metric.labels.get("process").map(String::as_str) == Some("isupipe-rust")
+        }));
     }
 
     #[test]
@@ -1352,15 +1635,27 @@ mod tests {
                 "2026-08-27T10:42:56Z".parse().unwrap(),
             )),
         );
-        assert_eq!(metrics.len(), 2);
+        let timestamped_calls = metrics
+            .iter()
+            .filter(|metric| metric.name == "db.query.calls" && metric.timestamp.is_some())
+            .map(|metric| metric.value)
+            .sum::<f64>();
+        let timestamped_duration = metrics
+            .iter()
+            .filter(|metric| metric.name == "db.query.total_duration" && metric.timestamp.is_some())
+            .map(|metric| metric.value)
+            .sum::<f64>();
+        assert_eq!(timestamped_calls, 10.0);
+        assert!((timestamped_duration - 76.788).abs() < 0.001);
         assert!(metrics.iter().any(|metric| {
-            metric.name == "db.query.calls"
-                && metric.value == 12.0
-                && metric.timestamp.map(|at| at.to_rfc3339())
-                    == Some("2026-08-27T10:42:55+00:00".into())
+            metric.timestamp.is_none()
+                && metric.labels.get("digest").map(String::as_str)
+                    == Some("select * from items where id=?")
         }));
-        assert!(metrics.iter().any(|metric| {
-            metric.name == "db.query.total_duration" && (metric.value - 76.872).abs() < 0.001
-        }));
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "db.query.p95_duration")
+        );
     }
 }

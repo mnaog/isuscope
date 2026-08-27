@@ -45,29 +45,24 @@ required = false
 |---|---|---|
 | alp | `http.requests`, `http.request_duration` | `node`, `method`, `route`; durationは`quantile` |
 | slp/pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration` | `node`, `engine`, `digest` |
-| perf | `cpu.sample_percent` | `node`, `symbol`, `binary` |
+| perf | `cpu.sample_percent`, `cpu.sample_count` | `node`, `process`, `symbol`, `binary` |
 | sysstat | `host.cpu_percent`, `host.disk_util_percent`, `host.disk_await` | `node`; diskは`device` |
 
-候補は単一の数式に混ぜません。HTTP、DB、CPU、host saturationの各カテゴリで候補を作り、根拠となる値とsourceを表示します。HTTPの`requests × p95`はendpoint内の順位には使えますが、CPU sampleやdisk awaitと直接比較できるスコアではありません。最大5件の表示では、まず観測できた各カテゴリの首位を1件ずつ残し、残枠をカテゴリ内の正規化値が高い候補で埋めます。表示番号はカテゴリ横断の改善優先順位を意味しません。未観測カテゴリも`unavailable`として明示します。改善によって支配的な待ち時間がHTTP、DB、CPU、diskの間を移るため、この結果は原因の断定ではなく、runごとに更新される次の調査対象です。
+候補は単一の数式に混ぜません。HTTP、DB、CPU、host saturationの各カテゴリで候補を作り、根拠となる値とsourceを表示します。HTTPの`requests × p95`はendpoint内の順位には使えますが、CPU sampleやdisk awaitと直接比較できるスコアではありません。最大5件の表示では、まず観測できた各カテゴリの首位を1件ずつ残し、残枠をカテゴリ内の正規化値が高い候補で埋めます。表示番号はカテゴリ横断の改善優先順位を意味しません。
 
-`isuscope init`が生成するconfigにはsysstat、perf、alp、slp collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`discovery-run`の両方で実行します。sysstat、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換し、perf reportはJSON Linesを出力します。alpとslpはログpathとformatが環境依存なので、生成された安全な既定値を実環境へ合わせます。各ツールの生出力も圧縮保存されます。
+候補生成には`timestamp`のないrun集約だけを使い、5秒seriesを加算しません。同じ対象の時系列があれば`strength=direct`、さらに同じnode・bucketでCPU/disk高負荷があれば`corroborated`、なければ`summary-only`です。これは調査根拠の強さであって、相関から原因を断定するものではありません。coverageには関連collectorのnode、status、errorを併記し、metricがない理由を「未設定」「unavailable」「failed」から切り分けます。
 
-ALP adapterと行動遷移helperは同じ`routes.toml`を使います。ALPが正規化前のURIを複数recordへ分けて返した場合、adapterはrequest数を合計し、再計算できないp95は候補を過小評価しないよう最大値を採用します。
+`isuscope init`が生成するconfigにはsysstat、perf、alp、slp collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`discovery-run`の両方で実行します。sysstat、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfはrun集約のreportと5秒ごとのsymbol seriesの両方を生成します。alpとslpはログpathとformatが環境依存なので、生成された安全な既定値を実環境へ合わせます。各ツールの生出力も圧縮保存されます。
 
-`isuscope bottleneck`は上記の共通metricが存在するカテゴリを横断して候補を生成します。残る拡張順は以下です。
+ALP adapterと行動遷移helperは同じ`routes.toml`を使います。標準設定は各正規表現をALP 1.0.21の`--matching-groups`へ解析前に渡すため、正規化route単位の正確なp95をALP自身が計算します。ALPの区切り文字と衝突するcommaをpatternへ含められず、置換後routeを一意に戻すため`replace`の`$1`などのcaptureも使用できません。該当routeは1規則ずつに分割し、固定のcanonical routeへ置換します。制約違反はcollector実行前に設定エラーとして拒否します。
 
-1. alp/slpの問題固有log formatとpathをSETUP時に確定する。
-2. 各カテゴリのcoverageが実際のcollector状態と一致することを検証する。
-3. 複数sourceが同じ待ち時間を裏付ける場合に、その関連をevidenceへ追加する。
-4. 同じtooling fingerprintを持つrun間で候補の増減を比較する。
-
-この順序なら、推測だけの総合点を先に作らず、観測データと欠測状態を正しく蓄積してからランキングを拡張できます。
+`isuscope bottleneck`は上記の共通metricが存在するカテゴリを横断して候補を生成します。実環境では最初にlog path・formatを確定し、`isuscope metrics`でmetric/label一覧、`isuscope series`で該当時間帯、`bottleneck`で次の調査候補という順に確認します。
 
 ## 時系列
 
 `host-sampler`は追加packageなしで`/proc`からCPU使用率、使用memory、load averageを1秒間隔で記録します。sysstatが利用できる環境では、CPUとdiskの各`sar` sampleもUTCの観測時刻付きで保存し、従来のrun全体平均もbottleneck判定用に残します。
 
-行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logは`mysql-log-delta`が5秒bucketのquery数と合計実行時間へ変換します。bucket値には`timestamp`があり、`isuscope series`またはSQLiteから参照できます。
+行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logはSQL literalを`?`へ正規化したdigestごとに、run集約のquery数・合計時間・p95と5秒bucketのquery数・合計時間を出します。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、`isuscope metrics`、filter可能な`isuscope series`またはSQLiteから参照できます。
 
 after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
 

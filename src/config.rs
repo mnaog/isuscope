@@ -167,6 +167,7 @@ pub enum CollectorParser {
     SlpJson,
     SlpTsv,
     Sysstat,
+    PerfScript,
 }
 
 #[derive(Debug, Clone, Deserialize)]

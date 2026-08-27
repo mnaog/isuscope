@@ -220,10 +220,23 @@ isuscope show latest
 - HTTP metricが0件でない
 - session fieldがある場合、transitionが0件でない
 - 動的routeの未正規化によるseries爆発がない
+- `perf-record`、`perf-report`、`perf-series`が全対象nodeで`complete`である
+- `isuscope metrics latest`で`cpu.sample_count`の時刻付き行が0件でなく、process・binary・symbol labelがある
+- perf stderrにlost sample、permission、unsupported eventの警告がなく、`[unknown]`や`-`のsymbol率が調査を妨げるほど高くない
 - benchmark stdout/stderrが圧縮保存されている
 - `tooling/extra/benchmark.sh`に当日実装が保存されている
 
 `degraded`はベンチ自体がPASSでもcollectorが失敗した状態です。失敗collectorのstderrを確認し、受け入れ確認では`complete`になるまで直します。
+
+perfはhost kernel、`perf_event_paranoid`、sudoers、kernel symbol公開範囲に依存するため、macOSやDocker上のparserテストだけでは受け入れ完了にしません。最初のLinux runでは次も確認します。
+
+```console
+isuscope metrics latest
+isuscope series latest --metric cpu.sample_count --bucket 5
+isuscope series latest --metric cpu.sample_percent --node app1 --bucket 5
+```
+
+対象processのsampleが全bucketで0件なら、アプリが軽いと結論づける前にcollector logとprocess/binary labelを確認します。観測条件を変更した場合、その前後のrunは同条件のスコア比較に使いません。
 
 `isuscope show latest`は各圧縮ログの直下に`zstd -dc -- '<path>'`を表示します。collectorが`failed`の場合はstderr logの`view`行をそのままコピーして原因を確認します。
 

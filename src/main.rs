@@ -50,11 +50,35 @@ enum Commands {
         #[arg(default_value = "latest")]
         run: String,
     },
-    /// 時刻付きmetricを5秒bucketの表で表示します。
+    /// metric名、時刻範囲、label cardinalityを一覧表示します。
+    Metrics {
+        /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+    },
+    /// 時刻付きmetricをbucket化した表で表示します。
     Series {
         /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
         #[arg(default_value = "latest")]
         run: String,
+        /// 表示するmetric名。複数回指定できます。指定時は汎用metric表になります。
+        #[arg(long = "metric")]
+        metrics: Vec<String>,
+        /// node labelで絞り込みます。
+        #[arg(long)]
+        node: Option<String>,
+        /// `key=value`形式のlabel完全一致。複数回指定できます。
+        #[arg(long = "label", value_parser = parse_label_filter)]
+        labels: Vec<(String, String)>,
+        /// benchmark開始からの表示開始秒。
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        /// benchmark開始からの表示終了秒。省略時は終了までです。
+        #[arg(long)]
+        to: Option<u64>,
+        /// bucket幅（秒）。
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        bucket: u64,
     },
     /// 保存済みbenchmark logへ現在のparserを適用します。
     Enrich {
@@ -256,8 +280,31 @@ async fn real_main() -> Result<bool> {
             show_bottlenecks(&config, &run)?;
             Ok(true)
         }
-        Commands::Series { run } => {
-            show_series(&config, &run)?;
+        Commands::Metrics { run } => {
+            show_metrics(&config, &run)?;
+            Ok(true)
+        }
+        Commands::Series {
+            run,
+            metrics,
+            node,
+            labels,
+            from,
+            to,
+            bucket,
+        } => {
+            show_series(
+                &config,
+                &run,
+                SeriesOptions {
+                    metrics,
+                    node,
+                    labels,
+                    from,
+                    to,
+                    bucket,
+                },
+            )?;
             Ok(true)
         }
         Commands::Enrich { run } => {
@@ -379,7 +426,95 @@ struct BucketRow {
     db_time: f64,
 }
 
-fn show_series(config: &LoadedConfig, requested: &str) -> Result<()> {
+#[derive(Debug)]
+struct SeriesOptions {
+    metrics: Vec<String>,
+    node: Option<String>,
+    labels: Vec<(String, String)>,
+    from: u64,
+    to: Option<u64>,
+    bucket: u64,
+}
+
+fn parse_label_filter(value: &str) -> std::result::Result<(String, String), String> {
+    let Some((key, value)) = value.split_once('=') else {
+        return Err("label must use key=value syntax".into());
+    };
+    if key.is_empty() || value.is_empty() {
+        return Err("label key and value must not be empty".into());
+    }
+    Ok((key.into(), value.into()))
+}
+
+#[derive(Default)]
+struct MetricInventory {
+    rows: usize,
+    timestamped: usize,
+    units: BTreeSet<String>,
+    first: Option<chrono::DateTime<chrono::Utc>>,
+    last: Option<chrono::DateTime<chrono::Utc>>,
+    labels: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn show_metrics(config: &LoadedConfig, requested: &str) -> Result<()> {
+    let store = Store::open(&config.data_dir)?;
+    let id = store
+        .resolve_id(requested)?
+        .with_context(|| format!("run `{requested}` was not found"))?;
+    let mut inventory = BTreeMap::<String, MetricInventory>::new();
+    for metric in store.metrics(&id)? {
+        let entry = inventory.entry(metric.name).or_default();
+        entry.rows += 1;
+        entry.units.insert(metric.unit);
+        if let Some(at) = metric.timestamp {
+            entry.timestamped += 1;
+            entry.first = Some(entry.first.map_or(at, |current| current.min(at)));
+            entry.last = Some(entry.last.map_or(at, |current| current.max(at)));
+        }
+        for (key, value) in metric.labels {
+            entry.labels.entry(key).or_default().insert(value);
+        }
+    }
+    println!("run {}", id);
+    println!(
+        "{:<34} {:>8} {:>8}  {:<16}  {:<20}",
+        "NAME", "ROWS", "TIMED", "UNIT", "TIME RANGE"
+    );
+    for (name, item) in &inventory {
+        let range = match (item.first, item.last) {
+            (Some(first), Some(last)) => format!("{}..{}", first.to_rfc3339(), last.to_rfc3339()),
+            _ => "aggregate-only".into(),
+        };
+        println!(
+            "{:<34} {:>8} {:>8}  {:<16}  {}",
+            name,
+            item.rows,
+            item.timestamped,
+            item.units.iter().cloned().collect::<Vec<_>>().join("|"),
+            range
+        );
+        for (key, values) in &item.labels {
+            let examples = values
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  label {:<18} values={:<6} examples={}",
+                key,
+                values.len(),
+                examples
+            );
+        }
+    }
+    if inventory.is_empty() {
+        println!("no metrics");
+    }
+    Ok(())
+}
+
+fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     let id = store
         .resolve_id(requested)?
@@ -391,23 +526,29 @@ fn show_series(config: &LoadedConfig, requested: &str) -> Result<()> {
         .finished_at
         .or(manifest.finished_at)
         .unwrap_or(start);
-    let first_bucket = start.timestamp().div_euclid(5) * 5;
+    let requested_end = options
+        .to
+        .map(|seconds| start + chrono::Duration::seconds(seconds as i64))
+        .unwrap_or(end)
+        .min(end);
+    let requested_start =
+        (start + chrono::Duration::seconds(options.from as i64)).min(requested_end);
+    let bucket_seconds = options.bucket as i64;
+    let first_bucket = requested_start.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
     let duration = (end - start).num_seconds().max(0);
+    let metrics = store
+        .metrics(&id)?
+        .into_iter()
+        .filter(|metric| metric_matches(metric, &options, first_bucket, requested_end))
+        .collect::<Vec<_>>();
+    if !options.metrics.is_empty() {
+        return show_generic_series(&id, start, requested_end, &options, metrics);
+    }
     let mut rows = BTreeMap::<(String, i64), BucketRow>::new();
-    let mut nodes = config
-        .config
-        .nodes
-        .iter()
-        .map(|node| node.name.clone())
-        .collect::<BTreeSet<_>>();
-    for metric in store.metrics(&id)? {
-        let Some(at) = metric
-            .timestamp
-            .filter(|at| at.timestamp() >= first_bucket && *at <= end)
-        else {
-            continue;
-        };
-        let bucket = at.timestamp().div_euclid(5) * 5;
+    let mut nodes = BTreeSet::new();
+    for metric in metrics {
+        let Some(at) = metric.timestamp else { continue };
+        let bucket = at.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
         let node = metric
             .labels
             .get("node")
@@ -438,14 +579,17 @@ fn show_series(config: &LoadedConfig, requested: &str) -> Result<()> {
         }
     }
     for node in nodes {
-        for bucket in (first_bucket..=end.timestamp()).step_by(5) {
+        for bucket in (first_bucket..=requested_end.timestamp()).step_by(options.bucket as usize) {
             rows.entry((node.clone(), bucket)).or_default();
         }
     }
     println!("run {}", id);
     println!("benchmark {} .. {}", start.to_rfc3339(), end.to_rfc3339());
     print_series_coverage(&manifest.collectors);
-    println!("bucket 5s; A/M=average/max; HTTP P95=max route p95; -=not observed (see coverage)");
+    println!(
+        "bucket {}s; A/M=average/max; HTTP P95=max-of-p95 (not recomputed); -=not observed (see coverage)",
+        options.bucket
+    );
     println!(
         "{:<10} {:<7} {:>11} {:>9} {:>8} {:>11} {:>11} {:>9} {:>9} {:>7} {:>9} {:>10}",
         "NODE",
@@ -467,7 +611,7 @@ fn show_series(config: &LoadedConfig, requested: &str) -> Result<()> {
     for ((node, bucket), row) in rows {
         let bucket_offset = bucket - start.timestamp();
         let from = bucket_offset.max(0);
-        let to = (bucket_offset + 5).min(duration.max(1));
+        let to = (bucket_offset + bucket_seconds).min(duration.max(1));
         println!(
             "{:<10} {:<7} {:>11} {:>9} {:>8} {:>11} {:>11} {:>9} {:>9} {:>7} {:>9} {:>10}",
             node,
@@ -487,6 +631,139 @@ fn show_series(config: &LoadedConfig, requested: &str) -> Result<()> {
     Ok(())
 }
 
+fn metric_matches(
+    metric: &isuscope::model::Metric,
+    options: &SeriesOptions,
+    first_bucket: i64,
+    end: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if !options.metrics.is_empty() && !options.metrics.contains(&metric.name) {
+        return false;
+    }
+    if let Some(node) = &options.node
+        && metric.labels.get("node") != Some(node)
+    {
+        return false;
+    }
+    if options
+        .labels
+        .iter()
+        .any(|(key, value)| metric.labels.get(key) != Some(value))
+    {
+        return false;
+    }
+    metric
+        .timestamp
+        .is_some_and(|at| at.timestamp() >= first_bucket && at <= end)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SeriesAggregation {
+    Sum,
+    Average,
+    MaxOfQuantile,
+}
+
+impl SeriesAggregation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Average => "average",
+            Self::MaxOfQuantile => "max-of-quantile",
+        }
+    }
+}
+
+fn aggregation_for(metric: &isuscope::model::Metric) -> SeriesAggregation {
+    if metric.labels.contains_key("quantile") {
+        return SeriesAggregation::MaxOfQuantile;
+    }
+    if matches!(
+        metric.name.as_str(),
+        "http.requests"
+            | "http.errors"
+            | "http.response_bytes"
+            | "http.connection_reused_requests"
+            | "db.query.calls"
+            | "db.query.total_duration"
+            | "cpu.sample_count"
+    ) {
+        SeriesAggregation::Sum
+    } else {
+        SeriesAggregation::Average
+    }
+}
+
+fn show_generic_series(
+    id: &str,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    options: &SeriesOptions,
+    metrics: Vec<isuscope::model::Metric>,
+) -> Result<()> {
+    type SeriesKey = (String, i64, String, String, String);
+    let mut rows = BTreeMap::<SeriesKey, (SeriesAggregation, Vec<f64>)>::new();
+    let bucket_seconds = options.bucket as i64;
+    for metric in metrics {
+        let Some(at) = metric.timestamp else { continue };
+        let node = metric
+            .labels
+            .get("node")
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        let bucket = at.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
+        let labels = metric
+            .labels
+            .iter()
+            .filter(|(key, _)| key.as_str() != "node")
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let aggregation = aggregation_for(&metric);
+        rows.entry((node, bucket, metric.name, metric.unit, labels))
+            .or_insert_with(|| (aggregation, Vec::new()))
+            .1
+            .push(metric.value);
+    }
+    println!("run {id}");
+    println!("benchmark {} .. {}", start.to_rfc3339(), end.to_rfc3339());
+    println!(
+        "bucket {}s; quantiles use max-of-quantile and are not recomputed",
+        options.bucket
+    );
+    println!(
+        "{:<10} {:<12} {:<34} {:>14} {:<14} {:<16}  LABELS",
+        "NODE", "ELAPSED", "METRIC", "VALUE", "UNIT", "AGGREGATION"
+    );
+    let empty = rows.is_empty();
+    for ((node, bucket, name, unit, labels), (aggregation, values)) in rows {
+        let value = match aggregation {
+            SeriesAggregation::Sum => values.iter().sum(),
+            SeriesAggregation::Average => values.iter().sum::<f64>() / values.len() as f64,
+            SeriesAggregation::MaxOfQuantile => {
+                values.iter().copied().reduce(f64::max).unwrap_or_default()
+            }
+        };
+        let from = (bucket - start.timestamp()).max(0);
+        let to =
+            (bucket - start.timestamp() + bucket_seconds).min((end - start).num_seconds().max(1));
+        println!(
+            "{:<10} {:<12} {:<34} {:>14.3} {:<14} {:<16}  {}",
+            node,
+            format!("{from}-{to}s"),
+            name,
+            value,
+            unit,
+            aggregation.name(),
+            labels
+        );
+    }
+    if empty {
+        println!("no matching timestamped metrics");
+    }
+    Ok(())
+}
+
 fn preferred_cpu(row: &BucketRow) -> &[f64] {
     if !row.cpu_host_sampler.is_empty() {
         &row.cpu_host_sampler
@@ -498,12 +775,13 @@ fn preferred_cpu(row: &BucketRow) -> &[f64] {
 }
 
 fn print_series_coverage(collectors: &[isuscope::model::CollectorResult]) {
-    const SERIES_COLLECTORS: [&str; 5] = [
+    const SERIES_COLLECTORS: [&str; 6] = [
         "host-sampler",
         "sysstat",
         "nginx-log-delta",
         "nginx-series",
         "mysql-log-delta",
+        "perf-series",
     ];
     println!("coverage");
     let relevant = collectors
@@ -576,7 +854,8 @@ fn show_bottlenecks(config: &LoadedConfig, requested: &str) -> Result<()> {
     let id = store
         .resolve_id(requested)?
         .with_context(|| format!("run `{requested}` was not found"))?;
-    let report = bottleneck::rank(&store.metrics(&id)?);
+    let manifest = store.load(&id)?;
+    let report = bottleneck::rank(&store.metrics(&id)?, &manifest.collectors);
     println!("run {}", id);
     println!("candidates: one leader per observed category, then category-local severity");
     println!("note: numbers are not a cross-category remediation priority");
@@ -598,17 +877,19 @@ fn show_bottlenecks(config: &LoadedConfig, requested: &str) -> Result<()> {
             item.source
         );
         println!("      verify: {}", item.verify_metric);
+        println!("      strength: {}", item.strength);
     }
     println!("coverage");
     for coverage in report.coverage {
         println!(
-            "  {:<10} {}",
+            "  {:<10} {:<11} {}",
             coverage.category,
             if coverage.available {
                 "complete"
             } else {
                 "unavailable"
-            }
+            },
+            coverage.detail
         );
     }
     Ok(())

@@ -23,6 +23,7 @@ struct RouteRuleConfig {
 }
 
 struct RouteRule {
+    source: String,
     pattern: Regex,
     replace: String,
 }
@@ -39,7 +40,34 @@ impl RouteNormalizer {
     }
 
     pub fn normalize(&self, uri: &str) -> String {
+        if let Some(rule) = self.rules.iter().find(|rule| rule.source == uri) {
+            return rule.replace.clone();
+        }
         normalize(uri, &self.rules)
+    }
+
+    pub fn alp_matching_groups(&self) -> Result<String> {
+        for rule in &self.rules {
+            if rule.source.contains(',') {
+                anyhow::bail!(
+                    "ALP matching-group pattern cannot contain a comma: {}",
+                    rule.source
+                );
+            }
+            if rule.replace.contains('$') {
+                anyhow::bail!(
+                    "ALP matching groups require a canonical replacement without captures: {} -> {}",
+                    rule.source,
+                    rule.replace
+                );
+            }
+        }
+        Ok(self
+            .rules
+            .iter()
+            .map(|rule| rule.source.as_str())
+            .collect::<Vec<_>>()
+            .join(","))
     }
 }
 
@@ -324,6 +352,7 @@ fn load_rules(path: Option<&Path>) -> Result<Vec<RouteRule>> {
         .into_iter()
         .map(|rule| {
             Ok(RouteRule {
+                source: rule.pattern.clone(),
                 pattern: Regex::new(&rule.pattern)
                     .with_context(|| format!("invalid route pattern `{}`", rule.pattern))?,
                 replace: rule.replace,
@@ -565,10 +594,12 @@ mod tests {
         let rules = RouteNormalizer {
             rules: vec![
                 RouteRule {
+                    source: r"^/api/user/[^/]+/icon$".into(),
                     pattern: Regex::new(r"^/api/user/[^/]+/icon$").unwrap(),
                     replace: "/api/user/:name/icon".into(),
                 },
                 RouteRule {
+                    source: r"^/api/livestream/[0-9]+$".into(),
                     pattern: Regex::new(r"^/api/livestream/[0-9]+$").unwrap(),
                     replace: "/api/livestream/:id".into(),
                 },
@@ -662,5 +693,51 @@ mod tests {
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.95), Some(4.0));
         assert_eq!(status_class("304"), "3xx");
         assert_eq!(parse_upstream_seconds_ms("0.001, 0.002"), Some(3.0));
+    }
+
+    #[test]
+    fn alp_matching_groups_preserve_exact_route_percentiles() {
+        let rules = RouteNormalizer {
+            rules: vec![RouteRule {
+                source: r"^/api/livestream/[0-9]+/reaction$".into(),
+                pattern: Regex::new(r"^/api/livestream/[0-9]+/reaction$").unwrap(),
+                replace: "/api/livestream/:id/reaction".into(),
+            }],
+        };
+        assert_eq!(
+            rules.alp_matching_groups().unwrap(),
+            r"^/api/livestream/[0-9]+/reaction$"
+        );
+        // ALP returns the matching regexp in its uri column. The adapter must
+        // translate that value to the same canonical route as raw access logs.
+        assert_eq!(
+            rules.normalize(r"^/api/livestream/[0-9]+/reaction$"),
+            "/api/livestream/:id/reaction"
+        );
+        assert_eq!(
+            rules.normalize("/api/livestream/42/reaction"),
+            "/api/livestream/:id/reaction"
+        );
+    }
+
+    #[test]
+    fn alp_matching_groups_reject_ambiguous_rules() {
+        let captured = RouteNormalizer {
+            rules: vec![RouteRule {
+                source: r"^/api/(user|livestream)/([^/]+)$".into(),
+                pattern: Regex::new(r"^/api/(user|livestream)/([^/]+)$").unwrap(),
+                replace: "/api/$1/:id".into(),
+            }],
+        };
+        assert!(captured.alp_matching_groups().is_err());
+
+        let comma = RouteNormalizer {
+            rules: vec![RouteRule {
+                source: r"^/api/(foo,bar)$".into(),
+                pattern: Regex::new(r"^/api/(foo,bar)$").unwrap(),
+                replace: "/api/:name".into(),
+            }],
+        };
+        assert!(comma.alp_matching_groups().is_err());
     }
 }

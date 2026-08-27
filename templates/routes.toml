@@ -1,15 +1,40 @@
 # 動的な値を含むURIを安定したroute名へ正規化します。
+# ALPでも同じ規則を使えるよう、各patternは単一のcanonical routeへ対応させます。
 [[routes]]
-pattern = "^/(etag|base|dynamic|fallback-users)/[^/]+$"
-replace = "/$1/:key"
+pattern = "^/etag/[^/]+$"
+replace = "/etag/:key"
+
+[[routes]]
+pattern = "^/base/[^/]+$"
+replace = "/base/:key"
+
+[[routes]]
+pattern = "^/dynamic/[^/]+$"
+replace = "/dynamic/:key"
+
+[[routes]]
+pattern = "^/fallback-users/[^/]+$"
+replace = "/fallback-users/:key"
 
 [[routes]]
 pattern = "^/api/user/[^/]+/icon$"
 replace = "/api/user/:name/icon"
 
 [[routes]]
-pattern = "^/api/user/[^/]+/(livestream|livestreams|statistics|theme)$"
-replace = "/api/user/:name/$1"
+pattern = "^/api/user/[^/]+/livestream$"
+replace = "/api/user/:name/livestream"
+
+[[routes]]
+pattern = "^/api/user/[^/]+/livestreams$"
+replace = "/api/user/:name/livestreams"
+
+[[routes]]
+pattern = "^/api/user/[^/]+/statistics$"
+replace = "/api/user/:name/statistics"
+
+[[routes]]
+pattern = "^/api/user/[^/]+/theme$"
+replace = "/api/user/:name/theme"
 
 [[routes]]
 pattern = "^/api/user/[^/]+$"
@@ -20,8 +45,36 @@ pattern = "^/api/livestream/[0-9]+$"
 replace = "/api/livestream/:id"
 
 [[routes]]
-pattern = "^/api/livestream/[0-9]+/(livecomment|reaction|enter|exit|statistics|report|moderate|ngwords)$"
-replace = "/api/livestream/:id/$1"
+pattern = "^/api/livestream/[0-9]+/livecomment$"
+replace = "/api/livestream/:id/livecomment"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/reaction$"
+replace = "/api/livestream/:id/reaction"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/enter$"
+replace = "/api/livestream/:id/enter"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/exit$"
+replace = "/api/livestream/:id/exit"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/statistics$"
+replace = "/api/livestream/:id/statistics"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/report$"
+replace = "/api/livestream/:id/report"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/moderate$"
+replace = "/api/livestream/:id/moderate"
+
+[[routes]]
+pattern = "^/api/livestream/[0-9]+/ngwords$"
+replace = "/api/livestream/:id/ngwords"
 
 [[routes]]
 pattern = "^/api/livestream/[0-9]+/livecomment/[0-9]+/report$"

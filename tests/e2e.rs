@@ -98,7 +98,15 @@ fn init_is_non_interactive_and_preserves_existing_files() {
     assert!(generated.contains("gzip -t"));
     let parsed: toml::Value = toml::from_str(&generated).unwrap();
     let collectors = parsed["collectors"].as_array().unwrap();
-    for name in ["nginx-log-delta", "alp", "mysql-log-delta", "slp"] {
+    for name in [
+        "perf-record",
+        "perf-report",
+        "perf-series",
+        "nginx-log-delta",
+        "alp",
+        "mysql-log-delta",
+        "slp",
+    ] {
         let collector = collectors
             .iter()
             .find(|collector| collector["name"].as_str() == Some(name))
@@ -118,6 +126,7 @@ fn init_is_non_interactive_and_preserves_existing_files() {
         "sysstat",
         "perf-record",
         "perf-report",
+        "perf-series",
         "nginx-log-mark",
         "nginx-log-delta",
         "alp",
@@ -623,6 +632,40 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert!(series_stdout.contains("bucket 5s"));
     assert!(series_stdout.contains("CPU A/M%"));
     assert!(series_stdout.contains("0-"));
+
+    let metrics = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["metrics", "latest"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(metrics.status.success());
+    let metrics_stdout = String::from_utf8(metrics.stdout).unwrap();
+    assert!(metrics_stdout.contains("NAME"));
+    assert!(metrics_stdout.contains("cpu"));
+    assert!(metrics_stdout.contains("label collector"));
+    assert!(metrics_stdout.contains("calculated"));
+
+    let filtered = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "series",
+            "latest",
+            "--metric",
+            "cpu",
+            "--label",
+            "collector=calculated",
+            "--bucket",
+            "10",
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(filtered.status.success());
+    let filtered_stdout = String::from_utf8(filtered.stdout).unwrap();
+    assert!(filtered_stdout.contains("bucket 10s"));
+    assert!(filtered_stdout.contains("cpu"));
+    assert!(filtered_stdout.contains("12.500"));
+    assert!(filtered_stdout.contains("average"));
+    assert!(filtered_stdout.contains("collector=calculated"));
     assert!(run_dir.join("tooling/config.toml").is_file());
     assert!(run_dir.join("tooling/isuscope-version.txt").is_file());
     assert_eq!(manifest["schema_version"], 6);
@@ -631,7 +674,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         "collectors preserve benchmark evidence"
     );
     assert_eq!(manifest["analysis_status"], "pending");
-    assert_eq!(manifest["tooling"]["isuscope_version"], "0.7.0");
+    assert_eq!(manifest["tooling"]["isuscope_version"], "0.8.0");
     assert_eq!(
         manifest["tooling"]["config_sha256"].as_str().unwrap().len(),
         64
