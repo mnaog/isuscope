@@ -1,7 +1,10 @@
 use crate::{
     collector,
     enrichment::{EnrichmentOutput, PARSER_LABEL},
-    model::{Fingerprint, Metric, RunManifest, RunState, Transition},
+    model::{
+        AnalysisStatus, AnalysisVerdict, Fingerprint, Metric, RunAnalysis, RunManifest, RunState,
+        Transition,
+    },
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -10,6 +13,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use uuid::Uuid;
 
 pub struct Store {
     data_dir: PathBuf,
@@ -28,6 +32,16 @@ pub struct RunSummary {
     pub passed: Option<bool>,
     pub note: Option<String>,
     pub tags: Vec<String>,
+    pub hypothesis: String,
+    pub analysis_status: String,
+    pub latest_analysis_verdict: Option<String>,
+    pub latest_analysis_body: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PendingAnalysis {
+    pub id: String,
+    pub hypothesis: String,
 }
 
 impl Store {
@@ -74,6 +88,7 @@ impl Store {
             manifest.benchmark.interrupted = true;
             manifest.benchmark.error =
                 Some("recovered after an interrupted isuscope process".into());
+            manifest.analysis_status = AnalysisStatus::NotRequired;
             write_manifest(&staging, &manifest)?;
             let final_dir = self.final_dir(&manifest.id);
             if final_dir.exists() {
@@ -81,7 +96,7 @@ impl Store {
             }
             fs::rename(&staging, &final_dir)?;
             self.connection.execute(
-                "INSERT OR IGNORE INTO runs (id, started_at, mode, state, commit_hash, dirty, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO runs (id, started_at, mode, state, commit_hash, dirty, note, hypothesis, analysis_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     manifest.id,
                     manifest.started_at.to_rfc3339(),
@@ -90,16 +105,19 @@ impl Store {
                     manifest.source.commit_hash,
                     manifest.source.dirty,
                     manifest.note,
+                    manifest.hypothesis,
+                    manifest.analysis_status.as_str(),
                 ],
             )?;
             self.connection.execute(
-                "UPDATE runs SET finished_at=?2, state=?3, score=?4, passed=0, exit_code=?5 WHERE id=?1",
+                "UPDATE runs SET finished_at=?2, state=?3, score=?4, passed=0, exit_code=?5, analysis_status=?6 WHERE id=?1",
                 params![
                     manifest.id,
                     manifest.finished_at.map(|value| value.to_rfc3339()),
                     manifest.state.as_str(),
                     manifest.benchmark.score,
                     manifest.benchmark.exit_code,
+                    manifest.analysis_status.as_str(),
                 ],
             )?;
             for tag in &manifest.tags {
@@ -126,7 +144,7 @@ impl Store {
         fs::create_dir_all(staging.join("tmp"))?;
         write_manifest(&staging, manifest)?;
         self.connection.execute(
-            "INSERT INTO runs (id, started_at, mode, state, commit_hash, dirty, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO runs (id, started_at, mode, state, commit_hash, dirty, note, hypothesis, analysis_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 manifest.id,
                 manifest.started_at.to_rfc3339(),
@@ -135,6 +153,8 @@ impl Store {
                 manifest.source.commit_hash,
                 manifest.source.dirty,
                 manifest.note,
+                manifest.hypothesis,
+                manifest.analysis_status.as_str(),
             ],
         )?;
         for tag in &manifest.tags {
@@ -166,7 +186,7 @@ impl Store {
 
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "UPDATE runs SET finished_at=?2, state=?3, commit_hash=?4, dirty=?5, score=?6, passed=?7, exit_code=?8, note=?9 WHERE id=?1",
+            "UPDATE runs SET finished_at=?2, state=?3, commit_hash=?4, dirty=?5, score=?6, passed=?7, exit_code=?8, note=?9, hypothesis=?10, analysis_status=?11 WHERE id=?1",
             params![
                 manifest.id,
                 manifest.finished_at.map(|value| value.to_rfc3339()),
@@ -177,6 +197,8 @@ impl Store {
                 manifest.benchmark.passed,
                 manifest.benchmark.exit_code,
                 manifest.note,
+                manifest.hypothesis,
+                manifest.analysis_status.as_str(),
             ],
         )?;
         for log in &manifest.logs {
@@ -224,13 +246,28 @@ impl Store {
                 ],
             )?;
         }
+        for analysis in &manifest.analyses {
+            transaction.execute(
+                "INSERT INTO run_analyses (id, run_id, created_at, verdict, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    analysis.id,
+                    manifest.id,
+                    analysis.created_at.to_rfc3339(),
+                    analysis.verdict.as_str(),
+                    analysis.body,
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(final_dir)
     }
 
     pub fn list(&self, limit: usize) -> Result<Vec<RunSummary>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, started_at, commit_hash, dirty, mode, state, score, passed, note FROM runs ORDER BY started_at DESC LIMIT ?1",
+            "SELECT r.id, r.started_at, r.commit_hash, r.dirty, r.mode, r.state, r.score, r.passed, r.note, r.hypothesis, r.analysis_status,
+                    (SELECT a.verdict FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1),
+                    (SELECT a.body FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1)
+             FROM runs r ORDER BY r.started_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit as i64], |row| {
             Ok(RunSummary {
@@ -244,6 +281,10 @@ impl Store {
                 passed: row.get(7)?,
                 note: row.get(8)?,
                 tags: Vec::new(),
+                hypothesis: row.get(9)?,
+                analysis_status: row.get(10)?,
+                latest_analysis_verdict: row.get(11)?,
+                latest_analysis_body: row.get(12)?,
             })
         })?;
         let mut runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -350,6 +391,74 @@ impl Store {
             .query_map([id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn pending_analyses(&self) -> Result<Vec<PendingAnalysis>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, hypothesis FROM runs WHERE passed=1 AND analysis_status='pending' ORDER BY started_at",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(PendingAnalysis {
+                    id: row.get(0)?,
+                    hypothesis: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn append_analysis(
+        &mut self,
+        id: &str,
+        verdict: AnalysisVerdict,
+        body: String,
+    ) -> Result<RunManifest> {
+        if !self.final_dir(id).is_dir() {
+            bail!("run `{id}` is not finalized");
+        }
+        if body.trim().is_empty() {
+            bail!("analysis body must not be empty");
+        }
+        let mut manifest = self.load(id)?;
+        if manifest.benchmark.passed != Some(true) {
+            bail!("only a passing run can be analyzed: `{id}`");
+        }
+        if verdict == AnalysisVerdict::Skipped
+            && manifest.analysis_status != AnalysisStatus::Pending
+        {
+            bail!("only an analysis-pending run can be skipped: `{id}`");
+        }
+        let analysis = RunAnalysis {
+            id: Uuid::now_v7().to_string(),
+            created_at: Utc::now(),
+            verdict,
+            body,
+        };
+        manifest.analysis_status = if verdict == AnalysisVerdict::Skipped {
+            AnalysisStatus::Skipped
+        } else {
+            AnalysisStatus::Complete
+        };
+        manifest.analyses.push(analysis.clone());
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO run_analyses (id, run_id, created_at, verdict, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                analysis.id,
+                manifest.id,
+                analysis.created_at.to_rfc3339(),
+                analysis.verdict.as_str(),
+                analysis.body,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE runs SET analysis_status=?2 WHERE id=?1",
+            params![manifest.id, manifest.analysis_status.as_str()],
+        )?;
+        transaction.commit()?;
+        write_manifest(&self.final_dir(id), &manifest)?;
+        Ok(manifest)
     }
 
     pub fn annotate(
@@ -540,7 +649,7 @@ impl Store {
     ) -> Result<()> {
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO runs (id, started_at, finished_at, mode, state, commit_hash, dirty, score, passed, exit_code, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO runs (id, started_at, finished_at, mode, state, commit_hash, dirty, score, passed, exit_code, note, hypothesis, analysis_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 manifest.id,
                 manifest.started_at.to_rfc3339(),
@@ -553,6 +662,8 @@ impl Store {
                 manifest.benchmark.passed,
                 manifest.benchmark.exit_code,
                 manifest.note,
+                manifest.hypothesis,
+                manifest.analysis_status.as_str(),
             ],
         )?;
         for tag in &manifest.tags {
@@ -603,6 +714,18 @@ impl Store {
                     enrichment.error,
                     serde_json::to_string(&enrichment.log_ids)?,
                     enrichment.tooling_path,
+                ],
+            )?;
+        }
+        for analysis in &manifest.analyses {
+            transaction.execute(
+                "INSERT INTO run_analyses (id, run_id, created_at, verdict, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    analysis.id,
+                    manifest.id,
+                    analysis.created_at.to_rfc3339(),
+                    analysis.verdict.as_str(),
+                    analysis.body,
                 ],
             )?;
         }
@@ -727,7 +850,9 @@ fn migrate(connection: &Connection) -> Result<()> {
             score INTEGER,
             passed INTEGER,
             exit_code INTEGER,
-            note TEXT
+            note TEXT,
+            hypothesis TEXT NOT NULL DEFAULT '',
+            analysis_status TEXT NOT NULL DEFAULT 'not_required'
         );
         CREATE TABLE IF NOT EXISTS logs (
             id TEXT NOT NULL,
@@ -790,11 +915,26 @@ fn migrate(connection: &Connection) -> Result<()> {
             tooling_path TEXT,
             PRIMARY KEY (run_id, name)
         );
+        CREATE TABLE IF NOT EXISTS run_analyses (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            body TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS run_analyses_run_created ON run_analyses(run_id, created_at);
         ",
     )?;
     ensure_column(connection, "runs", "note", "TEXT")?;
+    ensure_column(connection, "runs", "hypothesis", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        connection,
+        "runs",
+        "analysis_status",
+        "TEXT NOT NULL DEFAULT 'not_required'",
+    )?;
     ensure_column(connection, "metrics", "observed_at", "TEXT")?;
-    connection.pragma_update(None, "user_version", 4)?;
+    connection.pragma_update(None, "user_version", 5)?;
     Ok(())
 }
 
@@ -820,12 +960,15 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let manifest = RunManifest {
-            schema_version: 4,
+            schema_version: 5,
             id: "01a03df2-ecb2-72b3-aa1f-c952d3dd102b".into(),
             mode: RunMode::Run,
             state: RunState::Running,
             started_at: Utc::now(),
             finished_at: None,
+            hypothesis: "test recovery".into(),
+            analysis_status: AnalysisStatus::Pending,
+            analyses: Vec::new(),
             note: None,
             tags: Vec::new(),
             source: SourceSnapshot::default(),

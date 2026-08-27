@@ -2,7 +2,7 @@
 
 この文書は、競技開始後に初めて分かるベンチ起動方法、サーバー構成、ログ形式をisuscopeへ接続し、計測可能な状態にするためのランブックです。
 
-普段使うコマンドは`run`、`discovery-run`、`score-run`、`enrich`、`show`です。`init`と環境設定は開始直後に一度だけ行います。
+普段使うコマンドは`run`、`analyze`、`discovery-run`、`score-run`、`enrich`、`show`です。`init`と環境設定は開始直後に一度だけ行います。
 
 ## 最短チェックリスト
 
@@ -15,7 +15,8 @@
 - [ ] アクセスログfieldと`.isuscope/routes.toml`を確認する
 - [ ] `.isuscope/setup.sh`を実行する
 - [ ] `isuscope doctor`がfailure 0になることを確認する
-- [ ] `isuscope discovery-run`を1回通し、run stateが`complete`になるまで直す
+- [ ] `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`を1回通し、run stateが`complete`になるまで直す
+- [ ] PASSしたrunへ`isuscope analyze latest`で結果分析を記録する
 - [ ] `isuscope show latest`とSQLiteで保存内容を確認する
 - [ ] 以後は通常`isuscope run`、必要時だけ`discovery-run`を使う
 - [ ] 競技終了時にSQLiteだけでなくdata directory全体をbackupする
@@ -203,7 +204,7 @@ isuscope doctor
 ### 2. discovery-runを1回だけ通す
 
 ```console
-isuscope discovery-run
+isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"
 isuscope show latest
 ```
 
@@ -255,20 +256,28 @@ WHERE run_id = (SELECT id FROM runs ORDER BY started_at DESC LIMIT 1);
 通常の変更では次を実行します。
 
 ```console
-isuscope run
+isuscope run --hypothesis "変更が対象metricを改善し、scoreを上げる"
 isuscope show latest
 ```
 
-変更目的はrunと同時に残せます。
+仮説はrunと同時に必ず残します。PASS後は結果を判定・分析してから次のrunへ進みます。
 
 ```console
-isuscope run --tag admission-64 --note "POST admission 63→64"
+isuscope analyze latest --verdict supported --analysis "期待したmetricが改善し、scoreも上昇した"
+```
+
+`--verdict`は`supported`、`rejected`、`inconclusive`のいずれかです。分析を行えない場合は`isuscope analyze latest --skip --reason "理由"`を使います。FAILまたは中断runには分析は要求されません。
+
+noteとtagもrunと同時に残せます。
+
+```console
+isuscope run --hypothesis "admission 64でviewer完走数が増える" --tag admission-64 --note "POST admission 63→64"
 ```
 
 最終確認など、collectorもbenchmark parserも動かしたくない場合は`score-run`を使います。
 
 ```console
-isuscope score-run --tag final
+isuscope score-run --hypothesis "collectorなしで最終scoreが上がる" --tag final
 ```
 
 source/tooling snapshot、benchmark結果、stdout/stderrは保存されますが、before/during/after

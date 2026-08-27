@@ -42,6 +42,55 @@ impl RunState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisStatus {
+    #[default]
+    NotRequired,
+    Pending,
+    Complete,
+    Skipped,
+}
+
+impl AnalysisStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisVerdict {
+    Supported,
+    Rejected,
+    Inconclusive,
+    Skipped,
+}
+
+impl AnalysisVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Rejected => "rejected",
+            Self::Inconclusive => "inconclusive",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunAnalysis {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub verdict: AnalysisVerdict,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileDigest {
     pub path: String,
@@ -159,6 +208,12 @@ pub struct RunManifest {
     pub state: RunState,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub hypothesis: String,
+    #[serde(default)]
+    pub analysis_status: AnalysisStatus,
+    #[serde(default)]
+    pub analyses: Vec<RunAnalysis>,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]

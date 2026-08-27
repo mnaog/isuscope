@@ -4,12 +4,15 @@ use crate::{
     config::{CollectorPhase, LoadedConfig},
     enrichment::{self, EnrichmentOutput},
     git_snapshot,
-    model::{BenchmarkResult, RunManifest, RunMode, RunState, SourceSnapshot, ToolingSnapshot},
+    model::{
+        AnalysisStatus, BenchmarkResult, RunManifest, RunMode, RunState, SourceSnapshot,
+        ToolingSnapshot,
+    },
     shutdown::Shutdown,
     storage::Store,
     tooling,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use std::{fs, path::Path};
 use uuid::Uuid;
@@ -23,6 +26,7 @@ pub struct RunOutcome {
 
 #[derive(Debug, Clone, Default)]
 pub struct RunAnnotations {
+    pub hypothesis: String,
     pub note: Option<String>,
     pub tags: Vec<String>,
 }
@@ -33,6 +37,9 @@ pub async fn execute(
     shutdown: Shutdown,
     mut annotations: RunAnnotations,
 ) -> Result<RunOutcome> {
+    if annotations.hypothesis.trim().is_empty() {
+        bail!("hypothesis must not be empty");
+    }
     let mut store = Store::open(&config.data_dir)?;
     let recovered = store.recover_incomplete()?;
     if !recovered.is_empty() {
@@ -40,6 +47,15 @@ pub async fn execute(
             println!("recovered  {} (aborted)", short_id(id));
         }
         collector::cleanup_abandoned(&config, &recovered).await;
+    }
+    let pending = store.pending_analyses()?;
+    if let Some(run) = pending.first() {
+        bail!(
+            "run {} is still awaiting analysis for hypothesis `{}`; run `isuscope analyze {}` before starting another benchmark",
+            short_id(&run.id),
+            run.hypothesis,
+            short_id(&run.id),
+        );
     }
     let id = Uuid::now_v7().to_string();
     let staging = store.staging_dir(&id);
@@ -69,12 +85,15 @@ pub async fn execute(
     annotations.tags.sort();
     annotations.tags.dedup();
     let mut manifest = RunManifest {
-        schema_version: 4,
+        schema_version: 5,
         id: id.clone(),
         mode,
         state: RunState::Running,
         started_at,
         finished_at: None,
+        hypothesis: annotations.hypothesis,
+        analysis_status: AnalysisStatus::Pending,
+        analyses: Vec::new(),
         note: annotations.note.filter(|note| !note.trim().is_empty()),
         tags: annotations.tags,
         source,
@@ -226,6 +245,11 @@ pub async fn execute(
         _ => RunState::Failed,
     };
     manifest.finished_at = Some(Utc::now());
+    manifest.analysis_status = if manifest.benchmark.passed == Some(true) {
+        AnalysisStatus::Pending
+    } else {
+        AnalysisStatus::NotRequired
+    };
     manifest.metric_count = metrics.len();
     manifest.fingerprint_count = fingerprints.len();
     manifest.transition_count = transitions.len();
@@ -250,7 +274,15 @@ pub async fn execute(
             .unwrap_or_else(|| "-".into())
     );
     println!("state     {}", manifest.state.as_str());
+    println!("analysis  {}", manifest.analysis_status.as_str());
     println!("saved     {}", final_dir.display());
+    if manifest.analysis_status == AnalysisStatus::Pending {
+        println!();
+        println!(
+            "next      isuscope analyze {} --verdict <supported|rejected|inconclusive> --analysis <text>",
+            short_id(&id)
+        );
+    }
 
     Ok(RunOutcome {
         id,
@@ -322,6 +354,7 @@ fn absorb(
 fn print_header(manifest: &RunManifest, config: &LoadedConfig) {
     println!("run       {}", short_id(&manifest.id));
     println!("mode      {}", manifest.mode.as_str());
+    println!("hypothesis {}", manifest.hypothesis);
     let commit = manifest
         .source
         .commit_hash

@@ -4,13 +4,13 @@ use isuscope::{
     bottleneck,
     config::LoadedConfig,
     doctor, enrichment, init,
-    model::RunMode,
+    model::{AnalysisVerdict, RunMode},
     runner::{self, RunAnnotations},
     shutdown::Shutdown,
     storage::{RunSummary, Store},
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, fs, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(name = "isuscope", version, about = "ISUCONのベンチ実行記録ツール")]
@@ -78,6 +78,27 @@ enum Commands {
     },
     /// ベンチを起動せず、設定・command・SSH・時刻・diskを検査します。
     Doctor,
+    /// PASSしたrunへ仮説の判定と結果分析を追記します。
+    Analyze {
+        /// `latest`、run ID、または一意なtagを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+        /// 仮説の判定。
+        #[arg(long, value_enum)]
+        verdict: Option<VerdictArg>,
+        /// 結果の分析本文。
+        #[arg(long, conflicts_with = "analysis_file")]
+        analysis: Option<String>,
+        /// 結果の分析本文をUTF-8 fileから読み込みます。
+        #[arg(long, conflicts_with = "analysis")]
+        analysis_file: Option<PathBuf>,
+        /// 分析を省略します。理由の記録が必須です。
+        #[arg(long)]
+        skip: bool,
+        /// 分析を省略する理由。
+        #[arg(long)]
+        reason: Option<String>,
+    },
     #[command(name = "__transition", hide = true)]
     InternalTransition {
         #[arg(long)]
@@ -111,6 +132,9 @@ enum Commands {
 
 #[derive(Debug, Clone, Default, Args)]
 struct AnnotationArgs {
+    /// 今回の変更がなぜ、どの観測値をどう改善すると考えるかを記録します。
+    #[arg(long)]
+    hypothesis: String,
     /// runの目的や変更内容を記録します。
     #[arg(long)]
     note: Option<String>,
@@ -122,8 +146,26 @@ struct AnnotationArgs {
 impl From<AnnotationArgs> for RunAnnotations {
     fn from(value: AnnotationArgs) -> Self {
         Self {
+            hypothesis: value.hypothesis,
             note: value.note,
             tags: value.tags,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum VerdictArg {
+    Supported,
+    Rejected,
+    Inconclusive,
+}
+
+impl From<VerdictArg> for AnalysisVerdict {
+    fn from(value: VerdictArg) -> Self {
+        match value {
+            VerdictArg::Supported => Self::Supported,
+            VerdictArg::Rejected => Self::Rejected,
+            VerdictArg::Inconclusive => Self::Inconclusive,
         }
     }
 }
@@ -263,6 +305,59 @@ async fn real_main() -> Result<bool> {
             println!("warnings  {}", report.warnings.len());
             println!("failures  {}", report.failures.len());
             Ok(report.healthy())
+        }
+        Commands::Analyze {
+            run,
+            verdict,
+            analysis,
+            analysis_file,
+            skip,
+            reason,
+        } => {
+            let (verdict, body) = if skip {
+                if verdict.is_some() || analysis.is_some() || analysis_file.is_some() {
+                    anyhow::bail!(
+                        "--skip cannot be combined with --verdict, --analysis, or --analysis-file"
+                    );
+                }
+                let reason = reason
+                    .filter(|value| !value.trim().is_empty())
+                    .context("--skip requires a non-empty --reason")?;
+                (AnalysisVerdict::Skipped, reason)
+            } else {
+                if reason.is_some() {
+                    anyhow::bail!("--reason may be used only with --skip");
+                }
+                let verdict = verdict
+                    .context("analysis requires --verdict <supported|rejected|inconclusive>")?;
+                let body = match (analysis, analysis_file) {
+                    (Some(body), None) => body,
+                    (None, Some(path)) => fs::read_to_string(&path)
+                        .with_context(|| format!("cannot read {}", path.display()))?,
+                    (None, None) => anyhow::bail!(
+                        "analysis requires either --analysis <text> or --analysis-file <path>"
+                    ),
+                    (Some(_), Some(_)) => unreachable!("clap enforces conflicting arguments"),
+                };
+                if body.trim().is_empty() {
+                    anyhow::bail!("analysis must not be empty");
+                }
+                (verdict.into(), body)
+            };
+            let mut store = Store::open(&config.data_dir)?;
+            let id = store
+                .resolve_id(&run)?
+                .with_context(|| format!("run `{run}` was not found"))?;
+            let manifest = store.append_analysis(&id, verdict, body)?;
+            let latest = manifest
+                .analyses
+                .last()
+                .context("analysis was not appended")?;
+            println!("run       {}", runner::short_id(&manifest.id));
+            println!("verdict   {}", latest.verdict.as_str());
+            println!("analysis  {}", manifest.analysis_status.as_str());
+            println!("revisions {}", manifest.analyses.len());
+            Ok(true)
         }
         Commands::InternalTransition { .. } => unreachable!(),
     }
@@ -529,8 +624,8 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
             return Ok(());
         }
         println!(
-            "{:<9}  {:<19}  {:<13}  {:<13}  {:<9}  {:>10}",
-            "RUN", "STARTED", "COMMIT", "MODE", "RESULT", "SCORE"
+            "{:<9}  {:<19}  {:<13}  {:<13}  {:<9}  {:>10}  {:<12}",
+            "RUN", "STARTED", "COMMIT", "MODE", "RESULT", "SCORE", "ANALYSIS"
         );
         for run in runs {
             print_summary(&run);
@@ -552,6 +647,17 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
             .unwrap_or_else(|| "-".into())
     );
     println!("mode        {}", manifest.mode.as_str());
+    println!("hypothesis  {}", manifest.hypothesis);
+    println!("analysis    {}", manifest.analysis_status.as_str());
+    println!("revisions   {}", manifest.analyses.len());
+    for analysis in &manifest.analyses {
+        println!(
+            "  {}  {}  {}",
+            analysis.created_at.to_rfc3339(),
+            analysis.verdict.as_str(),
+            analysis.body.replace('\n', "\n                          ")
+        );
+    }
     println!("note        {}", manifest.note.as_deref().unwrap_or("-"));
     println!(
         "tags        {}",
@@ -629,7 +735,7 @@ fn print_sqlite_hint(store: &Store, run_id: Option<&str>) {
             run_id.replace('\'', "''")
         ),
         None => println!(
-            "sql hint    sqlite3 {} \"SELECT id,started_at,score,state FROM runs ORDER BY started_at DESC;\"",
+            "sql hint    sqlite3 {} \"SELECT id,started_at,score,state,analysis_status,hypothesis FROM runs ORDER BY started_at DESC;\"",
             shell_display(&path)
         ),
     }
@@ -706,14 +812,36 @@ fn print_summary(run: &RunSummary) {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".into());
     println!(
-        "{:<9}  {:<19}  {:<13}  {:<13}  {:<9}  {:>10}",
+        "{:<9}  {:<19}  {:<13}  {:<13}  {:<9}  {:>10}  {:<12}",
         runner::short_id(&run.id),
         started,
         format!("{commit}{dirty}"),
         run.mode,
         result,
         score,
+        run.analysis_status,
     );
+    println!(
+        "           hypothesis  {}",
+        compact_text(&run.hypothesis, 100)
+    );
+    if let (Some(verdict), Some(body)) = (&run.latest_analysis_verdict, &run.latest_analysis_body) {
+        println!(
+            "           analysis    {}: {}",
+            verdict,
+            compact_text(body, 100)
+        );
+    }
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut truncated = compact.chars().take(max_chars).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]

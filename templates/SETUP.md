@@ -11,8 +11,8 @@
 7. `bash -n benchmark.sh`、`bash -n parse-benchmark.sh`、`bash -n setup.sh`、`isuscope show`を実行してから、不足する場合だけ`setup.sh`の`apply_environment`へ冪等な導入処理を追加する
 8. ここで初めて`setup.sh`を実行し、`setup-state.json`が生成されることを確認する。標準ツールは自動installされない
 9. `isuscope doctor`を実行し、failureを解消する
-10. `isuscope discovery-run`を一度実行し、collectorとtransitionが0件でないことを確認する
+10. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`を一度実行し、collectorとtransitionが0件でないことを確認する。PASS後は`isuscope analyze latest`で結果を記録する
 
 remote変更を行う場合は、既存ファイルのbackup、設定検証、atomicな配置、必要最小限のreloadを行います。パッケージ導入やremote build、常駐agentは既存機能で代替できない場合だけ使用します。
 
-`benchmark.sh`、`parse-benchmark.sh`、`setup.sh`、`config.toml`、`routes.toml`、`setup-state.json`およびisuscopeのversionは各runの`tooling/`へsnapshotされます。以後の日常操作は`run`、`discovery-run`、`score-run`、`enrich`、`show`です。
+`benchmark.sh`、`parse-benchmark.sh`、`setup.sh`、`config.toml`、`routes.toml`、`setup-state.json`およびisuscopeのversionは各runの`tooling/`へsnapshotされます。以後は仮説付きの`run`、結果を残す`analyze`、`discovery-run`、`score-run`、`enrich`、`show`を使います。

@@ -2,11 +2,12 @@
 
 `isuscope`は、ISUCONのベンチマーク1回分を再現可能なrunとして記録するツールです。ベンチ結果、ソースコードの状態、構造化メトリクス、圧縮した生ログへの参照を、CLIを実行した手元のマシンへ保存します。
 
-公開CLIは日常操作を次の4コマンドに絞っています。
+日常の計測は「仮説を書く → ベンチを回す → PASSなら結果を分析する」を1単位にします。
 
 ```console
-isuscope run
-isuscope discovery-run
+isuscope run --hypothesis "変更理由と改善を期待する観測値"
+isuscope analyze latest --verdict supported --analysis "観測結果と判断"
+isuscope discovery-run --hypothesis "ボトルネックがDBからHTTPへ移ったはず"
 isuscope show [latest|RUN_ID]
 isuscope bottleneck [latest|RUN_ID]
 isuscope series [latest|RUN_ID]
@@ -52,7 +53,7 @@ isuscope init
 4. alpのaccess log path・format、slpのslow log path・format、perfの`sudo -n`権限を確認する。
 5. `bash -n .isuscope/benchmark.sh`、`bash -n .isuscope/setup.sh`、`isuscope show`で副作用なしの検査をする。
 6. 不足する環境変更だけを`setup.sh`へ記述し、`.isuscope/setup.sh`を実行する。
-7. `isuscope discovery-run`、`isuscope show latest`、`isuscope bottleneck latest`の順に実行し、collector状態、metric、coverageを確認する。
+7. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`、`isuscope show latest`、`isuscope bottleneck latest`の順に実行し、collector状態、metric、coverageを確認する。
 
 最低限編集するのは`benchmark.sh`、`config.toml`の`[ssh]`、`[[nodes]]`です。標準ツールの自動installやsudoers変更は行いません。必要な場合だけ、利用者が`setup.sh`の`apply_environment`へ冪等な処理を追加します。
 
@@ -71,27 +72,41 @@ your-isucon-project/
 標準collectorを有効にした通常のスコア計測を行います。perfを含めて毎回同じ観測条件にするため、collectorを変更したrun同士は同条件として比較しません。
 
 ```console
-isuscope run
+isuscope run --hypothesis "allocation削減によりviewer完走数が増える"
 ```
 
 標準collectorは通常runと同じです。加えて、cookieなどの匿名識別子を利用したユーザー行動遷移を集計します。
 
 ```console
-isuscope discovery-run
+isuscope discovery-run --hypothesis "routing変更により支配的な待ち時間が移動した"
 ```
 
 collectorとbenchmark parserを起動せず、スコア取得だけを行います。source、tooling、
 benchmark結果とstdout/stderrは保存されます。
 
 ```console
-isuscope score-run --tag final --note "観測なしの最終確認"
+isuscope score-run --hypothesis "観測負荷を外すと最終スコアが上がる" --tag final --note "観測なしの最終確認"
 ```
 
-runの目的を実行時に記録したり、保存後に更新したりできます。noteは`runs.note`、tagは
-`run_tags`へ保存されるため、SQLiteから直接検索できます。
+`--hypothesis`は全ベンチで必須です。ベンチ開始前に`run.json`とSQLiteへ保存され、後から変更できません。PASSしたrunは`analysis_status=pending`となり、結果分析を記録するまで次のベンチを開始できません。FAILまたは中断したrunは分析不要として確定するため、失敗原因を直した次のベンチを妨げません。
+
+分析では、仮説が支持されたか、棄却されたか、1回の結果では判断不能かを明示します。再評価した場合も上書きせず、revisionとして追記します。
 
 ```console
-isuscope run --tag admission-64 --note "admission 63→64"
+isuscope analyze latest --verdict supported --analysis "scoreが8%増え、エラー数は不変。想定したCPU時間も低下した"
+isuscope analyze latest --verdict rejected --analysis-file analysis.md
+```
+
+時間切れなどで分析しない場合だけ、理由付きでskipできます。skipも履歴に残り、次のベンチを許可します。
+
+```console
+isuscope analyze latest --skip --reason "競技終了前の最終計測のため"
+```
+
+補助的な説明と検索用tagも記録できます。noteは`runs.note`、tagは`run_tags`へ保存されるため、SQLiteから直接検索できます。
+
+```console
+isuscope run --hypothesis "admission 64で待機を抑えつつviewer完走数が増える" --tag admission-64 --note "admission 63→64"
 isuscope annotate latest --tag baseline --remove-tag admission-64
 isuscope show baseline
 ```
@@ -207,7 +222,7 @@ initializeの開始・終了を取得できる場合は、任意のevent行も�
                 └── <collector-log-id>.zst
 ```
 
-SQLiteにはrunのメタデータ、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログの本文はSQLiteへ入れません。
+SQLiteにはrunのメタデータ、仮説、分析状態、追記式の分析履歴、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログの本文はSQLiteへ入れません。
 
 `tooling/`には実際に使った設定、route規則、setup状態、isuscope versionをrunごとに保存します。各ファイルのSHA-256も`run.json`へ入るため、計測構成の違いを後から判別できます。
 
@@ -347,7 +362,7 @@ session cookieが発行される前のrequestは、同一ユーザーとして�
 mode = "external"
 ```
 
-`isuscope run`または`isuscope discovery-run`を実行するとcollectorを待機状態にし、ポータルからベンチを起動するよう案内します。ベンチ終了後、スコアとpass/failを対話形式で入力します。
+`--hypothesis`付きで`isuscope run`または`isuscope discovery-run`を実行するとcollectorを待機状態にし、ポータルからベンチを起動するよう案内します。ベンチ終了後、スコアとpass/failを対話形式で入力します。
 
 ポータル固有の自動結果取得は、run形式や公開CLIを変更せず後から追加できます。
 
@@ -356,7 +371,7 @@ mode = "external"
 比較専用コマンドを追加しなくても、SQLiteを直接照会できます。
 
 ```sql
-SELECT started_at, commit_hash, score
+SELECT started_at, commit_hash, score, hypothesis, analysis_status
 FROM runs
 WHERE passed = 1
 ORDER BY started_at;
@@ -382,6 +397,16 @@ SELECT r.started_at, r.score, r.note, t.tag
 FROM runs AS r
 LEFT JOIN run_tags AS t ON t.run_id = r.id
 ORDER BY r.started_at;
+```
+
+仮説と分析履歴を時系列で読む例です。
+
+```sql
+SELECT r.started_at, r.score, r.hypothesis,
+       a.created_at AS analyzed_at, a.verdict, a.body
+FROM runs AS r
+LEFT JOIN run_analyses AS a ON a.run_id = r.id
+ORDER BY r.started_at, a.created_at;
 ```
 
 秘密情報の自動maskingは行いません。短時間かつ管理されたISUCON環境で使用するという要件に基づく仕様です。
