@@ -1,9 +1,12 @@
 use crate::{
     benchmark::compress_log,
-    config::{CollectorConfig, CollectorPhase, LoadedConfig, NodeConfig, Transport},
+    config::{
+        CollectorConfig, CollectorParser, CollectorPhase, LoadedConfig, NodeConfig, Transport,
+    },
     model::{CollectorResult, Fingerprint, LogRef, Metric, RunMode, Transition},
     process,
     shutdown::Shutdown,
+    transition::RouteNormalizer,
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -339,6 +342,17 @@ async fn finalize(
     }
     let (mut metrics, mut fingerprints, transitions) =
         parse_protocol(&stdout_destination).unwrap_or_default();
+    if let Some(parser) = spec.collector.parser {
+        let routes = spec.working_dir.join(".isuscope/routes.toml");
+        match parse_standard_output(
+            &stdout_destination,
+            parser,
+            routes.is_file().then_some(routes.as_path()),
+        ) {
+            Ok(parsed) => metrics.extend(parsed),
+            Err(error) => compression_errors.push(format!("standard output parse failed: {error}")),
+        }
+    }
     if let Some(node) = &spec.node {
         for metric in &mut metrics {
             metric
@@ -359,13 +373,22 @@ async fn finalize(
         (None, false) => Some(compression_errors.join("; ")),
         (None, true) => None,
     };
+    let unavailable = error.is_none()
+        && exit_code.is_some_and(|code| spec.collector.unavailable_exit_codes.contains(&code));
     let success = error.is_none() && (intentionally_stopped || exit_code == Some(0));
     CollectorOutput {
         result: CollectorResult {
             name: spec.collector.name,
             node: spec.node.map(|node| node.name),
             phase: spec.collector.phase.as_str().into(),
-            status: if success { "complete" } else { "failed" }.into(),
+            status: if unavailable {
+                "unavailable"
+            } else if success {
+                "complete"
+            } else {
+                "failed"
+            }
+            .into(),
             exit_code,
             error,
             log_ids: logs.iter().map(|log| log.id.clone()).collect(),
@@ -493,6 +516,224 @@ pub(crate) fn parse_protocol(
         }
     }
     Ok((metrics, fingerprints, transitions))
+}
+
+fn parse_standard_output(
+    path: &Path,
+    parser: CollectorParser,
+    routes: Option<&Path>,
+) -> Result<Vec<Metric>> {
+    let input = fs::File::open(path)?;
+    let mut decoder = zstd::stream::read::Decoder::new(input)?;
+    let mut raw = String::new();
+    use std::io::Read;
+    decoder.read_to_string(&mut raw)?;
+    match parser {
+        CollectorParser::AlpJson => parse_alp_json(&raw, routes),
+        CollectorParser::SlpJson => parse_slp_json(&raw),
+        CollectorParser::Sysstat => Ok(parse_sysstat(&raw)),
+    }
+}
+
+fn json_records(raw: &str) -> Result<Vec<Value>> {
+    let value: Value = serde_json::from_str(raw).context("output is not valid JSON")?;
+    Ok(match value {
+        Value::Array(values) => values,
+        Value::Object(mut object) => object
+            .remove("data")
+            .or_else(|| object.remove("results"))
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_else(|| vec![Value::Object(object)]),
+        _ => Vec::new(),
+    })
+}
+
+fn number(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| {
+        object.get(*name).and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+    })
+}
+
+fn string(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(Value::as_str).map(str::to_owned))
+}
+
+fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
+    let normalizer = RouteNormalizer::load(routes)?;
+    let records = json_records(raw)?;
+    let mut routes = BTreeMap::<(String, String), (f64, Option<f64>)>::new();
+    for value in &records {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let Some(route) = string(object, &["uri", "route", "path"]) else {
+            continue;
+        };
+        let route = normalizer.normalize(route.split('?').next().unwrap_or(&route));
+        let method = string(object, &["method"]).unwrap_or_else(|| "-".into());
+        let stats = routes.entry((method, route)).or_default();
+        if let Some(count) = number(object, &["count", "requests"]) {
+            stats.0 += count;
+        }
+        if let Some(p95_seconds) = number(object, &["p95", "p95_time", "request_time_p95"]) {
+            stats.1 = Some(
+                stats
+                    .1
+                    .map_or(p95_seconds, |current| current.max(p95_seconds)),
+            );
+        }
+    }
+    let mut metrics = Vec::new();
+    for ((method, route), (requests, p95_seconds)) in routes {
+        let labels = BTreeMap::from([("method".into(), method), ("route".into(), route)]);
+        if requests > 0.0 {
+            metrics.push(Metric {
+                name: "http.requests".into(),
+                value: requests,
+                unit: "requests".into(),
+                labels: labels.clone(),
+            });
+        }
+        if let Some(p95_seconds) = p95_seconds {
+            let mut labels = labels;
+            labels.insert("quantile".into(), "0.95".into());
+            metrics.push(Metric {
+                name: "http.request_duration".into(),
+                value: p95_seconds * 1000.0,
+                unit: "ms".into(),
+                labels,
+            });
+        }
+    }
+    if !records.is_empty() && metrics.is_empty() {
+        anyhow::bail!("ALP JSON contained records but no supported count/p95 fields");
+    }
+    Ok(metrics)
+}
+
+fn parse_slp_json(raw: &str) -> Result<Vec<Metric>> {
+    let records = json_records(raw)?;
+    let mut metrics = Vec::new();
+    for value in &records {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let Some(digest) = string(object, &["digest", "query", "fingerprint", "abstract"]) else {
+            continue;
+        };
+        let engine = string(object, &["engine"]).unwrap_or_else(|| "mysql".into());
+        let labels = BTreeMap::from([("digest".into(), digest), ("engine".into(), engine)]);
+        if let Some(calls) = number(object, &["count", "calls", "query_count"]) {
+            metrics.push(Metric {
+                name: "db.query.calls".into(),
+                value: calls,
+                unit: "queries".into(),
+                labels: labels.clone(),
+            });
+        }
+        if let Some(total_seconds) = number(object, &["total", "total_time", "query_time_sum"]) {
+            metrics.push(Metric {
+                name: "db.query.total_duration".into(),
+                value: total_seconds * 1000.0,
+                unit: "ms".into(),
+                labels,
+            });
+        }
+    }
+    if !records.is_empty() && metrics.is_empty() {
+        anyhow::bail!("SLP JSON contained records but no supported calls/duration fields");
+    }
+    Ok(metrics)
+}
+
+fn parse_sysstat(raw: &str) -> Vec<Metric> {
+    let mut cpu_header: Option<Vec<String>> = None;
+    let mut disk_header: Option<Vec<String>> = None;
+    let mut cpu = (0.0_f64, 0_u64);
+    let mut disks = BTreeMap::<String, (f64, u64, f64, u64)>::new();
+    for line in raw.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.contains(&"CPU") && fields.contains(&"%idle") {
+            cpu_header = Some(fields.iter().map(|field| field.to_string()).collect());
+            continue;
+        }
+        if let Some(header) = &cpu_header {
+            let cpu_index = header.iter().position(|field| field == "CPU");
+            let idle_index = header.iter().position(|field| field == "%idle");
+            if fields.len() == header.len()
+                && cpu_index.is_some_and(|index| fields[index] == "all")
+                && let Some(idle) =
+                    idle_index.and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
+            {
+                cpu.0 += 100.0 - idle;
+                cpu.1 += 1;
+            }
+        }
+        if fields.contains(&"DEV") && fields.contains(&"await") {
+            disk_header = Some(fields.iter().map(|field| field.to_string()).collect());
+            continue;
+        }
+        let Some(header) = &disk_header else { continue };
+        let Some(dev_index) = header.iter().position(|field| field == "DEV") else {
+            continue;
+        };
+        if fields.len() != header.len() {
+            continue;
+        }
+        let device = fields[dev_index].to_string();
+        let values = disks.entry(device).or_default();
+        if let Some(value) = header
+            .iter()
+            .position(|field| field == "await")
+            .and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
+        {
+            values.0 += value;
+            values.1 += 1;
+        }
+        if let Some(value) = header
+            .iter()
+            .position(|field| field == "%util")
+            .and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
+        {
+            values.2 += value;
+            values.3 += 1;
+        }
+    }
+    let mut metrics = Vec::new();
+    if cpu.1 > 0 {
+        metrics.push(Metric {
+            name: "host.cpu_percent".into(),
+            value: cpu.0 / cpu.1 as f64,
+            unit: "percent".into(),
+            labels: BTreeMap::new(),
+        });
+    }
+    for (device, (await_sum, await_count, util_sum, util_count)) in disks {
+        let labels = BTreeMap::from([("device".into(), device)]);
+        if await_count > 0 {
+            metrics.push(Metric {
+                name: "host.disk_await".into(),
+                value: await_sum / await_count as f64,
+                unit: "ms".into(),
+                labels: labels.clone(),
+            });
+        }
+        if util_count > 0 {
+            metrics.push(Metric {
+                name: "host.disk_util_percent".into(),
+                value: util_sum / util_count as f64,
+                unit: "percent".into(),
+                labels,
+            });
+        }
+    }
+    metrics
 }
 
 fn expand(
@@ -643,4 +884,92 @@ fn skipped(collector: &CollectorConfig, reason: &str) -> CollectorOutput {
 
 fn matches_phase(left: CollectorPhase, right: CollectorPhase) -> bool {
     std::mem::discriminant(&left) == std::mem::discriminant(&right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_json_adapters_emit_bottleneck_metrics() {
+        let alp = parse_alp_json(
+            r#"[{"count":12,"method":"GET","uri":"/items/:id","p95":0.125}]"#,
+            None,
+        )
+        .unwrap();
+        assert!(
+            alp.iter()
+                .any(|metric| metric.name == "http.requests" && metric.value == 12.0)
+        );
+        assert!(
+            alp.iter()
+                .any(|metric| metric.name == "http.request_duration" && metric.value == 125.0)
+        );
+
+        let slp = parse_slp_json(
+            r#"[{"count":4,"fingerprint":"SELECT * FROM items WHERE id = ?","total_time":0.8}]"#,
+        )
+        .unwrap();
+        assert!(
+            slp.iter()
+                .any(|metric| metric.name == "db.query.calls" && metric.value == 4.0)
+        );
+        assert!(
+            slp.iter()
+                .any(|metric| metric.name == "db.query.total_duration" && metric.value == 800.0)
+        );
+        assert!(parse_alp_json(r#"[{"url":"/unknown","number":1}]"#, None).is_err());
+        assert!(parse_slp_json(r#"[{"sql":"SELECT 1","elapsed":1}]"#).is_err());
+    }
+
+    #[test]
+    fn alp_adapter_uses_shared_route_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let rules = directory.path().join("routes.toml");
+        fs::write(
+            &rules,
+            "[[routes]]\npattern = \"^/items/[0-9]+$\"\nreplace = \"/items/:id\"\n",
+        )
+        .unwrap();
+        let metrics = parse_alp_json(
+            r#"[{"count":12,"method":"GET","uri":"/items/42?x=1","p95":0.125},{"count":8,"method":"GET","uri":"/items/43","p95":0.150}]"#,
+            Some(&rules),
+        )
+        .unwrap();
+        assert!(metrics.iter().all(|metric| {
+            metric.labels.get("route").map(String::as_str) == Some("/items/:id")
+        }));
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "http.requests" && metric.value == 20.0)
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "http.request_duration" && metric.value == 150.0)
+        );
+    }
+
+    #[test]
+    fn sysstat_adapter_uses_during_samples() {
+        let metrics = parse_sysstat(
+            "Average: CPU %user %nice %system %iowait %steal %idle\nAverage: all 1.00 0.00 2.00 0.00 0.00 97.00\nAverage: all 2.00 0.00 4.00 0.00 0.00 94.00\nAverage: DEV tps rkB/s wkB/s dkB/s areq-sz aqu-sz await %util\nAverage: nvme0n1 10.0 1.0 2.0 0.0 3.0 0.1 4.5 70.0\nAverage: nvme0n1 10.0 1.0 2.0 0.0 3.0 0.1 5.5 90.0\n",
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "host.cpu_percent" && metric.value == 4.5)
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "host.disk_await" && metric.value == 5.0)
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "host.disk_util_percent" && metric.value == 80.0)
+        );
+    }
 }

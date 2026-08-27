@@ -255,6 +255,26 @@ impl Store {
         serde_json::from_slice(&raw).context("invalid run manifest")
     }
 
+    pub fn metrics(&self, id: &str) -> Result<Vec<Metric>> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, value, unit, labels_json FROM metrics WHERE run_id=?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([id], |row| {
+            let labels: String = row.get(3)?;
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, labels))
+        })?;
+        rows.map(|row| {
+            let (name, value, unit, labels_json) = row?;
+            Ok(Metric {
+                name,
+                value,
+                unit,
+                labels: serde_json::from_str(&labels_json).context("invalid metric labels")?,
+            })
+        })
+        .collect()
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

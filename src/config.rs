@@ -135,6 +135,14 @@ pub enum Transport {
     Ssh,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CollectorParser {
+    AlpJson,
+    SlpJson,
+    Sysstat,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollectorConfig {
     pub name: String,
@@ -146,12 +154,16 @@ pub struct CollectorConfig {
     #[serde(default)]
     pub modes: Vec<RunMode>,
     pub command: Vec<String>,
+    /// Optional adapter for a standard tool's native stdout.
+    pub parser: Option<CollectorParser>,
     #[serde(default = "default_collector_timeout")]
     pub timeout_seconds: u64,
     #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: u64,
     #[serde(default)]
     pub required: bool,
+    #[serde(default = "default_unavailable_exit_codes")]
+    pub unavailable_exit_codes: Vec<i32>,
 }
 
 impl CollectorConfig {
@@ -189,6 +201,9 @@ fn default_collector_timeout() -> u64 {
 }
 fn default_max_output_bytes() -> u64 {
     1024 * 1024 * 1024
+}
+fn default_unavailable_exit_codes() -> Vec<i32> {
+    vec![75]
 }
 
 impl LoadedConfig {

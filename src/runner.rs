@@ -229,10 +229,10 @@ fn absorb(
     transitions: &mut Vec<crate::model::Transition>,
 ) {
     for output in outputs {
-        let status_symbol = if output.result.status == "complete" {
-            "✓"
-        } else {
-            "!"
+        let status_symbol = match output.result.status.as_str() {
+            "complete" => "✓",
+            "unavailable" => "-",
+            _ => "!",
         };
         let node = output.result.node.as_deref().unwrap_or("local");
         println!(
