@@ -9,7 +9,7 @@ use isuscope::{
     shutdown::Shutdown,
     storage::{RunSummary, Store},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::{env, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
@@ -35,6 +35,12 @@ enum Commands {
     },
     /// 指定したrunでカテゴリ別のボトルネック候補を最大5件表示します。
     Bottleneck {
+        /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+    },
+    /// 時刻付きmetricを5秒bucketの表で表示します。
+    Series {
         /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
         #[arg(default_value = "latest")]
         run: String,
@@ -65,6 +71,8 @@ enum Commands {
         bytes_field: String,
         #[arg(long, default_value = "connreqs")]
         connection_requests_field: String,
+        #[arg(long)]
+        series_only: bool,
     },
 }
 
@@ -95,6 +103,7 @@ async fn real_main() -> Result<bool> {
         upstream_time_field,
         bytes_field,
         connection_requests_field,
+        series_only,
     } = &cli.command
     {
         isuscope::transition::emit(isuscope::transition::TransitionOptions {
@@ -110,6 +119,7 @@ async fn real_main() -> Result<bool> {
             upstream_time_field,
             bytes_field,
             connection_requests_field,
+            series_only: *series_only,
         })?;
         return Ok(true);
     }
@@ -139,7 +149,219 @@ async fn real_main() -> Result<bool> {
             show_bottlenecks(&config, &run)?;
             Ok(true)
         }
+        Commands::Series { run } => {
+            show_series(&config, &run)?;
+            Ok(true)
+        }
         Commands::InternalTransition { .. } => unreachable!(),
+    }
+}
+
+#[derive(Default)]
+struct BucketRow {
+    cpu_host_sampler: Vec<f64>,
+    cpu_sysstat: Vec<f64>,
+    cpu_other: Vec<f64>,
+    memory: Vec<f64>,
+    load: Vec<f64>,
+    disk_util: Vec<f64>,
+    disk_await: Vec<f64>,
+    http_requests: f64,
+    http_p95: Vec<f64>,
+    http_errors: f64,
+    db_calls: f64,
+    db_time: f64,
+}
+
+fn show_series(config: &LoadedConfig, requested: &str) -> Result<()> {
+    let store = Store::open(&config.data_dir)?;
+    let id = store
+        .resolve_id(requested)?
+        .with_context(|| format!("run `{requested}` was not found"))?;
+    let manifest = store.load(&id)?;
+    let start = manifest.benchmark.started_at.unwrap_or(manifest.started_at);
+    let end = manifest
+        .benchmark
+        .finished_at
+        .or(manifest.finished_at)
+        .unwrap_or(start);
+    let first_bucket = start.timestamp().div_euclid(5) * 5;
+    let duration = (end - start).num_seconds().max(0);
+    let mut rows = BTreeMap::<(String, i64), BucketRow>::new();
+    let mut nodes = config
+        .config
+        .nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect::<BTreeSet<_>>();
+    for metric in store.metrics(&id)? {
+        let Some(at) = metric
+            .timestamp
+            .filter(|at| at.timestamp() >= first_bucket && *at <= end)
+        else {
+            continue;
+        };
+        let bucket = at.timestamp().div_euclid(5) * 5;
+        let node = metric
+            .labels
+            .get("node")
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        nodes.insert(node.clone());
+        let row = rows.entry((node, bucket)).or_default();
+        match metric.name.as_str() {
+            "host.cpu_percent" => match metric.labels.get("collector").map(String::as_str) {
+                Some("host-sampler") => row.cpu_host_sampler.push(metric.value),
+                Some("sysstat") => row.cpu_sysstat.push(metric.value),
+                _ => row.cpu_other.push(metric.value),
+            },
+            "host.memory_used_bytes" => row.memory.push(metric.value / 1_048_576.0),
+            "host.load1" => row.load.push(metric.value),
+            "host.disk_util_percent" => row.disk_util.push(metric.value),
+            "host.disk_await" => row.disk_await.push(metric.value),
+            "http.requests" => row.http_requests += metric.value,
+            "http.errors" => row.http_errors += metric.value,
+            "http.request_duration"
+                if metric.labels.get("quantile").map(String::as_str) == Some("0.95") =>
+            {
+                row.http_p95.push(metric.value);
+            }
+            "db.query.calls" => row.db_calls += metric.value,
+            "db.query.total_duration" => row.db_time += metric.value,
+            _ => {}
+        }
+    }
+    for node in nodes {
+        for bucket in (first_bucket..=end.timestamp()).step_by(5) {
+            rows.entry((node.clone(), bucket)).or_default();
+        }
+    }
+    println!("run {}", id);
+    println!("benchmark {} .. {}", start.to_rfc3339(), end.to_rfc3339());
+    print_series_coverage(&manifest.collectors);
+    println!("bucket 5s; A/M=average/max; HTTP P95=max route p95; -=not observed (see coverage)");
+    println!(
+        "{:<10} {:<7} {:>11} {:>9} {:>8} {:>11} {:>11} {:>9} {:>9} {:>7} {:>9} {:>10}",
+        "NODE",
+        "ELAPSED",
+        "CPU A/M%",
+        "MEM MiB",
+        "LOAD MAX",
+        "DISK U%",
+        "AWAIT ms",
+        "HTTP REQ",
+        "P95 ms",
+        "ERRORS",
+        "DB CALLS",
+        "DB TIME ms"
+    );
+    if rows.is_empty() {
+        println!("no timestamped metrics in benchmark interval");
+    }
+    for ((node, bucket), row) in rows {
+        let bucket_offset = bucket - start.timestamp();
+        let from = bucket_offset.max(0);
+        let to = (bucket_offset + 5).min(duration.max(1));
+        println!(
+            "{:<10} {:<7} {:>11} {:>9} {:>8} {:>11} {:>11} {:>9} {:>9} {:>7} {:>9} {:>10}",
+            node,
+            format!("{from}-{to}s"),
+            avg_max(preferred_cpu(&row)),
+            average(&row.memory),
+            maximum(&row.load),
+            maximum(&row.disk_util),
+            maximum(&row.disk_await),
+            sum_or_missing(row.http_requests, &row.http_p95, row.http_errors),
+            maximum(&row.http_p95),
+            count_or_missing(row.http_errors, row.http_requests),
+            count_or_missing(row.db_calls, row.db_time),
+            count_or_missing(row.db_time, row.db_calls),
+        );
+    }
+    Ok(())
+}
+
+fn preferred_cpu(row: &BucketRow) -> &[f64] {
+    if !row.cpu_host_sampler.is_empty() {
+        &row.cpu_host_sampler
+    } else if !row.cpu_sysstat.is_empty() {
+        &row.cpu_sysstat
+    } else {
+        &row.cpu_other
+    }
+}
+
+fn print_series_coverage(collectors: &[isuscope::model::CollectorResult]) {
+    const SERIES_COLLECTORS: [&str; 5] = [
+        "host-sampler",
+        "sysstat",
+        "nginx-series-read",
+        "nginx-series",
+        "mysql-slow-series",
+    ];
+    println!("coverage");
+    let relevant = collectors
+        .iter()
+        .filter(|collector| SERIES_COLLECTORS.contains(&collector.name.as_str()))
+        .collect::<Vec<_>>();
+    if relevant.is_empty() {
+        println!("  no standard series collectors recorded");
+    }
+    for collector in relevant {
+        let detail = collector.error.clone().unwrap_or_else(|| {
+            collector
+                .exit_code
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "-".into())
+        });
+        println!(
+            "  {:<20} {:<12} {:<10} {}",
+            collector.name,
+            collector.node.as_deref().unwrap_or("local"),
+            collector.status,
+            detail
+        );
+    }
+}
+
+fn average(values: &[f64]) -> String {
+    if values.is_empty() {
+        "-".into()
+    } else {
+        format!("{:.1}", values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn maximum(values: &[f64]) -> String {
+    values
+        .iter()
+        .copied()
+        .reduce(f64::max)
+        .map(|value| format!("{value:.1}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn avg_max(values: &[f64]) -> String {
+    if values.is_empty() {
+        "-".into()
+    } else {
+        format!("{}/{}", average(values), maximum(values))
+    }
+}
+
+fn count_or_missing(value: f64, evidence: f64) -> String {
+    if value == 0.0 && evidence == 0.0 {
+        "-".into()
+    } else {
+        format!("{value:.0}")
+    }
+}
+
+fn sum_or_missing(value: f64, p95: &[f64], errors: f64) -> String {
+    if value == 0.0 && p95.is_empty() && errors == 0.0 {
+        "-".into()
+    } else {
+        format!("{value:.0}")
     }
 }
 
@@ -281,7 +503,7 @@ fn print_sqlite_hint(store: &Store, run_id: Option<&str>) {
     println!("sqlite      {} (shared by all runs)", path.display());
     match run_id {
         Some(run_id) => println!(
-            "sql hint    sqlite3 {} \"SELECT name,value,unit,labels_json FROM metrics WHERE run_id='{}';\"",
+            "sql hint    sqlite3 {} \"SELECT observed_at,name,value,unit,labels_json FROM metrics WHERE run_id='{}' ORDER BY observed_at;\"",
             shell_display(&path),
             run_id.replace('\'', "''")
         ),
@@ -371,4 +593,20 @@ fn print_summary(run: &RunSummary) {
         result,
         score,
     );
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+
+    #[test]
+    fn host_sampler_cpu_wins_over_sysstat() {
+        let row = BucketRow {
+            cpu_host_sampler: vec![80.0],
+            cpu_sysstat: vec![10.0],
+            cpu_other: vec![20.0],
+            ..Default::default()
+        };
+        assert_eq!(preferred_cpu(&row), &[80.0]);
+    }
 }

@@ -39,7 +39,8 @@ pub async fn execute(
     run_dir: &Path,
     shutdown: Shutdown,
 ) -> BenchmarkExecution {
-    match config.config.benchmark.mode {
+    let started_at = Utc::now();
+    let mut execution = match config.config.benchmark.mode {
         BenchmarkMode::Command => match execute_command(config, run_dir, shutdown).await {
             Ok(execution) => execution,
             Err(error) => BenchmarkExecution {
@@ -68,7 +69,10 @@ pub async fn execute(
                 logs: Vec::new(),
             },
         },
-    }
+    };
+    execution.result.started_at.get_or_insert(started_at);
+    execution.result.finished_at.get_or_insert_with(Utc::now);
+    execution
 }
 
 async fn execute_command(
@@ -176,6 +180,8 @@ async fn execute_command(
             passed,
             interrupted,
             messages: observation.messages,
+            started_at: None,
+            finished_at: None,
             initialize_started_at: observation.initialize_started_at,
             initialize_finished_at: observation.initialize_finished_at,
             error: if interrupted {
@@ -279,8 +285,11 @@ fn observe_line(
 }
 
 async fn execute_external(_config: &BenchmarkConfig) -> Result<BenchmarkResult> {
-    println!("collectors armed; start the benchmark from the contest portal");
+    println!("collectors armed; open the contest portal");
+    prompt("Press Enter immediately before starting the benchmark: ")?;
+    let started_at = Utc::now();
     prompt("Press Enter after the benchmark has finished: ")?;
+    let finished_at = Utc::now();
     let score = prompt("Score (empty if unavailable): ")?;
     let score = if score.trim().is_empty() {
         None
@@ -297,6 +306,8 @@ async fn execute_external(_config: &BenchmarkConfig) -> Result<BenchmarkResult> 
         mode: "external".into(),
         score,
         passed,
+        started_at: Some(started_at),
+        finished_at: Some(finished_at),
         ..Default::default()
     })
 }

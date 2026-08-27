@@ -80,6 +80,10 @@ pub struct BenchmarkResult {
     #[serde(default)]
     pub interrupted: bool,
     pub messages: Vec<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
     pub initialize_started_at: Option<DateTime<Utc>>,
     pub initialize_finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
@@ -91,6 +95,9 @@ pub struct Metric {
     pub value: f64,
     #[serde(default)]
     pub unit: String,
+    /// When the value was observed. Aggregate metrics may omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
 }

@@ -139,6 +139,7 @@ pub enum Transport {
 #[serde(rename_all = "kebab-case")]
 pub enum CollectorParser {
     AlpJson,
+    MysqlSlow,
     SlpJson,
     Sysstat,
 }

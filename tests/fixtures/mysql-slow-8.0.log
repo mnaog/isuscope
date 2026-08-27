@@ -1,0 +1,16 @@
+# Time: 2026-08-27T11:59:59.000000Z
+# User@Host: isucon[isucon] @ localhost []  Id: 10
+# Query_time: 0.900000  Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SELECT 0;
+# Time: 2026-08-27T12:00:01.000000Z
+# User@Host: isucon[isucon] @ localhost []  Id: 11
+# Query_time: 0.100000  Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SELECT 1;
+# Time: 2026-08-27T12:00:04.000000Z
+# User@Host: isucon[isucon] @ localhost []  Id: 12
+# Query_time: 0.250000  Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SELECT 2;
+# Time: 2026-08-27T12:00:06.000000Z
+# User@Host: isucon[isucon] @ localhost []  Id: 13
+# Query_time: 0.700000  Lock_time: 0.000000 Rows_sent: 1 Rows_examined: 1
+SELECT 3;

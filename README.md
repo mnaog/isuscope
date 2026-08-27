@@ -9,6 +9,7 @@ isuscope run
 isuscope discovery-run
 isuscope show [latest|RUN_ID]
 isuscope bottleneck [latest|RUN_ID]
+isuscope series [latest|RUN_ID]
 ```
 
 開始直後に一度だけ使う`isuscope init`もあります。日常操作には使用しません。
@@ -239,11 +240,26 @@ collectorの出力はすべて圧縮ログとして保存します。加えて�
 
 ```json
 {"type":"metric","name":"process.cpu_percent","value":34.2,"unit":"percent","labels":{"role":"app"}}
+{"type":"metric","name":"host.cpu_percent","value":82.1,"unit":"percent","timestamp":"2026-08-27T12:34:56.789Z","labels":{"node":"isu1"}}
 {"type":"fingerprint","name":"app.binary.sha256","value":"012345..."}
 {"type":"transition","from":"GET /api/livestream/:id","to":"GET /api/livecomments","count":4875,"p50_ms":3.0,"p95_ms":8.0}
 ```
 
 この形式以外の行は生ログとして残し、構造化parserでは無視します。
+
+metricへ任意の`timestamp`を付けると、RFC 3339文字列またはUnix秒（小数可）を観測時刻としてSQLiteの`metrics.observed_at`へ保存します。1秒ごとなどに同じ`name`とlabelで出力すれば、ベンチ中のCPU、memory、queue長、request数などを時系列として保持できます。`timestamp`を省略したALP集計値などは従来どおりrun全体の集計値として保存されます。
+
+時刻付きmetricはCLIから5秒bucketの表として確認できます。画面や常駐serverは不要です。
+
+```console
+isuscope series latest
+```
+
+`series`はUTCの5秒境界で揃えたmetricをbenchmark区間で切り出し、開始からの相対秒とともにnodeごとのhost、HTTP、database指標を表形式で並べます。先頭・末尾の部分bucketは実際の区間を表示します。1秒のhost sampleは平均・最大へ集約し、HTTPとdatabaseのcountは合計します。欠測は`-`で表示します。
+
+表の前には標準時系列collectorごとの`complete` / `unavailable` / `failed`、exit code、errorを表示します。各metricには生成したcollector名が記録され、CPUは`host-sampler`を優先し、利用できない場合だけsysstatへfallbackするため二重集計しません。HTTP、MySQL、sysstat parserはbenchmark区間外のsampleを除外します。
+
+`isuscope init`の標準構成では、追加package不要の`host-sampler`が`/proc`からCPU、memory、load averageを1秒間隔で取得します。利用可能ならsysstatも各CPU/disk sampleを時系列化します。discovery用access logとMySQL slow logは5秒bucketのHTTP/DB metricへ変換できます。
 
 `fingerprint`は文字列値をSQLiteへ保存します。app binary、設定、service unit、OSやtool versionなど、スコア取得時のremote実体を記録する用途です。
 
