@@ -20,4 +20,60 @@ stream_output = false
 user = "ubuntu"
 connect_timeout_seconds = 5
 
-# [[nodes]]と[[collectors]]はSETUP.mdの手順に従って追加します。
+# [[nodes]]はSETUP.mdの手順に従って追加します。roleを指定しない以下の
+# 標準collectorは、設定した全nodeでrun/discovery-runの両方に対して動きます。
+
+[[collectors]]
+name = "sysstat"
+phase = "during"
+transport = "ssh"
+command = ["sh", "-c", "command -v sar >/dev/null 2>&1 || exit 75; exec env LC_ALL=C sar -u -d 1"]
+parser = "sysstat"
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "perf-record"
+phase = "during"
+transport = "ssh"
+command = ["sh", "-c", "command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; exec sudo -n perf record -a -g -F 99 -o /tmp/isuscope-{run_id}.perf.data -- sleep 86400"]
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "perf-report"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", "command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; test -s /tmp/isuscope-{run_id}.perf.data || exit 75; sudo -n perf report --stdio --no-children --percent-limit 1 --sort dso,symbol --field-separator ';' -i /tmp/isuscope-{run_id}.perf.data | awk -F';' '/^[ ]*[0-9]+[.][0-9]+%/ { pct=$1; sub(/%/,\"\",pct); gsub(/^[ ]+|[ ]+$/,\"\",pct); binary=$2; symbol=$3; gsub(/^[ ]+|[ ]+$/,\"\",binary); gsub(/^[ ]+|[ ]+$/,\"\",symbol); gsub(/[\\\\\\\"]/,\"_\",binary); gsub(/[\\\\\\\"]/,\"_\",symbol); printf \"{\\\"type\\\":\\\"metric\\\",\\\"name\\\":\\\"cpu.sample_percent\\\",\\\"value\\\":%s,\\\"unit\\\":\\\"percent\\\",\\\"labels\\\":{\\\"binary\\\":\\\"%s\\\",\\\"symbol\\\":\\\"%s\\\"}}\\n\",pct,binary,symbol }'; rm -f /tmp/isuscope-{run_id}.perf.data"]
+timeout_seconds = 30
+unavailable_exit_codes = [75]
+
+# alp/slpはログ形式とpathが問題ごとに異なるため、SETUP.mdに従い以下の
+# placeholderを実環境へ合わせます。設定から削除せず、対象がなければ75を返します。
+[[collectors]]
+name = "alp-mark"
+phase = "before"
+transport = "ssh"
+command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; test -r /var/log/nginx/access.log || exit 75; stat -c '%i %s' /var/log/nginx/access.log > /tmp/isuscope-{run_id}.alp.offset"]
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "alp"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; test -r /var/log/nginx/access.log || exit 75; test -r /tmp/isuscope-{run_id}.alp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.alp.offset; test \"$(stat -c %i /var/log/nginx/access.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/nginx/access.log > /tmp/isuscope-{run_id}.alp.log; alp ltsv --file /tmp/isuscope-{run_id}.alp.log --output json; rm -f /tmp/isuscope-{run_id}.alp.offset /tmp/isuscope-{run_id}.alp.log"]
+parser = "alp-json"
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "slp-mark"
+phase = "before"
+transport = "ssh"
+command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; test -r /var/log/mysql/mysql-slow.log || exit 75; stat -c '%i %s' /var/log/mysql/mysql-slow.log > /tmp/isuscope-{run_id}.slp.offset"]
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "slp"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; test -r /var/log/mysql/mysql-slow.log || exit 75; test -r /tmp/isuscope-{run_id}.slp.offset || exit 75; read inode offset < /tmp/isuscope-{run_id}.slp.offset; test \"$(stat -c %i /var/log/mysql/mysql-slow.log)\" = \"$inode\" || exit 75; tail -c +$((offset+1)) /var/log/mysql/mysql-slow.log > /tmp/isuscope-{run_id}.slp.log; slp --format json /tmp/isuscope-{run_id}.slp.log; rm -f /tmp/isuscope-{run_id}.slp.offset /tmp/isuscope-{run_id}.slp.log"]
+parser = "slp-json"
+unavailable_exit_codes = [75]

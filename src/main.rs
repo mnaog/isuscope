@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use isuscope::{
+    bottleneck,
     config::LoadedConfig,
     init,
     model::RunMode,
@@ -8,6 +9,7 @@ use isuscope::{
     shutdown::Shutdown,
     storage::{RunSummary, Store},
 };
+use std::collections::BTreeMap;
 use std::{env, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
@@ -22,14 +24,20 @@ struct Cli {
 enum Commands {
     /// プロジェクトへ一度だけ使う設定雛形を生成します。
     Init,
-    /// 低負荷collectorでベンチを実行します。
+    /// 標準collectorでベンチを実行します。
     Run,
-    /// 詳細調査用collectorを有効にしてベンチを実行します。
+    /// 標準collectorに行動遷移分析を加えてベンチを実行します。
     DiscoveryRun,
     /// run一覧、または指定したrunの詳細を表示します。
     Show {
         /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
         run: Option<String>,
+    },
+    /// 指定したrunでカテゴリ別のボトルネック候補を最大5件表示します。
+    Bottleneck {
+        /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
     },
     #[command(name = "__transition", hide = true)]
     InternalTransition {
@@ -127,8 +135,55 @@ async fn real_main() -> Result<bool> {
             show(&config, run.as_deref())?;
             Ok(true)
         }
+        Commands::Bottleneck { run } => {
+            show_bottlenecks(&config, &run)?;
+            Ok(true)
+        }
         Commands::InternalTransition { .. } => unreachable!(),
     }
+}
+
+fn show_bottlenecks(config: &LoadedConfig, requested: &str) -> Result<()> {
+    let store = Store::open(&config.data_dir)?;
+    let id = store
+        .resolve_id(requested)?
+        .with_context(|| format!("run `{requested}` was not found"))?;
+    let report = bottleneck::rank(&store.metrics(&id)?);
+    println!("run {}", id);
+    println!("candidates: one leader per observed category, then category-local severity");
+    println!("note: numbers are not a cross-category remediation priority");
+    if report.candidates.is_empty() {
+        println!("no supported metrics were collected");
+    }
+    println!(
+        "{:<4}  {:<10}  {:<12}  {:<32}  {:<38}  {:<20}",
+        "NO.", "CATEGORY", "NODE", "TARGET", "EVIDENCE", "SOURCE"
+    );
+    for (index, item) in report.candidates.iter().enumerate() {
+        println!(
+            "{:<4}  {:<10}  {:<12}  {:<32}  {:<38}  {:<20}",
+            index + 1,
+            item.category,
+            item.node,
+            item.target,
+            item.evidence,
+            item.source
+        );
+        println!("      verify: {}", item.verify_metric);
+    }
+    println!("coverage");
+    for coverage in report.coverage {
+        println!(
+            "  {:<10} {}",
+            coverage.category,
+            if coverage.available {
+                "complete"
+            } else {
+                "unavailable"
+            }
+        );
+    }
+    Ok(())
 }
 
 fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
@@ -137,6 +192,7 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
         let runs = store.list(20)?;
         if runs.is_empty() {
             println!("no runs");
+            print_sqlite_hint(&store, None);
             return Ok(());
         }
         println!(
@@ -146,6 +202,7 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
         for run in runs {
             print_summary(&run);
         }
+        print_sqlite_hint(&store, None);
         return Ok(());
     };
     let id = store
@@ -188,18 +245,100 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
         }
     );
     println!("collectors  {}", manifest.collectors.len());
+    print_collector_overview(&manifest.collectors);
     println!("metrics     {}", manifest.metric_count);
+    print_metric_overview(&store.metrics(&id)?);
     println!("fingerprints {}", manifest.fingerprint_count);
     println!("transitions {}", manifest.transition_count);
     println!("logs        {}", manifest.logs.len());
     for log in &manifest.logs {
         println!("  {}", log.id);
+        let path = config
+            .data_dir
+            .join("runs")
+            .join(&manifest.id)
+            .join("logs")
+            .join(format!("{}.zst", log.id));
+        println!(
+            "    view    zstd -dc -- {}",
+            shell_quote(&path.display().to_string())
+        );
     }
     println!(
         "path        {}",
         runner::run_path(store.data_dir(), &id).display()
     );
+    print_sqlite_hint(&store, Some(&id));
     Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn print_sqlite_hint(store: &Store, run_id: Option<&str>) {
+    let path = store.data_dir().join("isuscope.sqlite3");
+    println!("sqlite      {} (shared by all runs)", path.display());
+    match run_id {
+        Some(run_id) => println!(
+            "sql hint    sqlite3 {} \"SELECT name,value,unit,labels_json FROM metrics WHERE run_id='{}';\"",
+            shell_display(&path),
+            run_id.replace('\'', "''")
+        ),
+        None => println!(
+            "sql hint    sqlite3 {} \"SELECT id,started_at,score,state FROM runs ORDER BY started_at DESC;\"",
+            shell_display(&path)
+        ),
+    }
+    println!(
+        "compare     sqlite3 {} \"SELECT substr(run_id,-8) AS run,name,value,unit,labels_json FROM metrics WHERE name='http.request_duration' ORDER BY labels_json,run_id;\"",
+        shell_display(&path)
+    );
+}
+
+fn shell_display(path: &std::path::Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn print_collector_overview(collectors: &[isuscope::model::CollectorResult]) {
+    if collectors.is_empty() {
+        return;
+    }
+    println!("observability");
+    for collector in collectors {
+        let node = collector.node.as_deref().unwrap_or("local");
+        println!(
+            "  {:<12} {:<24} {:<12} {}",
+            collector.status, collector.name, node, collector.phase
+        );
+    }
+}
+
+fn print_metric_overview(metrics: &[isuscope::model::Metric]) {
+    if metrics.is_empty() {
+        return;
+    }
+    let mut series = BTreeMap::<(&str, &str), (usize, f64, f64)>::new();
+    for metric in metrics {
+        let entry =
+            series
+                .entry((&metric.name, &metric.unit))
+                .or_insert((0, metric.value, metric.value));
+        entry.0 += 1;
+        entry.1 = entry.1.min(metric.value);
+        entry.2 = entry.2.max(metric.value);
+    }
+    println!("metric series");
+    println!(
+        "  {:<34} {:>6}  {:>12}  {:>12}  UNIT",
+        "NAME", "ROWS", "MIN", "MAX"
+    );
+    for ((name, unit), (rows, min, max)) in series {
+        println!(
+            "  {:<34} {:>6}  {:>12.2}  {:>12.2}  {}",
+            name, rows, min, max, unit
+        );
+    }
 }
 
 fn print_summary(run: &RunSummary) {

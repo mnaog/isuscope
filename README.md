@@ -2,12 +2,13 @@
 
 `isuscope`は、ISUCONのベンチマーク1回分を再現可能なrunとして記録するツールです。ベンチ結果、ソースコードの状態、構造化メトリクス、圧縮した生ログへの参照を、CLIを実行した手元のマシンへ保存します。
 
-公開CLIは意図的に次の3コマンドだけにしています。
+公開CLIは日常操作を次の4コマンドに絞っています。
 
 ```console
 isuscope run
 isuscope discovery-run
 isuscope show [latest|RUN_ID]
+isuscope bottleneck [latest|RUN_ID]
 ```
 
 開始直後に一度だけ使う`isuscope init`もあります。日常操作には使用しません。
@@ -17,6 +18,8 @@ isuscope show [latest|RUN_ID]
 このリポジトリには、実際に利用できる最初のMVPが入っています。コマンドによるベンチ起動、外部ベンチの対話操作、local/SSH collector、SQLite索引、Git snapshot、ログ圧縮、失敗runの保存を実装済みです。
 
 大会ポータル固有のベンチ開始・終了の自動検知は、実際のポータル仕様が分かってから追加します。
+
+実環境のtool versionや時系列相関が必要な未完了項目は[`TODO.md`](TODO.md)で追跡します。
 
 ## インストール
 
@@ -34,7 +37,25 @@ cargo install --path .
 
 競技開始後の導入・受け入れ確認・通常運用は、[ISUCON当日の導入・運用手順](docs/contest-day.md)にまとめています。
 
-[`examples/config.toml`](examples/config.toml)をISUCONプロジェクトへコピーします。
+推奨する開始方法は、標準collectorを含む非対話型scaffoldの生成です。既存ファイルは上書きしないため再実行できます。
+
+```console
+isuscope init
+```
+
+### 初回runまでの7ステップ
+
+1. `isuscope init`でscaffoldを生成する。この時点ではまだ`setup.sh`を実行しない。
+2. `.isuscope/benchmark.sh`へベンチの起動、完了待ち、結果JSON出力を実装する。
+3. `.isuscope/config.toml`の`[ssh]`と`[[nodes]]`を実環境へ合わせる。
+4. alpのaccess log path・format、slpのslow log path・format、perfの`sudo -n`権限を確認する。
+5. `bash -n .isuscope/benchmark.sh`、`bash -n .isuscope/setup.sh`、`isuscope show`で副作用なしの検査をする。
+6. 不足する環境変更だけを`setup.sh`へ記述し、`.isuscope/setup.sh`を実行する。
+7. `isuscope discovery-run`、`isuscope show latest`、`isuscope bottleneck latest`の順に実行し、collector状態、metric、coverageを確認する。
+
+最低限編集するのは`benchmark.sh`、`config.toml`の`[ssh]`、`[[nodes]]`です。標準ツールの自動installやsudoers変更は行いません。必要な場合だけ、利用者が`setup.sh`の`apply_environment`へ冪等な処理を追加します。
+
+問題固有collectorや複数node設定の詳細な参考例は[`examples/config.toml`](examples/config.toml)にあります。
 
 ```text
 your-isucon-project/
@@ -44,22 +65,15 @@ your-isucon-project/
 
 `isuscope`は、現在のディレクトリから親ディレクトリへ向かって`.isuscope/config.toml`を探索します。
 
-または、非対話型scaffoldを生成します。既存ファイルは上書きしないため再実行できます。
-
-```console
-isuscope init
-.isuscope/setup.sh
-```
-
 ## コマンド
 
-低負荷のcollectorで通常のスコア計測を行います。
+標準collectorを有効にした通常のスコア計測を行います。perfを含めて毎回同じ観測条件にするため、collectorを変更したrun同士は同条件として比較しません。
 
 ```console
 isuscope run
 ```
 
-アクセスログやユーザー行動遷移など、調査用collectorも有効にして実行します。
+標準collectorは通常runと同じです。加えて、cookieなどの匿名識別子を利用したユーザー行動遷移を集計します。
 
 ```console
 isuscope discovery-run
@@ -74,6 +88,23 @@ isuscope show 8c9f021a
 ```
 
 `show`が表示する短縮IDはUUIDの末尾8文字です。そのまま`show`の引数として利用できます。
+
+run詳細には、SQLiteへ保存されたcollectorごとの`complete` / `unavailable` / `failed`、metric名ごとの行数・最小値・最大値・単位も表示します。ユーザーはSQLを直接書かなくても、どの観測が取れていて、どのmetricが存在するかを確認できます。SQLiteは検索・比較用の索引であり、collectorの生出力はrun配下の圧縮ログが正本です。
+
+各log IDの直下には、圧縮ログを読むための`zstd -dc -- '<path>'`も表示します。collectorが`failed`の場合はstderr logの`view`行をコピーして実行します。
+
+SQLiteはrunごとに独立しておらず、1つの`data_dir`につき1ファイルを全runで共有します。各tableの`run_id`でrunを区別するため、commit、score、同じmetric・labelなどをJOINしてrun間比較できます。run配下の`run.json`と圧縮ログはrunごとに独立した正本で、SQLiteはそれらを横断する索引です。
+
+`show`の末尾にはSQLiteファイルの絶対パスと、そのままコピーして実行できる`sqlite3`のquery例を表示します。一覧ではrun履歴、run詳細ではそのrunのmetric全行を確認するqueryになり、さらに同じmetricをrun横断で並べる比較queryも表示します。通常は`show`と`bottleneck`を使い、独自の比較やlabel単位の調査が必要な場合だけquery例を入口にSQLiteを直接参照します。
+
+runのHTTP、database、CPU、hostメトリクスから、ボトルネック候補を上位5件表示します。
+
+```console
+isuscope bottleneck
+isuscope bottleneck 8c9f021a
+```
+
+HTTP、database、CPU、host saturationのカテゴリごとに候補を作り、観測できた各カテゴリの首位を残してから、カテゴリ内で正規化した深刻度で最大5件を表示します。異なる単位の生値は加算しません。表示番号はカテゴリ横断の改善優先順位ではありません。各候補には根拠、source、改善後に確認するmetricを表示し、未観測カテゴリもcoverageへ`unavailable`として明示します。改善により支配的なボトルネックは移動するため、これは原因の断定ではなく、runごとに更新される次の調査対象です。
 
 ## 当日のベンチ起動アダプター
 
@@ -181,6 +212,8 @@ required = false
 
 SSH collectorが出力したmetricには、対象node名が`node` labelとして自動追加されます。collector自身が`node` labelを出力した場合はその値を維持します。
 
+roleはマシンの固定的な種類ではなく、collectorの実行先を選択する任意のtagです。1台へ`roles = ["edge", "app", "db"]`のように複数指定でき、役割が移動したら次のrunの前に変更します。設定はrunごとにsnapshotされるため、過去runが参照した役割は保持されます。
+
 コマンド引数では、次のplaceholderを利用できます。
 
 - `{run_id}`
@@ -190,11 +223,19 @@ SSH collectorが出力したmetricには、対象node名が`node` labelとして
 
 collectorの失敗は記録しますが、ベンチは停止しません。例外として、`before` phaseで`required = true`を指定したcollectorが失敗した場合は、ベンチを開始しません。
 
+標準観測collectorのように「毎回試すが、そのrunでは対象が存在しない」ものは、終了コード`75`で終了してください。isuscopeはこれを失敗ではなく`unavailable`として記録します。たとえばMySQLを退役してPostgreSQLへ移行した後は、MySQL slow log collectorが`75`を返せばrunをdegradedにせず、観測対象が消えた事実を履歴へ残せます。終了コードはcollectorごとの`unavailable_exit_codes = [75]`で変更できます。
+
+perf、alp、slp、sysstatを常設する場合の役割分担、collector構成、ツールやDBが消えた場合の扱い、およびbottleneckランキングへ渡すmetric契約は[標準観測スタックの設計](docs/standard-observability.md)にまとめています。
+
+`isuscope init`が生成するconfigにはsysstat、perf、alp、slpの標準collectorが最初から含まれます。roleを空にして全nodeを対象にし、両方のrun modeで同じ観測を試みます。ツール、権限、対象ログがなければ終了コード75で`unavailable`になります。alpとslpのログpath・formatだけは問題環境に合わせてください。
+
 `max_output_bytes`はstdoutとstderrへ個別に適用します。上限に達した後もpipeの読み取り自体は続けるため、観測対象のプロセスをblockしません。runはdegradedとなり、保存ログには途中で打ち切られたことが記録されます。
 
 ### 構造化collector出力
 
 collectorの出力はすべて圧縮ログとして保存します。加えて、1行に1つのJSON objectをstdoutへ出力すると、計算済みの値をSQLiteにも記録できます。
+
+標準ツールのnative出力には`parser = "sysstat"`、`parser = "alp-json"`、`parser = "slp-json"`を指定できます。adapterは生ログを残したまま共通metricへ変換し、変換できない出力をcollectorの成功として扱いません。
 
 ```json
 {"type":"metric","name":"process.cpu_percent","value":34.2,"unit":"percent","labels":{"role":"app"}}
@@ -246,6 +287,21 @@ SELECT started_at, commit_hash, score
 FROM runs
 WHERE passed = 1
 ORDER BY started_at;
+```
+
+metricは`run_id`を持つため、同名metricをrun横断で比較できます。
+
+```sql
+SELECT substr(m.run_id, -8) AS run,
+       r.score,
+       m.name,
+       m.value,
+       m.unit,
+       m.labels_json
+FROM metrics AS m
+JOIN runs AS r ON r.id = m.run_id
+WHERE m.name = 'http.request_duration'
+ORDER BY m.labels_json, r.started_at;
 ```
 
 秘密情報の自動maskingは行いません。短時間かつ管理されたISUCON環境で使用するという要件に基づく仕様です。

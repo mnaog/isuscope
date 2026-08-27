@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod bottleneck;
 pub mod collector;
 pub mod config;
 pub mod git_snapshot;

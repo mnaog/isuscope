@@ -126,21 +126,19 @@ role名は自由ですが、collectorの対象選択に使うため、実際の�
 
 ### 6. collectorを設定する
 
-通常の`run`には、ベンチ中に常駐しない低負荷collectorだけを入れます。
+生成された標準collectorは`run`と`discovery-run`の両方で起動を試みます。
 
-- host CPU・memoryの前後差分
-- service CPU・memoryの前後差分
+- sysstatによるhost CPU・disk
+- perfによるsystem-wide hot symbol
+- alpによるHTTP集計
+- slpによるslow query集計
 - remote fingerprint
 
-`discovery-run`には、初期調査用の重いcollectorを追加できます。
+`discovery-run`だけが、標準観測にcookieなどの匿名識別子を使った行動遷移を追加します。
 
-- Nginxアクセスログの開始offset記録と終了後差分回収
-- route別request数、status、response bytes
-- request/upstream latencyのp50/p95/p99
-- HTTP接続再利用
 - 匿名viewer単位の行動遷移
 
-ベンチ中のSSH転送、圧縮、ログ解析はスコアへ影響しやすいため避けます。開始前にoffsetだけ記録し、終了後に差分を回収・解析する構成を推奨します。
+ベンチ中のSSH転送、圧縮、ログ解析はスコアへ影響しやすいため避けます。ログ系collectorは開始前にoffsetだけ記録し、終了後に差分を回収・解析する構成を推奨します。perfはベンチと同時にsamplingするため、全runで同じ条件にします。
 
 `before` collectorでベンチ実行の前提になるものには`required = true`を設定します。ログローテーションをベンチ起動コマンドが行う場合は、offset記録より先に同じrotationを済ませ、計測中のinode消失を防ぎます。
 
@@ -203,6 +201,8 @@ isuscope show latest
 - `tooling/extra/benchmark.sh`に当日実装が保存されている
 
 `degraded`はベンチ自体がPASSでもcollectorが失敗した状態です。失敗collectorのstderrを確認し、受け入れ確認では`complete`になるまで直します。
+
+`isuscope show latest`は各圧縮ログの直下に`zstd -dc -- '<path>'`を表示します。collectorが`failed`の場合はstderr logの`view`行をそのままコピーして原因を確認します。
 
 ### 3. SQLiteを確認する
 

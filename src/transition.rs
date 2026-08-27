@@ -27,6 +27,22 @@ struct RouteRule {
     replace: String,
 }
 
+pub struct RouteNormalizer {
+    rules: Vec<RouteRule>,
+}
+
+impl RouteNormalizer {
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        Ok(Self {
+            rules: load_rules(path)?,
+        })
+    }
+
+    pub fn normalize(&self, uri: &str) -> String {
+        normalize(uri, &self.rules)
+    }
+}
+
 #[derive(Debug)]
 struct Event {
     at: DateTime<Utc>,
@@ -60,7 +76,7 @@ pub struct TransitionOptions<'a> {
 }
 
 pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
-    let rules = load_rules(options.rules)?;
+    let rules = RouteNormalizer::load(options.rules)?;
     let mut paths = find_logs(options.run_dir, options.prefix)?;
     paths.sort();
     let mut sessions: BTreeMap<String, Vec<Event>> = BTreeMap::new();
@@ -226,7 +242,7 @@ fn read_log(
     path: &Path,
     node: &str,
     options: &TransitionOptions<'_>,
-    rules: &[RouteRule],
+    rules: &RouteNormalizer,
     sessions: &mut BTreeMap<String, Vec<Event>>,
     route_stats: &mut BTreeMap<(String, String, String), RouteStats>,
 ) -> Result<()> {
@@ -243,7 +259,7 @@ fn read_log(
             continue;
         };
         let uri = uri.split('?').next().unwrap_or(uri);
-        let route = normalize(uri, rules);
+        let route = rules.normalize(uri);
         let mut stats_key = (node.to_owned(), (*method).to_owned(), route.clone());
         if !route_stats.contains_key(&stats_key) && route_stats.len() >= MAX_ROUTE_SERIES {
             stats_key.2 = "/__cardinality_limit__".into();
@@ -407,16 +423,18 @@ mod tests {
         )
         .unwrap();
         encoder.finish().unwrap();
-        let rules = vec![
-            RouteRule {
-                pattern: Regex::new(r"^/api/user/[^/]+/icon$").unwrap(),
-                replace: "/api/user/:name/icon".into(),
-            },
-            RouteRule {
-                pattern: Regex::new(r"^/api/livestream/[0-9]+$").unwrap(),
-                replace: "/api/livestream/:id".into(),
-            },
-        ];
+        let rules = RouteNormalizer {
+            rules: vec![
+                RouteRule {
+                    pattern: Regex::new(r"^/api/user/[^/]+/icon$").unwrap(),
+                    replace: "/api/user/:name/icon".into(),
+                },
+                RouteRule {
+                    pattern: Regex::new(r"^/api/livestream/[0-9]+$").unwrap(),
+                    replace: "/api/livestream/:id".into(),
+                },
+            ],
+        };
         let mut sessions = BTreeMap::new();
         let options = TransitionOptions {
             run_dir: dir.path(),
