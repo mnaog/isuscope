@@ -1,5 +1,6 @@
 use crate::{
     collector,
+    enrichment::{EnrichmentOutput, PARSER_LABEL},
     model::{Fingerprint, Metric, RunManifest, RunState, Transition},
 };
 use anyhow::{Context, Result, bail};
@@ -25,6 +26,8 @@ pub struct RunSummary {
     pub state: String,
     pub score: Option<i64>,
     pub passed: Option<bool>,
+    pub note: Option<String>,
+    pub tags: Vec<String>,
 }
 
 impl Store {
@@ -78,7 +81,7 @@ impl Store {
             }
             fs::rename(&staging, &final_dir)?;
             self.connection.execute(
-                "INSERT OR IGNORE INTO runs (id, started_at, mode, state, commit_hash, dirty) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO runs (id, started_at, mode, state, commit_hash, dirty, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     manifest.id,
                     manifest.started_at.to_rfc3339(),
@@ -86,6 +89,7 @@ impl Store {
                     manifest.state.as_str(),
                     manifest.source.commit_hash,
                     manifest.source.dirty,
+                    manifest.note,
                 ],
             )?;
             self.connection.execute(
@@ -98,6 +102,12 @@ impl Store {
                     manifest.benchmark.exit_code,
                 ],
             )?;
+            for tag in &manifest.tags {
+                self.connection.execute(
+                    "INSERT OR IGNORE INTO run_tags (run_id, tag) VALUES (?1, ?2)",
+                    params![manifest.id, tag],
+                )?;
+            }
             recovered.push(manifest.id);
         }
         Ok(recovered)
@@ -116,7 +126,7 @@ impl Store {
         fs::create_dir_all(staging.join("tmp"))?;
         write_manifest(&staging, manifest)?;
         self.connection.execute(
-            "INSERT INTO runs (id, started_at, mode, state, commit_hash, dirty) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO runs (id, started_at, mode, state, commit_hash, dirty, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 manifest.id,
                 manifest.started_at.to_rfc3339(),
@@ -124,8 +134,15 @@ impl Store {
                 manifest.state.as_str(),
                 manifest.source.commit_hash,
                 manifest.source.dirty,
+                manifest.note,
             ],
         )?;
+        for tag in &manifest.tags {
+            self.connection.execute(
+                "INSERT INTO run_tags (run_id, tag) VALUES (?1, ?2)",
+                params![manifest.id, tag],
+            )?;
+        }
         Ok(staging)
     }
 
@@ -149,7 +166,7 @@ impl Store {
 
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "UPDATE runs SET finished_at=?2, state=?3, commit_hash=?4, dirty=?5, score=?6, passed=?7, exit_code=?8 WHERE id=?1",
+            "UPDATE runs SET finished_at=?2, state=?3, commit_hash=?4, dirty=?5, score=?6, passed=?7, exit_code=?8, note=?9 WHERE id=?1",
             params![
                 manifest.id,
                 manifest.finished_at.map(|value| value.to_rfc3339()),
@@ -159,6 +176,7 @@ impl Store {
                 manifest.benchmark.score,
                 manifest.benchmark.passed,
                 manifest.benchmark.exit_code,
+                manifest.note,
             ],
         )?;
         for log in &manifest.logs {
@@ -191,13 +209,28 @@ impl Store {
                 params![manifest.id, collector.name, collector.node, collector.phase, collector.status, collector.exit_code, collector.error],
             )?;
         }
+        for enrichment in &manifest.enrichments {
+            transaction.execute(
+                "INSERT INTO enrichment_runs (run_id, name, status, command_json, exit_code, error, log_ids_json, tooling_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    manifest.id,
+                    enrichment.name,
+                    enrichment.status,
+                    serde_json::to_string(&enrichment.command)?,
+                    enrichment.exit_code,
+                    enrichment.error,
+                    serde_json::to_string(&enrichment.log_ids)?,
+                    enrichment.tooling_path,
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(final_dir)
     }
 
     pub fn list(&self, limit: usize) -> Result<Vec<RunSummary>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, started_at, commit_hash, dirty, mode, state, score, passed FROM runs ORDER BY started_at DESC LIMIT ?1",
+            "SELECT id, started_at, commit_hash, dirty, mode, state, score, passed, note FROM runs ORDER BY started_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit as i64], |row| {
             Ok(RunSummary {
@@ -209,10 +242,15 @@ impl Store {
                 state: row.get(5)?,
                 score: row.get(6)?,
                 passed: row.get(7)?,
+                note: row.get(8)?,
+                tags: Vec::new(),
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for run in &mut runs {
+            run.tags = self.tags(&run.id)?;
+        }
+        Ok(runs)
     }
 
     pub fn resolve_id(&self, requested: &str) -> Result<Option<String>> {
@@ -235,6 +273,16 @@ impl Store {
             .optional()?;
         if exact.is_some() {
             return Ok(exact);
+        }
+        let tagged = self
+            .connection
+            .prepare("SELECT run_id FROM run_tags WHERE tag=?1 ORDER BY rowid DESC")?
+            .query_map([requested], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match tagged.len() {
+            1 => return Ok(tagged.into_iter().next()),
+            count if count > 1 => bail!("run tag `{requested}` matches {count} runs"),
+            _ => {}
         }
         let mut statement = self
             .connection
@@ -292,6 +340,137 @@ impl Store {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn tags(&self, id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT tag FROM run_tags WHERE run_id=?1 ORDER BY tag")?;
+        statement
+            .query_map([id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn annotate(
+        &mut self,
+        id: &str,
+        note: Option<String>,
+        tags: &[String],
+        remove_tags: &[String],
+    ) -> Result<RunManifest> {
+        if !self.final_dir(id).is_dir() {
+            bail!("run `{id}` is not finalized");
+        }
+        let mut manifest = self.load(id)?;
+        if let Some(note) = note {
+            manifest.note = (!note.trim().is_empty()).then_some(note);
+        }
+        for tag in tags {
+            let tag = tag.trim();
+            if !tag.is_empty() && !manifest.tags.iter().any(|value| value == tag) {
+                manifest.tags.push(tag.to_owned());
+            }
+        }
+        manifest
+            .tags
+            .retain(|tag| !remove_tags.iter().any(|removed| removed == tag));
+        manifest.tags.sort();
+        manifest.tags.dedup();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE runs SET note=?2 WHERE id=?1",
+            params![id, manifest.note],
+        )?;
+        transaction.execute("DELETE FROM run_tags WHERE run_id=?1", [id])?;
+        for tag in &manifest.tags {
+            transaction.execute(
+                "INSERT INTO run_tags (run_id, tag) VALUES (?1, ?2)",
+                params![id, tag],
+            )?;
+        }
+        transaction.commit()?;
+        write_manifest(&self.final_dir(id), &manifest)?;
+        Ok(manifest)
+    }
+
+    pub fn replace_enrichments(
+        &mut self,
+        manifest: &mut RunManifest,
+        outputs: Vec<EnrichmentOutput>,
+    ) -> Result<()> {
+        let mut names = outputs
+            .iter()
+            .map(|output| output.result.name.clone())
+            .collect::<Vec<_>>();
+        names.extend(
+            manifest
+                .enrichments
+                .iter()
+                .map(|result| result.name.clone()),
+        );
+        names.sort();
+        names.dedup();
+        manifest.enrichments.clear();
+        manifest
+            .logs
+            .retain(|log| !log.kind.starts_with("benchmark-parser:"));
+        for output in &outputs {
+            manifest.enrichments.push(output.result.clone());
+            manifest.logs.extend(output.logs.clone());
+        }
+
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM enrichment_runs WHERE run_id=?1",
+            [&manifest.id],
+        )?;
+        for name in &names {
+            transaction.execute(
+                "DELETE FROM metrics WHERE run_id=?1 AND json_extract(labels_json, '$.\"isuscope.parser\"')=?2",
+                params![manifest.id, name],
+            )?;
+            transaction.execute(
+                "DELETE FROM logs WHERE run_id=?1 AND kind LIKE ?2",
+                params![manifest.id, format!("benchmark-parser:{name}:%")],
+            )?;
+        }
+        for output in &outputs {
+            for log in &output.logs {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO logs (id, run_id, kind, node) VALUES (?1, ?2, ?3, ?4)",
+                    params![log.id, manifest.id, log.kind, log.node],
+                )?;
+            }
+            for metric in &output.metrics {
+                transaction.execute(
+                    "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
+                )?;
+            }
+            transaction.execute(
+                "INSERT OR REPLACE INTO enrichment_runs (run_id, name, status, command_json, exit_code, error, log_ids_json, tooling_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    manifest.id,
+                    output.result.name,
+                    output.result.status,
+                    serde_json::to_string(&output.result.command)?,
+                    output.result.exit_code,
+                    output.result.error,
+                    serde_json::to_string(&output.result.log_ids)?,
+                    output.result.tooling_path,
+                ],
+            )?;
+        }
+        let metric_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM metrics WHERE run_id=?1",
+            [&manifest.id],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        manifest.metric_count = metric_count as usize;
+        write_manifest(&self.final_dir(&manifest.id), manifest)?;
+        Ok(())
     }
 
     fn restore_missing_finalized_runs(&mut self) -> Result<()> {
@@ -361,7 +540,7 @@ impl Store {
     ) -> Result<()> {
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO runs (id, started_at, finished_at, mode, state, commit_hash, dirty, score, passed, exit_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO runs (id, started_at, finished_at, mode, state, commit_hash, dirty, score, passed, exit_code, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 manifest.id,
                 manifest.started_at.to_rfc3339(),
@@ -373,8 +552,15 @@ impl Store {
                 manifest.benchmark.score,
                 manifest.benchmark.passed,
                 manifest.benchmark.exit_code,
+                manifest.note,
             ],
         )?;
+        for tag in &manifest.tags {
+            transaction.execute(
+                "INSERT INTO run_tags (run_id, tag) VALUES (?1, ?2)",
+                params![manifest.id, tag],
+            )?;
+        }
         for log in &manifest.logs {
             transaction.execute(
                 "INSERT INTO logs (id, run_id, kind, node) VALUES (?1, ?2, ?3, ?4)",
@@ -405,6 +591,21 @@ impl Store {
                 params![manifest.id, collector.name, collector.node, collector.phase, collector.status, collector.exit_code, collector.error],
             )?;
         }
+        for enrichment in &manifest.enrichments {
+            transaction.execute(
+                "INSERT INTO enrichment_runs (run_id, name, status, command_json, exit_code, error, log_ids_json, tooling_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    manifest.id,
+                    enrichment.name,
+                    enrichment.status,
+                    serde_json::to_string(&enrichment.command)?,
+                    enrichment.exit_code,
+                    enrichment.error,
+                    serde_json::to_string(&enrichment.log_ids)?,
+                    enrichment.tooling_path,
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -418,11 +619,20 @@ fn structured_records_from_logs(
     let mut fingerprints = Vec::new();
     let mut transitions = Vec::new();
     for log in &manifest.logs {
-        if !log.kind.starts_with("collector:") || !log.kind.ends_with(":stdout") {
+        let parser_name = log
+            .kind
+            .strip_prefix("benchmark-parser:")
+            .and_then(|rest| rest.strip_suffix(":stdout"));
+        let inline_benchmark =
+            log.kind == "benchmark-stdout" && manifest.mode != crate::model::RunMode::ScoreRun;
+        if (!log.kind.starts_with("collector:") || !log.kind.ends_with(":stdout"))
+            && parser_name.is_none()
+            && !inline_benchmark
+        {
             continue;
         }
         let path = run_dir.join("logs").join(format!("{}.zst", log.id));
-        let (mut parsed_metrics, mut parsed_fingerprints, parsed_transitions) =
+        let (mut parsed_metrics, mut parsed_fingerprints, mut parsed_transitions) =
             match collector::parse_protocol(&path) {
                 Ok(records) => records,
                 Err(error) => {
@@ -459,14 +669,31 @@ fn structured_records_from_logs(
                     .or_insert_with(|| collector_name.to_owned());
             }
         }
+        if let Some(parser_name) = parser_name {
+            for metric in &mut parsed_metrics {
+                metric
+                    .labels
+                    .insert(PARSER_LABEL.into(), parser_name.to_owned());
+            }
+            parsed_fingerprints.clear();
+            parsed_transitions.clear();
+        } else if inline_benchmark {
+            for metric in &mut parsed_metrics {
+                metric.labels.insert(PARSER_LABEL.into(), "inline".into());
+            }
+            parsed_fingerprints.clear();
+            parsed_transitions.clear();
+        }
         metrics.extend(parsed_metrics);
         fingerprints.extend(parsed_fingerprints);
         transitions.extend(parsed_transitions);
     }
-    if let (Some(start), Some(end)) = (
-        manifest.benchmark.initialize_started_at,
-        manifest.benchmark.initialize_finished_at,
-    ) {
+    if manifest.mode != crate::model::RunMode::ScoreRun
+        && let (Some(start), Some(end)) = (
+            manifest.benchmark.initialize_started_at,
+            manifest.benchmark.initialize_finished_at,
+        )
+    {
         metrics.push(Metric {
             name: "benchmark.initialize_duration".into(),
             value: (end - start).num_microseconds().unwrap_or_default() as f64 / 1_000.0,
@@ -478,7 +705,7 @@ fn structured_records_from_logs(
     Ok((metrics, fingerprints, transitions))
 }
 
-fn write_manifest(run_dir: &Path, manifest: &RunManifest) -> Result<()> {
+pub(crate) fn write_manifest(run_dir: &Path, manifest: &RunManifest) -> Result<()> {
     let path = run_dir.join("run.json");
     let temporary = run_dir.join("run.json.tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(manifest)?)?;
@@ -499,7 +726,8 @@ fn migrate(connection: &Connection) -> Result<()> {
             dirty INTEGER NOT NULL,
             score INTEGER,
             passed INTEGER,
-            exit_code INTEGER
+            exit_code INTEGER,
+            note TEXT
         );
         CREATE TABLE IF NOT EXISTS logs (
             id TEXT NOT NULL,
@@ -545,17 +773,38 @@ fn migrate(connection: &Connection) -> Result<()> {
             exit_code INTEGER,
             error TEXT
         );
-        PRAGMA user_version = 3;
+        CREATE TABLE IF NOT EXISTS run_tags (
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            tag TEXT NOT NULL,
+            PRIMARY KEY (run_id, tag)
+        );
+        CREATE INDEX IF NOT EXISTS run_tags_tag ON run_tags(tag);
+        CREATE TABLE IF NOT EXISTS enrichment_runs (
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            command_json TEXT NOT NULL,
+            exit_code INTEGER,
+            error TEXT,
+            log_ids_json TEXT NOT NULL,
+            tooling_path TEXT,
+            PRIMARY KEY (run_id, name)
+        );
         ",
     )?;
-    let has_observed_at = connection
-        .prepare("PRAGMA table_info(metrics)")?
+    ensure_column(connection, "runs", "note", "TEXT")?;
+    ensure_column(connection, "metrics", "observed_at", "TEXT")?;
+    connection.pragma_update(None, "user_version", 4)?;
+    Ok(())
+}
+
+fn ensure_column(connection: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|column| column == "observed_at");
-    if !has_observed_at {
-        connection.execute("ALTER TABLE metrics ADD COLUMN observed_at TEXT", [])?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|value| value == column) {
+        connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
     }
     Ok(())
 }
@@ -577,10 +826,13 @@ mod tests {
             state: RunState::Running,
             started_at: Utc::now(),
             finished_at: None,
+            note: None,
+            tags: Vec::new(),
             source: SourceSnapshot::default(),
             tooling: ToolingSnapshot::default(),
             benchmark: BenchmarkResult::default(),
             collectors: Vec::new(),
+            enrichments: Vec::new(),
             logs: Vec::new(),
             metric_count: 0,
             fingerprint_count: 0,

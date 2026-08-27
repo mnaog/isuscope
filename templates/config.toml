@@ -7,7 +7,7 @@ exclude = [".pprotein"]
 
 [tooling]
 # 当日実装したベンチアダプターと問題固有scriptを各runへ保存します。
-include = ["benchmark.sh", "fingerprint.sh"]
+include = ["benchmark.sh", "parse-benchmark.sh", "fingerprint.sh"]
 
 [benchmark]
 mode = "command"
@@ -15,6 +15,13 @@ mode = "command"
 command = [".isuscope/benchmark.sh"]
 working_dir = "."
 stream_output = false
+
+# 問題固有の件数などがbenchmark stdoutに現れる場合に有効化します。
+# parserはベンチ終了後に実行され、保存済みrunへ`isuscope enrich`で再適用できます。
+# [[benchmark.parsers]]
+# name = "contest-output"
+# command = [".isuscope/parse-benchmark.sh", "{benchmark_stdout}"]
+# timeout_seconds = 30
 
 [ssh]
 user = "ubuntu"

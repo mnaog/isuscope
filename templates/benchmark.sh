@@ -18,6 +18,9 @@ set -euo pipefail
 #   printf '%s\n' '{"type":"isuscope.event","name":"initialize-started"}'
 #   printf '%s\n' '{"type":"isuscope.event","name":"initialize-finished"}'
 #
+# 任意のmetric（問題固有parserを使わず直接保存する場合）:
+#   printf '%s\n' '{"type":"metric","name":"benchmark.viewer.completed","value":123,"unit":"viewers"}'
+#
 # 利用できる環境変数:
 #   ISUSCOPE_BENCHMARK_PROTOCOL=v1
 #   ISUSCOPE_PROJECT_ROOT=<対象プロジェクトの絶対path>

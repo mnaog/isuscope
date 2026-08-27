@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use isuscope::{
     bottleneck,
     config::LoadedConfig,
-    init,
+    doctor, enrichment, init,
     model::RunMode,
-    runner,
+    runner::{self, RunAnnotations},
     shutdown::Shutdown,
     storage::{RunSummary, Store},
 };
@@ -25,9 +25,20 @@ enum Commands {
     /// プロジェクトへ一度だけ使う設定雛形を生成します。
     Init,
     /// 標準collectorでベンチを実行します。
-    Run,
+    Run {
+        #[command(flatten)]
+        annotations: AnnotationArgs,
+    },
     /// 標準collectorに行動遷移分析を加えてベンチを実行します。
-    DiscoveryRun,
+    DiscoveryRun {
+        #[command(flatten)]
+        annotations: AnnotationArgs,
+    },
+    /// collectorを起動せず、スコア取得だけを行います。
+    ScoreRun {
+        #[command(flatten)]
+        annotations: AnnotationArgs,
+    },
     /// run一覧、または指定したrunの詳細を表示します。
     Show {
         /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
@@ -45,6 +56,28 @@ enum Commands {
         #[arg(default_value = "latest")]
         run: String,
     },
+    /// 保存済みbenchmark logへ現在のparserを適用します。
+    Enrich {
+        /// `latest`、run ID、または一意なtagを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+    },
+    /// 保存済みrunへnoteとtagを追加・更新します。
+    Annotate {
+        /// `latest`、run ID、または一意なtagを指定します。
+        run: String,
+        /// runの説明。空文字を指定すると削除します。
+        #[arg(long)]
+        note: Option<String>,
+        /// 追加するtag。複数回指定できます。
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// 削除するtag。複数回指定できます。
+        #[arg(long = "remove-tag")]
+        remove_tags: Vec<String>,
+    },
+    /// ベンチを起動せず、設定・command・SSH・時刻・diskを検査します。
+    Doctor,
     #[command(name = "__transition", hide = true)]
     InternalTransition {
         #[arg(long)]
@@ -74,6 +107,25 @@ enum Commands {
         #[arg(long)]
         series_only: bool,
     },
+}
+
+#[derive(Debug, Clone, Default, Args)]
+struct AnnotationArgs {
+    /// runの目的や変更内容を記録します。
+    #[arg(long)]
+    note: Option<String>,
+    /// 検索用tag。複数回指定できます。
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+}
+
+impl From<AnnotationArgs> for RunAnnotations {
+    fn from(value: AnnotationArgs) -> Self {
+        Self {
+            note: value.note,
+            tags: value.tags,
+        }
+    }
 }
 
 #[tokio::main]
@@ -131,16 +183,29 @@ async fn real_main() -> Result<bool> {
     let config = LoadedConfig::discover(&current)?;
     match cli.command {
         Commands::Init => unreachable!(),
-        Commands::Run => Ok(runner::execute(config, RunMode::Run, Shutdown::listen())
-            .await?
-            .passed),
-        Commands::DiscoveryRun => {
+        Commands::Run { annotations } => {
             Ok(
-                runner::execute(config, RunMode::DiscoveryRun, Shutdown::listen())
+                runner::execute(config, RunMode::Run, Shutdown::listen(), annotations.into())
                     .await?
                     .passed,
             )
         }
+        Commands::DiscoveryRun { annotations } => Ok(runner::execute(
+            config,
+            RunMode::DiscoveryRun,
+            Shutdown::listen(),
+            annotations.into(),
+        )
+        .await?
+        .passed),
+        Commands::ScoreRun { annotations } => Ok(runner::execute(
+            config,
+            RunMode::ScoreRun,
+            Shutdown::listen(),
+            annotations.into(),
+        )
+        .await?
+        .passed),
         Commands::Show { run } => {
             show(&config, run.as_deref())?;
             Ok(true)
@@ -152,6 +217,52 @@ async fn real_main() -> Result<bool> {
         Commands::Series { run } => {
             show_series(&config, &run)?;
             Ok(true)
+        }
+        Commands::Enrich { run } => {
+            let outcome = enrichment::enrich_saved(&config, &run).await?;
+            println!("run       {}", runner::short_id(&outcome.run_id));
+            println!("parsers   {}", outcome.parser_count);
+            println!("metrics   {}", outcome.metric_count);
+            println!(
+                "result    {}",
+                if outcome.failed {
+                    "DEGRADED"
+                } else {
+                    "COMPLETE"
+                }
+            );
+            Ok(!outcome.failed)
+        }
+        Commands::Annotate {
+            run,
+            note,
+            tags,
+            remove_tags,
+        } => {
+            let mut store = Store::open(&config.data_dir)?;
+            let id = store
+                .resolve_id(&run)?
+                .with_context(|| format!("run `{run}` was not found"))?;
+            let manifest = store.annotate(&id, note, &tags, &remove_tags)?;
+            println!("run       {}", runner::short_id(&manifest.id));
+            println!("note      {}", manifest.note.as_deref().unwrap_or("-"));
+            println!(
+                "tags      {}",
+                if manifest.tags.is_empty() {
+                    "-".into()
+                } else {
+                    manifest.tags.join(",")
+                }
+            );
+            Ok(true)
+        }
+        Commands::Doctor => {
+            let report = doctor::run(&config).await?;
+            println!();
+            println!("passed    {}", report.passed);
+            println!("warnings  {}", report.warnings.len());
+            println!("failures  {}", report.failures.len());
+            Ok(report.healthy())
         }
         Commands::InternalTransition { .. } => unreachable!(),
     }
@@ -441,6 +552,15 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
             .unwrap_or_else(|| "-".into())
     );
     println!("mode        {}", manifest.mode.as_str());
+    println!("note        {}", manifest.note.as_deref().unwrap_or("-"));
+    println!(
+        "tags        {}",
+        if manifest.tags.is_empty() {
+            "-".into()
+        } else {
+            manifest.tags.join(",")
+        }
+    );
     println!("state       {}", manifest.state.as_str());
     println!(
         "commit      {}",
@@ -468,6 +588,7 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
     );
     println!("collectors  {}", manifest.collectors.len());
     print_collector_overview(&manifest.collectors);
+    println!("enrichments {}", manifest.enrichments.len());
     println!("metrics     {}", manifest.metric_count);
     print_metric_overview(&store.metrics(&id)?);
     println!("fingerprints {}", manifest.fingerprint_count);

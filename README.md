@@ -80,6 +80,29 @@ isuscope run
 isuscope discovery-run
 ```
 
+collectorとbenchmark parserを起動せず、スコア取得だけを行います。source、tooling、
+benchmark結果とstdout/stderrは保存されます。
+
+```console
+isuscope score-run --tag final --note "観測なしの最終確認"
+```
+
+runの目的を実行時に記録したり、保存後に更新したりできます。noteは`runs.note`、tagは
+`run_tags`へ保存されるため、SQLiteから直接検索できます。
+
+```console
+isuscope run --tag admission-64 --note "admission 63→64"
+isuscope annotate latest --tag baseline --remove-tag admission-64
+isuscope show baseline
+```
+
+ベンチを起動せず、設定、local command、tooling script、SSH疎通、node間時刻差、
+data directoryとdisk空き容量を検査します。
+
+```console
+isuscope doctor
+```
+
 最近のrun一覧、または指定したrunの詳細を表示します。
 
 ```console
@@ -107,6 +130,37 @@ isuscope bottleneck 8c9f021a
 
 HTTP、database、CPU、host saturationのカテゴリごとに候補を作り、観測できた各カテゴリの首位を残してから、カテゴリ内で正規化した深刻度で最大5件を表示します。異なる単位の生値は加算しません。表示番号はカテゴリ横断の改善優先順位ではありません。各候補には根拠、source、改善後に確認するmetricを表示し、未観測カテゴリもcoverageへ`unavailable`として明示します。改善により支配的なボトルネックは移動するため、これは原因の断定ではなく、runごとに更新される次の調査対象です。
 
+## Benchmark parserと後処理
+
+問題固有の件数がbenchmark stdoutへ出る場合は、`[[benchmark.parsers]]`を追加します。
+parserはベンチ終了後にだけ動くため、採点中の負荷にはなりません。
+
+```toml
+[[benchmark.parsers]]
+name = "contest-output"
+command = [".isuscope/parse-benchmark.sh", "{benchmark_stdout}"]
+timeout_seconds = 30
+```
+
+parserは`{run_id}`、`{run_dir}`、`{benchmark_stdout}`、`{benchmark_stderr}`を
+command引数で利用できます。stdoutへ1行1 JSON objectでmetricを出します。
+`isuscope.parser` labelはisuscopeが自動追加します。
+
+```json
+{"type":"metric","name":"benchmark.scenario.success","value":5783,"unit":"runs","labels":{"scenario":"viewer"}}
+```
+
+benchmark adapter自身がこのmetric JSONLをstdoutへ出せる場合は、外部parserなしでも直接保存されます。
+
+最初のベンチ後にparserを実装・修正した場合は、保存済みの圧縮logへ再適用できます。
+以前の外部parserが生成したmetricとlogを現在のparser構成で置換し、inline metricとcollector由来の値は変更しません。
+
+```console
+isuscope enrich latest
+```
+
+再適用時のconfigと`[tooling].include`も対象runの`tooling/enrichments/<id>/`へ保存されます。
+
 ## 当日のベンチ起動アダプター
 
 ベンチの起動方法は大会ごとに異なる前提です。`isuscope init`は`.isuscope/benchmark.sh`を生成し、`config.toml`から直接呼び出します。ISUCON開始後に調査したCLIやportal APIとの接続処理は、この1ファイルだけへ実装します。
@@ -131,26 +185,29 @@ initializeの開始・終了を取得できる場合は、任意のevent行も�
 ```text
 .isuscope/
 ├── config.toml
-├── isuscope.sqlite3
-└── runs/
-    └── <run-id>/
-        ├── run.json
-        ├── source/
-        │   ├── git.json
-        │   └── working-tree.patch
-        ├── tooling/
-        │   ├── config.toml
-        │   ├── routes.toml
-        │   ├── setup.sh
-        │   ├── setup-state.json
-        │   ├── extra/benchmark.sh
-        │   └── isuscope-version.txt
-        └── logs/
-            ├── benchmark-stdout.zst
-            └── <collector-log-id>.zst
+└── data/
+    ├── isuscope.sqlite3
+    └── runs/
+        └── <run-id>/
+            ├── run.json
+            ├── source/
+            │   ├── git.json
+            │   └── working-tree.patch
+            ├── tooling/
+            │   ├── config.toml
+            │   ├── routes.toml
+            │   ├── setup.sh
+            │   ├── setup-state.json
+            │   ├── extra/benchmark.sh
+            │   ├── extra/parse-benchmark.sh
+            │   ├── enrichments/
+            │   └── isuscope-version.txt
+            └── logs/
+                ├── benchmark-stdout.zst
+                └── <collector-log-id>.zst
 ```
 
-SQLiteにはrunのメタデータ、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログの本文はSQLiteへ入れません。
+SQLiteにはrunのメタデータ、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログの本文はSQLiteへ入れません。
 
 `tooling/`には実際に使った設定、route規則、setup状態、isuscope versionをrunごとに保存します。各ファイルのSHA-256も`run.json`へ入るため、計測構成の違いを後から判別できます。
 
@@ -318,6 +375,13 @@ FROM metrics AS m
 JOIN runs AS r ON r.id = m.run_id
 WHERE m.name = 'http.request_duration'
 ORDER BY m.labels_json, r.started_at;
+```
+
+```sql
+SELECT r.started_at, r.score, r.note, t.tag
+FROM runs AS r
+LEFT JOIN run_tags AS t ON t.run_id = r.id
+ORDER BY r.started_at;
 ```
 
 秘密情報の自動maskingは行いません。短時間かつ管理されたISUCON環境で使用するという要件に基づく仕様です。

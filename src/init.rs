@@ -7,6 +7,7 @@ const SETUP: &str = include_str!("../templates/setup.sh");
 const SETUP_DOC: &str = include_str!("../templates/SETUP.md");
 const FINGERPRINT: &str = include_str!("../templates/fingerprint.sh");
 const BENCHMARK: &str = include_str!("../templates/benchmark.sh");
+const BENCHMARK_PARSER: &str = include_str!("../templates/parse-benchmark.sh");
 
 pub fn scaffold(project_root: &Path) -> Result<()> {
     let directory = project_root.join(".isuscope");
@@ -20,6 +21,8 @@ pub fn scaffold(project_root: &Path) -> Result<()> {
     let fingerprint_created = create_if_missing(&fingerprint, FINGERPRINT)?;
     let benchmark = directory.join("benchmark.sh");
     let benchmark_created = create_if_missing(&benchmark, BENCHMARK)?;
+    let benchmark_parser = directory.join("parse-benchmark.sh");
+    let benchmark_parser_created = create_if_missing(&benchmark_parser, BENCHMARK_PARSER)?;
     create_if_missing(&directory.join("SETUP.md"), SETUP_DOC)?;
     #[cfg(unix)]
     if setup_created {
@@ -41,6 +44,13 @@ pub fn scaffold(project_root: &Path) -> Result<()> {
         let mut permissions = fs::metadata(&benchmark)?.permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&benchmark, permissions)?;
+    }
+    #[cfg(unix)]
+    if benchmark_parser_created {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&benchmark_parser)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&benchmark_parser, permissions)?;
     }
     println!("isuscope scaffold: {}", directory.display());
     println!("next: inspect .isuscope/SETUP.md and run .isuscope/setup.sh");

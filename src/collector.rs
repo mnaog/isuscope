@@ -408,7 +408,7 @@ async fn finalize(
     }
 }
 
-async fn capture_capped<R>(mut reader: R, path: PathBuf, limit: u64) -> Result<bool>
+pub(crate) async fn capture_capped<R>(mut reader: R, path: PathBuf, limit: u64) -> Result<bool>
 where
     R: AsyncRead + Unpin,
 {
@@ -1005,7 +1005,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     value
         .chars()
         .map(|character| {

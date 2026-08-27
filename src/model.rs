@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 pub enum RunMode {
     Run,
     DiscoveryRun,
+    ScoreRun,
 }
 
 impl RunMode {
@@ -14,6 +15,7 @@ impl RunMode {
         match self {
             Self::Run => "run",
             Self::DiscoveryRun => "discovery-run",
+            Self::ScoreRun => "score-run",
         }
     }
 }
@@ -138,6 +140,18 @@ pub struct CollectorResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentResult {
+    pub name: String,
+    pub status: String,
+    pub command: Vec<String>,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub log_ids: Vec<String>,
+    #[serde(default)]
+    pub tooling_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunManifest {
     pub schema_version: u32,
     pub id: String,
@@ -145,11 +159,17 @@ pub struct RunManifest {
     pub state: RunState,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub source: SourceSnapshot,
     #[serde(default)]
     pub tooling: ToolingSnapshot,
     pub benchmark: BenchmarkResult,
     pub collectors: Vec<CollectorResult>,
+    #[serde(default)]
+    pub enrichments: Vec<EnrichmentResult>,
     pub logs: Vec<LogRef>,
     pub metric_count: usize,
     #[serde(default)]

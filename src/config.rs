@@ -79,6 +79,18 @@ pub struct BenchmarkConfig {
     pub initialize_start_marker: String,
     #[serde(default = "default_initialize_finish_marker")]
     pub initialize_finish_marker: String,
+    #[serde(default)]
+    pub parsers: Vec<BenchmarkParserConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BenchmarkParserConfig {
+    pub name: String,
+    pub command: Vec<String>,
+    #[serde(default = "default_parser_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_parser_output_bytes")]
+    pub max_output_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +218,12 @@ fn default_max_output_bytes() -> u64 {
 fn default_unavailable_exit_codes() -> Vec<i32> {
     vec![75]
 }
+fn default_parser_timeout() -> u64 {
+    30
+}
+fn default_parser_output_bytes() -> u64 {
+    16 * 1024 * 1024
+}
 
 impl LoadedConfig {
     pub fn discover(start: &Path) -> Result<Self> {
@@ -265,6 +283,31 @@ fn validate(config: &Config) -> Result<()> {
     for node in &config.nodes {
         if !node_names.insert(&node.name) {
             bail!("duplicate node name `{}`", node.name);
+        }
+    }
+    let mut parser_names = std::collections::BTreeSet::new();
+    for parser in &config.benchmark.parsers {
+        if parser.name.trim().is_empty() {
+            bail!("benchmark parser name must not be empty");
+        }
+        if parser.name == "inline" {
+            bail!("benchmark parser name `inline` is reserved");
+        }
+        if !parser
+            .name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        {
+            bail!(
+                "benchmark parser name `{}` may contain only ASCII letters, digits, `-`, and `_`",
+                parser.name
+            );
+        }
+        if parser.command.is_empty() {
+            bail!("benchmark parser `{}` has an empty command", parser.name);
+        }
+        if !parser_names.insert(&parser.name) {
+            bail!("duplicate benchmark parser name `{}`", parser.name);
         }
     }
     let mut collector_keys = std::collections::BTreeSet::new();

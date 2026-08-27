@@ -79,6 +79,8 @@ fn init_is_non_interactive_and_preserves_existing_files() {
     assert!(project.path().join(".isuscope/setup.sh").is_file());
     let benchmark = project.path().join(".isuscope/benchmark.sh");
     assert!(benchmark.is_file());
+    let benchmark_parser = project.path().join(".isuscope/parse-benchmark.sh");
+    assert!(benchmark_parser.is_file());
     assert!(
         fs::read_to_string(&config)
             .unwrap()
@@ -112,6 +114,14 @@ fn init_is_non_interactive_and_preserves_existing_files() {
         use std::os::unix::fs::PermissionsExt;
         assert_ne!(
             fs::metadata(&benchmark).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert_ne!(
+            fs::metadata(&benchmark_parser)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
             0
         );
     }
@@ -275,7 +285,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert!(run_dir.join("tooling/config.toml").is_file());
     assert!(run_dir.join("tooling/isuscope-version.txt").is_file());
     assert_eq!(manifest["schema_version"], 4);
-    assert_eq!(manifest["tooling"]["isuscope_version"], "0.4.0");
+    assert_eq!(manifest["tooling"]["isuscope_version"], "0.5.0");
     assert_eq!(
         manifest["tooling"]["config_sha256"].as_str().unwrap().len(),
         64
@@ -327,6 +337,297 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn enrich_replaces_parser_metrics_and_annotations_are_queryable() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    let write_config = |value: i64| {
+        fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf 'viewer completed: 10\nscore: 123\n'"]
+score_pattern = "score: ([0-9]+)"
+
+[[benchmark.parsers]]
+name = "contest-output"
+command = ["sh", "-c", "printf '%s\\n' '{{\"type\":\"metric\",\"name\":\"benchmark.viewer.completed\",\"value\":{value},\"unit\":\"viewers\",\"timestamp\":\"2026-08-27T12:34:56Z\"}}'"]
+"#,
+            ),
+        )
+        .unwrap();
+    };
+    write_config(10);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--note", "initial parser", "--tag", "candidate"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    let (note, value, labels): (String, f64, String) = database
+        .query_row(
+            "SELECT r.note, m.value, m.labels_json FROM runs r JOIN metrics m ON m.run_id=r.id WHERE m.name='benchmark.viewer.completed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(note, "initial parser");
+    assert_eq!(value, 10.0);
+    assert!(labels.contains("isuscope.parser"));
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT COUNT(*) FROM run_tags WHERE tag='candidate'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(database);
+
+    write_config(20);
+    let enrich = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["enrich", "candidate"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        enrich.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enrich.stderr)
+    );
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    let (count, value): (i64, f64) = database
+        .query_row(
+            "SELECT COUNT(*), MAX(value) FROM metrics WHERE name='benchmark.viewer.completed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(value, 20.0);
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT observed_at FROM metrics WHERE name='benchmark.viewer.completed'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "2026-08-27T12:34:56+00:00"
+    );
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM enrichment_runs", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(database);
+
+    let annotate = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "annotate",
+            "candidate",
+            "--note",
+            "parser updated",
+            "--tag",
+            "baseline",
+            "--remove-tag",
+            "candidate",
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(annotate.status.success());
+    let show = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["show", "baseline"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+    let output = String::from_utf8(show.stdout).unwrap();
+    assert!(output.contains("note        parser updated"));
+    assert!(output.contains("tags        baseline"));
+
+    for suffix in ["", "-wal", "-shm"] {
+        let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["show", "baseline"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(restored.status.success());
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT value FROM metrics WHERE name='benchmark.viewer.completed'",
+                [],
+                |row| row.get::<_, f64>(0)
+            )
+            .unwrap(),
+        20.0
+    );
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM enrichment_runs", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn adapter_can_emit_metrics_without_an_external_parser() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark.viewer.completed\",\"value\":77,\"unit\":\"viewers\"}' '{\"type\":\"isuscope.result\",\"score\":456,\"pass\":true}'"]
+"#,
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .arg("run")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    let (value, labels): (f64, String) = database
+        .query_row(
+            "SELECT value, labels_json FROM metrics WHERE name='benchmark.viewer.completed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(value, 77.0);
+    assert!(labels.contains("inline"));
+}
+
+#[test]
+fn score_run_skips_collectors_and_benchmark_parsers() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' 'webappの初期化を行います' 'ベンチマーク走行前のデータ整合性チェック' '{\"type\":\"isuscope.result\",\"score\":321,\"pass\":true}'"]
+
+[[benchmark.parsers]]
+name = "must-not-run"
+command = ["sh", "-c", "touch parser-ran"]
+
+[[collectors]]
+name = "must-not-run"
+phase = "after"
+command = ["sh", "-c", "touch collector-ran"]
+"#,
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["score-run", "--tag", "final"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(!project.path().join("parser-ran").exists());
+    assert!(!project.path().join("collector-ran").exists());
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    let (mode, score, collectors, metrics): (String, i64, i64, i64) = database
+        .query_row(
+            "SELECT mode, score, (SELECT COUNT(*) FROM collector_runs), (SELECT COUNT(*) FROM metrics) FROM runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(mode, "score-run");
+    assert_eq!(score, 321);
+    assert_eq!(collectors, 0);
+    assert_eq!(metrics, 0);
+    drop(database);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["show", "final"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(restored.status.success());
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM metrics", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn doctor_checks_without_starting_benchmark() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(config_dir.join("check.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[tooling]
+include = ["check.sh"]
+
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "touch benchmark-ran"]
+"#,
+    )
+    .unwrap();
+    let doctor = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .arg("doctor")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(!project.path().join("benchmark-ran").exists());
+    let output = String::from_utf8(doctor.stdout).unwrap();
+    assert!(output.contains("failures  0"));
+    assert!(output.contains("no SSH nodes are configured"));
 }
 
 #[test]

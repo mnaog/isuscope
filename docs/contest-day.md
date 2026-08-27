@@ -2,17 +2,19 @@
 
 この文書は、競技開始後に初めて分かるベンチ起動方法、サーバー構成、ログ形式をisuscopeへ接続し、計測可能な状態にするためのランブックです。
 
-普段使うコマンドは`run`、`discovery-run`、`show`だけです。`init`と環境設定は開始直後に一度だけ行います。
+普段使うコマンドは`run`、`discovery-run`、`score-run`、`enrich`、`show`です。`init`と環境設定は開始直後に一度だけ行います。
 
 ## 最短チェックリスト
 
 - [ ] `isuscope --version`で事前に用意したbinaryを確認する
 - [ ] 対象プロジェクトで`isuscope init`を1回実行する
 - [ ] `.isuscope/benchmark.sh`へ当日の起動・完了待ち・結果取得を実装する
+- [ ] 必要なら`.isuscope/parse-benchmark.sh`へ問題固有の出力parserを実装する
 - [ ] `.isuscope/config.toml`へSSH、node、role、collectorを設定する
 - [ ] `.isuscope/fingerprint.sh`をapp binaryと主要serviceへ合わせる
 - [ ] アクセスログfieldと`.isuscope/routes.toml`を確認する
 - [ ] `.isuscope/setup.sh`を実行する
+- [ ] `isuscope doctor`がfailure 0になることを確認する
 - [ ] `isuscope discovery-run`を1回通し、run stateが`complete`になるまで直す
 - [ ] `isuscope show latest`とSQLiteで保存内容を確認する
 - [ ] 以後は通常`isuscope run`、必要時だけ`discovery-run`を使う
@@ -47,6 +49,7 @@ isuscope init
 ```text
 .isuscope/
 ├── benchmark.sh     # 当日に実装するベンチ起動アダプター
+├── parse-benchmark.sh # benchmark出力をmetricへ変換
 ├── config.toml      # node、SSH、collector設定
 ├── fingerprint.sh   # remote実体の識別
 ├── routes.toml      # 動的URLの正規化
@@ -142,6 +145,21 @@ role名は自由ですが、collectorの対象選択に使うため、実際の�
 
 `before` collectorでベンチ実行の前提になるものには`required = true`を設定します。ログローテーションをベンチ起動コマンドが行う場合は、offset記録より先に同じrotationを済ませ、計測中のinode消失を防ぎます。
 
+### 6.1 benchmark parserを設定する
+
+viewer完走数、シナリオ成功数、DNS成功数などがbenchmark stdoutにだけ現れる場合は、
+`.isuscope/parse-benchmark.sh`で汎用metric JSONLへ変換します。
+
+```toml
+[[benchmark.parsers]]
+name = "contest-output"
+command = [".isuscope/parse-benchmark.sh", "{benchmark_stdout}"]
+timeout_seconds = 30
+```
+
+初回runの時点でparserが完成している必要はありません。stdoutは必ず保存されるため、run後に
+scriptを実装して`isuscope enrich latest`を実行できます。再解析だけではベンチを消費しません。
+
 ### 7. アクセスログとroute規則を合わせる
 
 ユーザー行動遷移には、少なくとも次のfieldが必要です。
@@ -175,7 +193,9 @@ remote変更では、既存ファイルのbackup、設定test、atomicな配置�
 isuscope --version
 isuscope show
 bash -n .isuscope/benchmark.sh
+bash -n .isuscope/parse-benchmark.sh
 bash -n .isuscope/setup.sh
+isuscope doctor
 ```
 
 `show`が設定を読めれば、configの構文とdata directoryを確認できます。
@@ -238,6 +258,21 @@ WHERE run_id = (SELECT id FROM runs ORDER BY started_at DESC LIMIT 1);
 isuscope run
 isuscope show latest
 ```
+
+変更目的はrunと同時に残せます。
+
+```console
+isuscope run --tag admission-64 --note "POST admission 63→64"
+```
+
+最終確認など、collectorもbenchmark parserも動かしたくない場合は`score-run`を使います。
+
+```console
+isuscope score-run --tag final
+```
+
+source/tooling snapshot、benchmark結果、stdout/stderrは保存されますが、before/during/after
+collectorとbenchmark parserはすべてskipされます。
 
 runの前に、変更目的をcommitまたは作業メモへ残します。dirty worktreeでもpatchとhashは保存されますが、意味のある単位でcommitすると比較しやすくなります。
 

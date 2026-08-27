@@ -1,6 +1,7 @@
 use crate::{
+    collector,
     config::{BenchmarkConfig, BenchmarkMode, LoadedConfig},
-    model::{BenchmarkResult, LogRef},
+    model::{BenchmarkResult, LogRef, Metric},
     process,
     shutdown::Shutdown,
 };
@@ -23,6 +24,7 @@ use tokio::{
 pub struct BenchmarkExecution {
     pub result: BenchmarkResult,
     pub logs: Vec<LogRef>,
+    pub metrics: Vec<Metric>,
 }
 
 #[derive(Default)]
@@ -38,26 +40,31 @@ pub async fn execute(
     config: &LoadedConfig,
     run_dir: &Path,
     shutdown: Shutdown,
+    collect_metrics: bool,
 ) -> BenchmarkExecution {
     let started_at = Utc::now();
     let mut execution = match config.config.benchmark.mode {
-        BenchmarkMode::Command => match execute_command(config, run_dir, shutdown).await {
-            Ok(execution) => execution,
-            Err(error) => BenchmarkExecution {
-                result: BenchmarkResult {
-                    mode: "command".into(),
-                    command: config.config.benchmark.command.clone(),
-                    passed: Some(false),
-                    error: Some(format!("{error:#}")),
-                    ..Default::default()
+        BenchmarkMode::Command => {
+            match execute_command(config, run_dir, shutdown, collect_metrics).await {
+                Ok(execution) => execution,
+                Err(error) => BenchmarkExecution {
+                    result: BenchmarkResult {
+                        mode: "command".into(),
+                        command: config.config.benchmark.command.clone(),
+                        passed: Some(false),
+                        error: Some(format!("{error:#}")),
+                        ..Default::default()
+                    },
+                    logs: Vec::new(),
+                    metrics: Vec::new(),
                 },
-                logs: Vec::new(),
-            },
-        },
+            }
+        }
         BenchmarkMode::External => match execute_external(&config.config.benchmark).await {
             Ok(result) => BenchmarkExecution {
                 result,
                 logs: Vec::new(),
+                metrics: Vec::new(),
             },
             Err(error) => BenchmarkExecution {
                 result: BenchmarkResult {
@@ -67,6 +74,7 @@ pub async fn execute(
                     ..Default::default()
                 },
                 logs: Vec::new(),
+                metrics: Vec::new(),
             },
         },
     };
@@ -79,6 +87,7 @@ async fn execute_command(
     config: &LoadedConfig,
     run_dir: &Path,
     mut shutdown: Shutdown,
+    collect_metrics: bool,
 ) -> Result<BenchmarkExecution> {
     let benchmark = &config.config.benchmark;
     let (program, args) = benchmark
@@ -159,6 +168,18 @@ async fn execute_command(
         kind: "benchmark-stderr".into(),
         node: None,
     });
+    let mut metrics = if collect_metrics {
+        collector::parse_protocol(&run_dir.join("logs/benchmark-stdout.zst"))
+            .map(|records| records.0)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for metric in &mut metrics {
+        metric
+            .labels
+            .insert("isuscope.parser".into(), "inline".into());
+    }
 
     let observation = Arc::try_unwrap(observation)
         .map_err(|_| anyhow::anyhow!("benchmark observation is still shared"))?
@@ -193,6 +214,7 @@ async fn execute_command(
             },
         },
         logs,
+        metrics,
     })
 }
 
@@ -342,6 +364,7 @@ mod tests {
             score_pattern: r"スコア:\s*([0-9]+)".into(),
             initialize_start_marker: "初期化を行います".into(),
             initialize_finish_marker: "整合性チェック".into(),
+            parsers: Vec::new(),
         }
     }
 

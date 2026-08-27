@@ -2,6 +2,8 @@ pub mod benchmark;
 pub mod bottleneck;
 pub mod collector;
 pub mod config;
+pub mod doctor;
+pub mod enrichment;
 pub mod git_snapshot;
 pub mod init;
 pub mod model;
