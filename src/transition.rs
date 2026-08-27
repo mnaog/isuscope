@@ -388,6 +388,51 @@ fn read_log(
         if options.series_only && !within_interval(at, state.interval) {
             continue;
         }
+        if options.series_only {
+            let Some(at) = at else { continue };
+            let Some(bucket_at) = DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) else {
+                continue;
+            };
+            let status_class = fields
+                .get(options.status_field)
+                .map(|status| status_class(status))
+                .unwrap_or_else(|| "unknown".into());
+            let mut bucket_route = route;
+            let new_key = (
+                bucket_at,
+                node.to_owned(),
+                (*method).to_owned(),
+                bucket_route.clone(),
+            );
+            if !state.bucket_stats.contains_key(&new_key)
+                && state.bucket_stats.len() >= MAX_ROUTE_SERIES
+            {
+                bucket_route = "/__cardinality_limit__".into();
+            }
+            let bucket = state
+                .bucket_stats
+                .entry((
+                    bucket_at,
+                    node.to_owned(),
+                    (*method).to_owned(),
+                    bucket_route,
+                ))
+                .or_default();
+            *bucket.requests_by_status.entry(status_class).or_default() += 1;
+            if let Some(value) = fields
+                .get(options.request_time_field)
+                .and_then(|value| parse_seconds_ms(value))
+            {
+                bucket.request_durations_ms.push(value);
+            }
+            if let Some(value) = fields
+                .get(options.upstream_time_field)
+                .and_then(|value| parse_upstream_seconds_ms(value))
+            {
+                bucket.upstream_durations_ms.push(value);
+            }
+            continue;
+        }
         let mut stats_key = (node.to_owned(), (*method).to_owned(), route.clone());
         if !state.route_stats.contains_key(&stats_key)
             && state.route_stats.len() >= MAX_ROUTE_SERIES
@@ -671,7 +716,8 @@ mod tests {
             &mut bounded_state,
         )
         .unwrap();
-        assert_eq!(bounded_routes.len(), 1);
+        assert!(bounded_sessions.is_empty());
+        assert!(bounded_routes.is_empty());
         assert_eq!(bounded_buckets.len(), 1);
     }
 

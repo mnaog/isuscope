@@ -9,6 +9,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -18,6 +19,18 @@ use uuid::Uuid;
 pub struct Store {
     data_dir: PathBuf,
     connection: Connection,
+}
+
+const STRUCTURED_SNAPSHOT_SCHEMA: u32 = 1;
+
+/// Canonical copy of the rows stored in SQLite. Logs remain the source evidence,
+/// while this parser-independent snapshot makes deleting SQLite lossless.
+#[derive(Serialize, Deserialize)]
+struct StructuredSnapshot {
+    schema_version: u32,
+    metrics: Vec<Metric>,
+    fingerprints: Vec<Fingerprint>,
+    transitions: Vec<Transition>,
 }
 
 #[derive(Debug)]
@@ -182,6 +195,7 @@ impl Store {
     ) -> Result<PathBuf> {
         let staging = self.staging_dir(&manifest.id);
         write_manifest(&staging, manifest)?;
+        write_structured_snapshot(&staging, metrics, fingerprints, transitions)?;
         let final_dir = self.final_dir(&manifest.id);
         fs::rename(&staging, &final_dir)
             .with_context(|| format!("cannot finalize run directory {}", final_dir.display()))?;
@@ -581,8 +595,76 @@ impl Store {
         )?;
         transaction.commit()?;
         manifest.metric_count = metric_count as usize;
-        write_manifest(&self.final_dir(&manifest.id), manifest)?;
+        // Keep the recovery snapshot in lockstep with parser enrichment. This
+        // deliberately happens before run.json so a crash cannot advertise a
+        // metric count that its snapshot does not contain.
+        let run_dir = self.final_dir(&manifest.id);
+        let mut snapshot = match read_structured_snapshot(&run_dir)? {
+            Some(snapshot) => snapshot,
+            None => self.structured_snapshot_from_database(&manifest.id)?,
+        };
+        snapshot.metrics.retain(|metric| {
+            metric
+                .labels
+                .get(PARSER_LABEL)
+                .is_none_or(|parser| !names.contains(parser))
+        });
+        for output in outputs {
+            snapshot.metrics.extend(output.metrics);
+        }
+        write_structured_snapshot(
+            &run_dir,
+            &snapshot.metrics,
+            &snapshot.fingerprints,
+            &snapshot.transitions,
+        )?;
+        write_manifest(&run_dir, manifest)?;
         Ok(())
+    }
+
+    fn structured_snapshot_from_database(&self, id: &str) -> Result<StructuredSnapshot> {
+        let metrics = self.metrics(id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT name, value, labels_json FROM fingerprints WHERE run_id=?1 ORDER BY id",
+        )?;
+        let fingerprints = statement
+            .query_map([id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (name, value, labels_json) = row?;
+                Ok(Fingerprint {
+                    name,
+                    value,
+                    labels: serde_json::from_str(&labels_json)
+                        .context("invalid fingerprint labels")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut statement = self.connection.prepare(
+            "SELECT from_route, to_route, count, p50_ms, p95_ms FROM transitions WHERE run_id=?1 ORDER BY id",
+        )?;
+        let transitions = statement
+            .query_map([id], |row| {
+                Ok(Transition {
+                    from_route: row.get(0)?,
+                    to_route: row.get(1)?,
+                    count: row.get(2)?,
+                    p50_ms: row.get(3)?,
+                    p95_ms: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(StructuredSnapshot {
+            schema_version: STRUCTURED_SNAPSHOT_SCHEMA,
+            metrics,
+            fingerprints,
+            transitions,
+        })
     }
 
     fn restore_missing_finalized_runs(&mut self) -> Result<()> {
@@ -621,7 +703,19 @@ impl Store {
             }
 
             let (metrics, fingerprints, transitions) =
-                structured_records_from_logs(&run_dir, &manifest)?;
+                if let Some(snapshot) = read_structured_snapshot(&run_dir)? {
+                    (
+                        snapshot.metrics,
+                        snapshot.fingerprints,
+                        snapshot.transitions,
+                    )
+                } else {
+                    eprintln!(
+                        "! {} has no structured snapshot; falling back to protocol logs",
+                        manifest.id
+                    );
+                    structured_records_from_logs(&run_dir, &manifest)?
+                };
             self.restore_finalized_run(&manifest, &metrics, &fingerprints, &transitions)?;
             eprintln!("reindexed  {} from saved run", manifest.id);
             if metrics.len() != manifest.metric_count
@@ -736,6 +830,53 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+}
+
+fn structured_snapshot_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("structured.json.zst")
+}
+
+fn write_structured_snapshot(
+    run_dir: &Path,
+    metrics: &[Metric],
+    fingerprints: &[Fingerprint],
+    transitions: &[Transition],
+) -> Result<()> {
+    let path = structured_snapshot_path(run_dir);
+    let temporary = run_dir.join("structured.json.zst.tmp");
+    let output = fs::File::create(&temporary)?;
+    let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
+    serde_json::to_writer(
+        &mut encoder,
+        &StructuredSnapshot {
+            schema_version: STRUCTURED_SNAPSHOT_SCHEMA,
+            metrics: metrics.to_vec(),
+            fingerprints: fingerprints.to_vec(),
+            transitions: transitions.to_vec(),
+        },
+    )?;
+    encoder.finish()?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+fn read_structured_snapshot(run_dir: &Path) -> Result<Option<StructuredSnapshot>> {
+    let path = structured_snapshot_path(run_dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let input = fs::File::open(&path)?;
+    let decoder = zstd::stream::read::Decoder::new(input)?;
+    let snapshot: StructuredSnapshot = serde_json::from_reader(decoder)
+        .with_context(|| format!("invalid structured snapshot {}", path.display()))?;
+    if snapshot.schema_version != STRUCTURED_SNAPSHOT_SCHEMA {
+        bail!(
+            "unsupported structured snapshot schema {} in {}",
+            snapshot.schema_version,
+            path.display()
+        );
+    }
+    Ok(Some(snapshot))
 }
 
 fn structured_records_from_logs(

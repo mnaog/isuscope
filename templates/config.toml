@@ -35,6 +35,15 @@ connect_timeout_seconds = 5
 # [[nodes]]はSETUP.mdの手順に従って追加します。roleを指定しない以下の
 # 標準collectorは、設定した全nodeでrun/discovery-runの両方に対して動きます。
 
+# setup.shで配置した問題固有fingerprintを全nodeから取得します。
+[[collectors]]
+name = "remote-fingerprint"
+phase = "before"
+transport = "ssh"
+command = ["sh", "-c", "test -x /usr/local/lib/isuscope/fingerprint.sh || exit 75; exec sudo -n /usr/local/lib/isuscope/fingerprint.sh"]
+timeout_seconds = 15
+unavailable_exit_codes = [75]
+
 # /procだけを使うため、remoteへの追加package導入なしで1秒ごとの基本host時系列を取ります。
 [[collectors]]
 name = "host-sampler"
@@ -51,17 +60,26 @@ parser = "sysstat"
 unavailable_exit_codes = [75]
 
 [[collectors]]
-name = "perf-record"
-phase = "during"
+name = "perf-start"
+phase = "before"
 transport = "ssh"
-command = ["sh", "-c", "command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; date +%s.%N > /tmp/isuscope-{run_id}.perf.start; exec sudo -n env LC_ALL=C perf record -a -F 99 -o /tmp/isuscope-{run_id}.perf.data -- sleep 86400"]
+command = ["sh", "-c", "set -eu; base=/tmp/isuscope-{run_id}.perf; command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; sudo -n rm -f \"$base.data\" \"$base.log\" \"$base.pid\"; date +%s.%N > \"$base.start\"; sudo -n sh -c 'nohup env LC_ALL=C perf record -a -F 99 -o \"$1.data\" -- sleep 86400 >\"$1.log\" 2>&1 & echo $! >\"$1.pid\"' sh \"$base\"; i=0; while :; do pid=$(sudo -n cat \"$base.pid\" 2>/dev/null) || exit 75; case $pid in ''|*[!0-9]*) exit 75 ;; esac; if sudo -n kill -0 \"$pid\" 2>/dev/null; then break; fi; i=$((i+1)); if test \"$i\" -ge 20; then sudo -n cat \"$base.log\" >&2 || true; exit 75; fi; sleep 0.1; done"]
+timeout_seconds = 10
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "perf-stop"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", "set -eu; base=/tmp/isuscope-{run_id}.perf; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; pid=$(sudo -n cat \"$base.pid\" 2>/dev/null) || exit 75; case $pid in ''|*[!0-9]*) exit 75 ;; esac; sudo -n kill -INT \"$pid\" 2>/dev/null || exit 75; i=0; while sudo -n kill -0 \"$pid\" 2>/dev/null; do i=$((i+1)); if test \"$i\" -ge 100; then sudo -n cat \"$base.log\" >&2 || true; exit 1; fi; sleep 0.1; done; sudo -n test -s \"$base.data\" || exit 75; sudo -n rm -f \"$base.pid\""]
+timeout_seconds = 20
 unavailable_exit_codes = [75]
 
 [[collectors]]
 name = "perf-report"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; test -s /tmp/isuscope-{run_id}.perf.data || exit 75; sudo -n env LC_ALL=C perf report --stdio --no-children --percent-limit 1 --sort comm,dso,symbol --fields overhead,comm,dso,symbol --field-separator ';' -i /tmp/isuscope-{run_id}.perf.data | awk -F';' '/^[ ]*[0-9]+[.][0-9]+%/ { pct=$1; sub(/%/,\"\",pct); gsub(/^[ ]+|[ ]+$/,\"\",pct); process=$2; binary=$3; symbol=$4; gsub(/^[ ]+|[ ]+$/,\"\",process); gsub(/^[ ]+|[ ]+$/,\"\",binary); gsub(/^[ ]+|[ ]+$/,\"\",symbol); gsub(/[\\\\\\\"]/,\"_\",process); gsub(/[\\\\\\\"]/,\"_\",binary); gsub(/[\\\\\\\"]/,\"_\",symbol); printf \"{\\\"type\\\":\\\"metric\\\",\\\"name\\\":\\\"cpu.sample_percent\\\",\\\"value\\\":%s,\\\"unit\\\":\\\"percent\\\",\\\"labels\\\":{\\\"process\\\":\\\"%s\\\",\\\"binary\\\":\\\"%s\\\",\\\"symbol\\\":\\\"%s\\\"}}\\n\",pct,process,binary,symbol }'"]
+command = ["sh", "-c", "base=/tmp/isuscope-{run_id}.perf; command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; sudo -n test -s \"$base.data\" || exit 75; sudo -n env LC_ALL=C perf report --stdio --no-children --percent-limit 1 --sort comm,dso,symbol --fields overhead,comm,dso,symbol --field-separator ';' -i \"$base.data\" | awk -F';' '/^[ ]*[0-9]+[.][0-9]+%/ { pct=$1; sub(/%/,\"\",pct); gsub(/^[ ]+|[ ]+$/,\"\",pct); process=$2; binary=$3; symbol=$4; gsub(/^[ ]+|[ ]+$/,\"\",process); gsub(/^[ ]+|[ ]+$/,\"\",binary); gsub(/^[ ]+|[ ]+$/,\"\",symbol); gsub(/[\\\\\\\"]/,\"_\",process); gsub(/[\\\\\\\"]/,\"_\",binary); gsub(/[\\\\\\\"]/,\"_\",symbol); printf \"{\\\"type\\\":\\\"metric\\\",\\\"name\\\":\\\"cpu.sample_percent\\\",\\\"value\\\":%s,\\\"unit\\\":\\\"percent\\\",\\\"labels\\\":{\\\"process\\\":\\\"%s\\\",\\\"binary\\\":\\\"%s\\\",\\\"symbol\\\":\\\"%s\\\"}}\\n\",pct,process,binary,symbol }'"]
 timeout_seconds = 30
 unavailable_exit_codes = [75]
 
@@ -69,7 +87,7 @@ unavailable_exit_codes = [75]
 name = "perf-series"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "data=/tmp/isuscope-{run_id}.perf.data; start=/tmp/isuscope-{run_id}.perf.start; cleanup() { sudo -n rm -f \"$data\" >/dev/null 2>&1 || true; rm -f \"$start\"; }; trap cleanup EXIT; command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; test -s \"$data\" || exit 75; test -s \"$start\" || exit 75; printf '# isuscope-perf-start %s\\n' \"$(cat \"$start\")\"; sudo -n env LC_ALL=C perf script --reltime --ns -F comm,time,event,ip,sym,dso -i \"$data\""]
+command = ["sh", "-c", "base=/tmp/isuscope-{run_id}.perf; cleanup() { sudo -n rm -f \"$base.data\" \"$base.log\" \"$base.pid\" >/dev/null 2>&1 || true; rm -f \"$base.start\"; }; trap cleanup EXIT; command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; sudo -n test -s \"$base.data\" || exit 75; test -s \"$base.start\" || exit 75; printf '# isuscope-perf-start %s\\n' \"$(cat \"$base.start\")\"; sudo -n env LC_ALL=C perf script --reltime --ns -F comm,time,event,ip,sym,dso -i \"$base.data\""]
 parser = "perf-script"
 timeout_seconds = 30
 unavailable_exit_codes = [75]
@@ -198,7 +216,18 @@ unavailable_exit_codes = [75]
 name = "nginx-series"
 phase = "after"
 transport = "local"
+modes = ["run"]
 command = ["isuscope", "__transition", "--series-only", "--run-dir", "{run_dir}", "--prefix", "nginx-log-delta-", "--rules", ".isuscope/routes.toml"]
+timeout_seconds = 30
+
+# discovery-runでは同じ差分から時系列に加えてsession/viewer単位の遷移を作ります。
+# session field名は環境のLTSVに合わせて必要ならcommandへ`--session-field`を追加します。
+[[collectors]]
+name = "user-transition"
+phase = "after"
+transport = "local"
+modes = ["discovery-run"]
+command = ["isuscope", "__transition", "--run-dir", "{run_dir}", "--prefix", "nginx-log-delta-", "--rules", ".isuscope/routes.toml"]
 timeout_seconds = 30
 
 [[collectors]]

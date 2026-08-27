@@ -53,7 +53,9 @@ pub fn scaffold(project_root: &Path) -> Result<()> {
         fs::set_permissions(&benchmark_parser, permissions)?;
     }
     println!("isuscope scaffold: {}", directory.display());
-    println!("next: inspect .isuscope/SETUP.md and run .isuscope/setup.sh");
+    println!(
+        "next: inspect .isuscope/SETUP.md; do not run setup.sh until its checklist is complete"
+    );
     Ok(())
 }
 

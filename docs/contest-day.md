@@ -220,7 +220,7 @@ isuscope show latest
 - HTTP metricが0件でない
 - session fieldがある場合、transitionが0件でない
 - 動的routeの未正規化によるseries爆発がない
-- `perf-record`、`perf-report`、`perf-series`が全対象nodeで`complete`である
+- `perf-start`、`perf-stop`、`perf-report`、`perf-series`が全対象nodeで`complete`である
 - `isuscope metrics latest`で`cpu.sample_count`の時刻付き行が0件でなく、process・binary・symbol labelがある
 - perf stderrにlost sample、permission、unsupported eventの警告がなく、`[unknown]`や`-`のsymbol率が調査を妨げるほど高くない
 - benchmark stdout/stderrが圧縮保存されている

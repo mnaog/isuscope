@@ -236,20 +236,21 @@ initializeの開始・終了を取得できる場合は、任意のevent行も�
             │   └── isuscope-version.txt
             ├── context/
             │   └── codex-history.md
+            ├── structured.json.zst
             └── logs/
                 ├── benchmark-stdout.zst
                 └── <collector-log-id>.zst
 ```
 
-SQLiteにはrunのメタデータ、仮説、分析状態、追記式の分析履歴、Codex context参照、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログとCodex会話の本文はSQLiteへ入れません。
+SQLiteにはrunのメタデータ、仮説、分析状態、追記式の分析履歴、Codex context参照、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログとCodex会話の本文はSQLiteへ入れません。`structured.json.zst`にはSQLiteへ入れたmetric、fingerprint、transitionの正規化済み行を圧縮保存します。
 
 `tooling/`には実際に使った設定、route規則、setup状態、isuscope versionをrunごとに保存します。各ファイルのSHA-256も`run.json`へ入るため、計測構成の違いを後から判別できます。
 
-SQLiteファイルを失った場合でも、`run.json`とcollectorの生ログからrun索引と構造化データを再構築できます。
+SQLiteファイルを失った場合でも、`run.json`と`structured.json.zst`からrun索引と構造化データを完全に再構築できます。collectorの生ログも根拠データとして残ります。
 
 ### SQLite索引の復旧
 
-`runs/`以下の完成済みrunが正本で、SQLiteは検索・比較用の索引です。`isuscope`は起動時にSQLiteへ未登録のrunを検出すると、`run.json`とcollectorの圧縮ログから自動的に索引を復元します。公開CLIに復旧専用コマンドはありません。
+`runs/`以下の完成済みrunが正本で、SQLiteは検索・比較用の索引です。`isuscope`は起動時にSQLiteへ未登録のrunを検出すると、`run.json`と`structured.json.zst`から自動的に索引を復元します。旧runにsnapshotがなければJSON protocol logの再解析へfallbackしますが、native adapterの結果まで完全に戻る保証はありません。公開CLIに復旧専用コマンドはありません。
 
 SQLiteが壊れた場合は、isuscopeが動いていないことを確認してから`isuscope.sqlite3`、`isuscope.sqlite3-wal`、`isuscope.sqlite3-shm`を別ディレクトリへ退避し、プロジェクト内で次を実行します。
 
@@ -257,7 +258,7 @@ SQLiteが壊れた場合は、isuscopeが動いていないことを確認して
 isuscope show
 ```
 
-復元したrunは標準エラーへ`reindexed`と表示されます。圧縮ログが欠損・破損している場合、そのログに含まれていた構造化メトリクスまでは復元できません。退避したSQLiteファイルは、内容を確認するまで削除しないでください。
+復元したrunは標準エラーへ`reindexed`と表示されます。`structured.json.zst`が欠損・破損した旧runでは復元が不完全になり得ます。退避したSQLiteファイルは、内容を確認するまで削除しないでください。
 
 収集中のrunは、最初に`runs/.incomplete/`へ書き込みます。収集とSQLiteへの記録が完了したときだけ最終ディレクトリへ移動します。ベンチやinitializeが失敗した場合も、failed runとして確定・保存します。
 
@@ -347,11 +348,12 @@ isuscope metrics latest
 isuscope series latest
 isuscope series latest --metric http.requests --node app1 --label route=/api/livestream/:id --bucket 10
 isuscope series latest --metric db.query.total_duration --from 20 --to 60
+isuscope series latest --metric cpu.sample_count --limit 2000
 ```
 
 `metrics`はmetric名、行数、時刻付き行数、単位、時刻範囲、labelの種類・cardinality・例を一覧にします。最初にこれを実行すると、SQLiteのschemaを知らなくても指定可能なfilterを確認できます。
 
-引数なしの`series`はUTCの5秒境界で揃えたmetricをbenchmark区間で切り出し、開始からの相対秒とともにnodeごとのhost、HTTP、database指標を表形式で並べます。`--metric`を1回以上指定すると任意metricの汎用表になり、`--node`、複数の`--label key=value`、`--from`、`--to`、`--bucket`で絞り込み・再集約できます。count、duration合計、bytes、sample countは合計し、gaugeは平均します。p95などのquantileは元sampleなしには再計算できないため、明示的に`max-of-quantile`として表示します。欠測は`-`です。
+引数なしの`series`はUTCの5秒境界で揃えたmetricをbenchmark区間で切り出し、開始からの相対秒とともにnodeごとのhost、HTTP、database指標を表形式で並べます。`--metric`を1回以上指定すると任意metricの汎用表になり、`--node`、複数の`--label key=value`、`--from`、`--to`、`--bucket`で絞り込み・再集約できます。汎用表は高cardinalityなperf metricでも端末を埋めないよう既定1000行で打ち切り、`--limit`で変更できます。count、duration合計、bytes、sample countは合計し、gaugeは平均します。p95などのquantileは元sampleなしには再計算できないため、明示的に`max-of-quantile`として表示します。欠測は`-`です。
 
 表の前には標準時系列collectorごとの`complete` / `unavailable` / `failed`、exit code、errorを表示します。各metricには生成したcollector名が記録され、CPUは`host-sampler`を優先し、利用できない場合だけsysstatへfallbackするため二重集計しません。HTTP、MySQL、sysstat parserはbenchmark区間外のsampleを除外します。
 

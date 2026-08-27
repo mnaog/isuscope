@@ -34,6 +34,7 @@ struct Observation {
     messages: Vec<String>,
     initialize_started_at: Option<chrono::DateTime<Utc>>,
     initialize_finished_at: Option<chrono::DateTime<Utc>>,
+    protocol_result_count: usize,
 }
 
 pub async fn execute(
@@ -60,7 +61,8 @@ pub async fn execute(
                 },
             }
         }
-        BenchmarkMode::External => match execute_external(&config.config.benchmark).await {
+        BenchmarkMode::External => match execute_external(&config.config.benchmark, shutdown).await
+        {
             Ok(result) => BenchmarkExecution {
                 result,
                 logs: Vec::new(),
@@ -185,7 +187,8 @@ async fn execute_command(
         .map_err(|_| anyhow::anyhow!("benchmark observation is still shared"))?
         .into_inner()
         .map_err(|_| anyhow::anyhow!("benchmark observation lock is poisoned"))?;
-    let passed = if interrupted || !status.success() {
+    let duplicate_result = observation.protocol_result_count > 1;
+    let passed = if interrupted || !status.success() || duplicate_result {
         Some(false)
     } else {
         observation
@@ -207,6 +210,11 @@ async fn execute_command(
             initialize_finished_at: observation.initialize_finished_at,
             error: if interrupted {
                 Some("interrupted by signal".into())
+            } else if duplicate_result {
+                Some(format!(
+                    "benchmark emitted {} isuscope.result records; expected exactly one",
+                    observation.protocol_result_count
+                ))
             } else if !status.success() {
                 Some(format!("benchmark command exited with {status}"))
             } else {
@@ -241,7 +249,7 @@ where
                 println!("{line}");
             }
         }
-        observe_line(&line, &score_pattern, &config, &observation);
+        observe_line(&line, stderr, &score_pattern, &config, &observation);
     }
     file.flush().await?;
     Ok(())
@@ -249,6 +257,7 @@ where
 
 fn observe_line(
     line: &str,
+    stderr: bool,
     score_pattern: &Regex,
     config: &BenchmarkConfig,
     observation: &Arc<Mutex<Observation>>,
@@ -267,6 +276,9 @@ fn observe_line(
     {
         observation.initialize_finished_at = Some(Utc::now());
     }
+    // Contest benchmarkers commonly log their human-readable score to stderr.
+    // The configured regex is safe on both streams; only the structured JSON
+    // protocol below is restricted to stdout.
     if let Some(captures) = score_pattern.captures(line)
         && let Some(value) = captures
             .get(1)
@@ -274,7 +286,7 @@ fn observe_line(
     {
         observation.score = Some(value);
     }
-    if let Ok(value) = serde_json::from_str::<Value>(line) {
+    if !stderr && let Ok(value) = serde_json::from_str::<Value>(line) {
         if value.get("type").and_then(Value::as_str) == Some("isuscope.event") {
             match value.get("name").and_then(Value::as_str) {
                 Some("initialize-started") if observation.initialize_started_at.is_none() => {
@@ -289,36 +301,64 @@ fn observe_line(
                 _ => {}
             }
         }
-        if let Some(score) = value.get("score").and_then(Value::as_i64) {
-            observation.score = Some(score);
-        }
-        if let Some(passed) = value.get("pass").and_then(Value::as_bool) {
-            observation.passed = Some(passed);
-        }
-        if let Some(messages) = value.get("messages").and_then(Value::as_array) {
-            observation.messages.extend(
-                messages
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned),
-            );
+        if value.get("type").and_then(Value::as_str) == Some("isuscope.result") {
+            observation.protocol_result_count += 1;
+            if let Some(score) = value.get("score").and_then(Value::as_i64) {
+                observation.score = Some(score);
+            }
+            if let Some(passed) = value.get("pass").and_then(Value::as_bool) {
+                observation.passed = Some(passed);
+            }
+            if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+                observation.messages.extend(
+                    messages
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned),
+                );
+            }
         }
     }
 }
 
-async fn execute_external(_config: &BenchmarkConfig) -> Result<BenchmarkResult> {
+async fn execute_external(
+    _config: &BenchmarkConfig,
+    mut shutdown: Shutdown,
+) -> Result<BenchmarkResult> {
+    let mut input = BufReader::new(tokio::io::stdin());
     println!("collectors armed; open the contest portal");
-    prompt("Press Enter immediately before starting the benchmark: ")?;
+    let Some(_) = prompt(
+        &mut input,
+        &mut shutdown,
+        "Press Enter immediately before starting the benchmark: ",
+    )
+    .await?
+    else {
+        return Ok(interrupted_external(None));
+    };
     let started_at = Utc::now();
-    prompt("Press Enter after the benchmark has finished: ")?;
+    let Some(_) = prompt(
+        &mut input,
+        &mut shutdown,
+        "Press Enter after the benchmark has finished: ",
+    )
+    .await?
+    else {
+        return Ok(interrupted_external(Some(started_at)));
+    };
     let finished_at = Utc::now();
-    let score = prompt("Score (empty if unavailable): ")?;
+    let Some(score) = prompt(&mut input, &mut shutdown, "Score (empty if unavailable): ").await?
+    else {
+        return Ok(interrupted_external(Some(started_at)));
+    };
     let score = if score.trim().is_empty() {
         None
     } else {
         Some(score.trim().parse().context("score must be an integer")?)
     };
-    let result = prompt("Result [pass/fail]: ")?;
+    let Some(result) = prompt(&mut input, &mut shutdown, "Result [pass/fail]: ").await? else {
+        return Ok(interrupted_external(Some(started_at)));
+    };
     let passed = match result.trim().to_ascii_lowercase().as_str() {
         "pass" | "p" => Some(true),
         "fail" | "f" => Some(false),
@@ -334,12 +374,36 @@ async fn execute_external(_config: &BenchmarkConfig) -> Result<BenchmarkResult> 
     })
 }
 
-fn prompt(message: &str) -> Result<String> {
+fn interrupted_external(started_at: Option<chrono::DateTime<Utc>>) -> BenchmarkResult {
+    BenchmarkResult {
+        mode: "external".into(),
+        passed: Some(false),
+        interrupted: true,
+        started_at,
+        finished_at: Some(Utc::now()),
+        error: Some("interrupted by signal".into()),
+        ..Default::default()
+    }
+}
+
+async fn prompt<R: tokio::io::AsyncBufRead + Unpin>(
+    input: &mut R,
+    shutdown: &mut Shutdown,
+    message: &str,
+) -> Result<Option<String>> {
     print!("{message}");
     io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input)
+    let mut answer = String::new();
+    tokio::select! {
+        read = input.read_line(&mut answer) => {
+            let bytes = read?;
+            if bytes == 0 {
+                bail!("standard input closed while waiting for external benchmark input");
+            }
+            Ok(Some(answer))
+        }
+        _ = shutdown.cancelled() => Ok(None),
+    }
 }
 
 pub fn compress_log(source: &Path, destination: &Path) -> Result<()> {
@@ -372,21 +436,24 @@ mod tests {
     fn parses_japanese_score_and_failure_json() {
         let observation = Arc::new(Mutex::new(Observation::default()));
         let regex = Regex::new(&config().score_pattern).unwrap();
-        observe_line("スコア: 954885", &regex, &config(), &observation);
+        observe_line("スコア: 954885", false, &regex, &config(), &observation);
         observe_line(
             r#"{"type":"isuscope.event","name":"initialize-started"}"#,
+            false,
             &regex,
             &config(),
             &observation,
         );
         observe_line(
             r#"{"type":"isuscope.event","name":"initialize-finished"}"#,
+            false,
             &regex,
             &config(),
             &observation,
         );
         observe_line(
-            r#"{"pass":false,"score":0,"messages":["initialize failed"]}"#,
+            r#"{"type":"isuscope.result","pass":false,"score":0,"messages":["initialize failed"]}"#,
+            false,
             &regex,
             &config(),
             &observation,
@@ -397,5 +464,30 @@ mod tests {
         assert_eq!(value.messages, vec!["initialize failed"]);
         assert!(value.initialize_started_at.is_some());
         assert!(value.initialize_finished_at.is_some());
+    }
+
+    #[test]
+    fn accepts_legacy_stderr_score_but_not_untyped_or_stderr_json() {
+        let observation = Arc::new(Mutex::new(Observation::default()));
+        let regex = Regex::new(&config().score_pattern).unwrap();
+        observe_line("スコア: 3211", true, &regex, &config(), &observation);
+        observe_line(
+            r#"{"score":9999,"pass":true}"#,
+            false,
+            &regex,
+            &config(),
+            &observation,
+        );
+        observe_line(
+            r#"{"type":"isuscope.result","score":8888,"pass":true}"#,
+            true,
+            &regex,
+            &config(),
+            &observation,
+        );
+        let value = observation.lock().unwrap();
+        assert_eq!(value.score, Some(3211));
+        assert_eq!(value.passed, None);
+        assert_eq!(value.protocol_result_count, 0);
     }
 }

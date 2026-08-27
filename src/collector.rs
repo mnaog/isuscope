@@ -73,7 +73,9 @@ async fn cleanup_node(config: &LoadedConfig, node: &NodeConfig, run_id: &str) ->
     }
     args.push(format!("{user}@{}", node.host));
     args.push("--".into());
-    let script = format!("find /tmp -maxdepth 1 -type f -name 'isuscope-{run_id}.*' -delete");
+    let script = format!(
+        "base=/tmp/isuscope-{run_id}.perf; if sudo -n test -s \"$base.pid\" 2>/dev/null; then pid=$(sudo -n cat \"$base.pid\" 2>/dev/null || true); case $pid in ''|*[!0-9]*) ;; *) sudo -n kill -INT \"$pid\" 2>/dev/null || true ;; esac; fi; sudo -n rm -f \"$base.data\" \"$base.log\" \"$base.pid\" 2>/dev/null || true; find /tmp -maxdepth 1 -type f -name 'isuscope-{run_id}.*' -delete"
+    );
     args.push(
         ["sh", "-c", &script]
             .iter()
@@ -356,6 +358,7 @@ async fn finalize(
         }
     }
     for metric in &mut metrics {
+        normalize_perf_labels(metric);
         metric
             .labels
             .entry("collector".into())
@@ -542,28 +545,25 @@ fn parse_metric_timestamp(value: Option<&Value>) -> Option<chrono::DateTime<chro
     }
 }
 
-fn parse_standard_output(
+pub(crate) fn parse_standard_output(
     path: &Path,
     parser: CollectorParser,
     routes: Option<&Path>,
     interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
 ) -> Result<Vec<Metric>> {
     let input = fs::File::open(path)?;
-    let mut decoder = zstd::stream::read::Decoder::new(input)?;
+    let decoder = zstd::stream::read::Decoder::new(input)?;
+    if matches!(parser, CollectorParser::MysqlSlow) {
+        return parse_mysql_slow_reader(std::io::BufReader::new(decoder), interval);
+    }
+    let mut decoder = decoder;
     use std::io::Read;
     let mut bytes = Vec::new();
     decoder.read_to_end(&mut bytes)?;
-    // MySQL slow logs may contain raw binary SQL literals (for example icon
-    // blobs). Keep record boundaries and replace only invalid byte sequences;
-    // JSON/TSV/perf adapters remain strict so malformed tool output is visible.
-    let raw = if matches!(parser, CollectorParser::MysqlSlow) {
-        String::from_utf8_lossy(&bytes).into_owned()
-    } else {
-        String::from_utf8(bytes).context("stream did not contain valid UTF-8")?
-    };
+    let raw = String::from_utf8(bytes).context("stream did not contain valid UTF-8")?;
     match parser {
         CollectorParser::AlpJson => parse_alp_json(&raw, routes),
-        CollectorParser::MysqlSlow => Ok(parse_mysql_slow_series(&raw, interval)),
+        CollectorParser::MysqlSlow => unreachable!("handled by streaming parser"),
         CollectorParser::SlpJson => parse_slp_json(&raw),
         CollectorParser::SlpTsv => parse_slp_tsv(&raw),
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
@@ -617,14 +617,16 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
             .unwrap_or("-");
         let after_event = raw_symbol
             .rsplit_once(": ")
-            .map_or(raw_symbol, |(_, value)| value);
+            .map_or(raw_symbol, |(_, value)| value)
+            .trim();
         let mut symbol_fields = after_event.splitn(2, char::is_whitespace);
         let first = symbol_fields.next().unwrap_or("-");
-        let symbol = if first.chars().all(|character| character.is_ascii_hexdigit()) {
-            symbol_fields.next().unwrap_or("-").trim()
-        } else {
-            after_event
-        };
+        let symbol =
+            if !first.is_empty() && first.chars().all(|character| character.is_ascii_hexdigit()) {
+                symbol_fields.next().unwrap_or("-").trim()
+            } else {
+                after_event
+            };
         let Some(bucket) = chrono::DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) else {
             continue;
         };
@@ -632,8 +634,8 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
             .entry((
                 bucket,
                 if process.is_empty() { "-" } else { &process }.into(),
-                binary.into(),
-                symbol.into(),
+                canonical_perf_binary(binary),
+                canonical_perf_symbol(symbol),
             ))
             .or_default() += 1;
         parsed_lines += 1;
@@ -687,10 +689,18 @@ fn benchmark_interval(run_dir: &Path) -> Option<(chrono::DateTime<Utc>, chrono::
     ))
 }
 
+#[cfg(test)]
 fn parse_mysql_slow_series(
     raw: &str,
     interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
 ) -> Vec<Metric> {
+    parse_mysql_slow_reader(std::io::Cursor::new(raw.as_bytes()), interval).unwrap_or_default()
+}
+
+fn parse_mysql_slow_reader<R: std::io::BufRead>(
+    reader: R,
+    interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+) -> Result<Vec<Metric>> {
     #[derive(Default)]
     struct Event {
         timestamp: Option<chrono::DateTime<Utc>>,
@@ -749,7 +759,11 @@ fn parse_mysql_slow_series(
     let mut event = Event::default();
     let mut buckets = BTreeMap::<(chrono::DateTime<Utc>, String), Stats>::new();
     let mut aggregate = BTreeMap::<String, Stats>::new();
-    for line in raw.lines() {
+    for raw_line in reader.split(b'\n') {
+        let raw_line = raw_line?;
+        // Slow logs can include binary SQL literals. Lossy conversion is
+        // intentionally scoped to one line, keeping peak memory bounded.
+        let line = String::from_utf8_lossy(&raw_line);
         if let Some(value) = line.strip_prefix("# Time: ") {
             flush(&mut event, interval, &mut buckets, &mut aggregate);
             event.timestamp = chrono::DateTime::parse_from_rfc3339(value.trim())
@@ -762,7 +776,7 @@ fn parse_mysql_slow_series(
                 .and_then(|value| value.parse::<f64>().ok())
                 .map(|seconds| seconds * 1_000.0);
         } else if event.duration_ms.is_some() && !line.starts_with("# User@Host:") {
-            event.query.push(line.to_owned());
+            event.query.push(line.into_owned());
         }
     }
     flush(&mut event, interval, &mut buckets, &mut aggregate);
@@ -816,7 +830,45 @@ fn parse_mysql_slow_series(
             });
         }
     }
-    metrics
+    Ok(metrics)
+}
+
+pub(crate) fn canonical_perf_binary(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('[') && value.ends_with(']') {
+        return value.to_owned();
+    }
+    std::path::Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
+        .to_owned()
+}
+
+pub(crate) fn canonical_perf_symbol(value: &str) -> String {
+    let mut value = value.trim();
+    for prefix in ["[.] ", "[k] ", "[u] "] {
+        if let Some(stripped) = value.strip_prefix(prefix) {
+            value = stripped.trim();
+            break;
+        }
+    }
+    value.to_owned()
+}
+
+fn normalize_perf_labels(metric: &mut Metric) {
+    if !matches!(
+        metric.name.as_str(),
+        "cpu.sample_count" | "cpu.sample_percent"
+    ) {
+        return;
+    }
+    if let Some(binary) = metric.labels.get_mut("binary") {
+        *binary = canonical_perf_binary(binary);
+    }
+    if let Some(symbol) = metric.labels.get_mut("symbol") {
+        *symbol = canonical_perf_symbol(symbol);
+    }
 }
 
 fn percentile_value(sorted: &[f64], quantile: f64) -> Option<f64> {

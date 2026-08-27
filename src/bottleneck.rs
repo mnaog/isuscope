@@ -238,7 +238,7 @@ fn cpu(metrics: &[Metric], out: &mut BTreeMap<&'static str, Vec<Bottleneck>>) {
             out.entry("cpu").or_default().push(Bottleneck {
                 category: "cpu",
                 node: label(m, "node"),
-                target: format!("{} {}", label(m, "binary"), label(m, "symbol")),
+                target: cpu_target(m),
                 evidence: format!("sample_share={:.2}%", m.value),
                 source: "perf",
                 severity: m.value,
@@ -397,8 +397,7 @@ fn metric_supports_candidate(metric: &Metric, candidate: &Bottleneck) -> bool {
             matches!(
                 metric.name.as_str(),
                 "cpu.sample_count" | "cpu.sample_percent"
-            ) && candidate.target
-                == format!("{} {}", label(metric, "binary"), label(metric, "symbol"))
+            ) && candidate.target == cpu_target(metric)
         }
         "host" => match metric.name.as_str() {
             "host.cpu_percent" => candidate.target == "cpu",
@@ -412,6 +411,14 @@ fn metric_supports_candidate(metric: &Metric, candidate: &Bottleneck) -> bool {
         },
         _ => false,
     }
+}
+
+fn cpu_target(metric: &Metric) -> String {
+    format!(
+        "{} {}",
+        crate::collector::canonical_perf_binary(&label(metric, "binary")),
+        crate::collector::canonical_perf_symbol(&label(metric, "symbol"))
+    )
 }
 
 fn source_priority(category: &str, collector: &str) -> u8 {
@@ -599,7 +606,7 @@ mod tests {
                     "app1",
                     "mysql select * from livestream_tags where livestream_id = ?",
                 ),
-                ("cpu", "app1", "mysqld [.] row_search_mvcc"),
+                ("cpu", "app1", "mysqld row_search_mvcc"),
                 ("host", "app1", "cpu"),
             ]
         );

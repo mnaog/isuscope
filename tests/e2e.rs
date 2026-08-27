@@ -99,7 +99,8 @@ fn init_is_non_interactive_and_preserves_existing_files() {
     let parsed: toml::Value = toml::from_str(&generated).unwrap();
     let collectors = parsed["collectors"].as_array().unwrap();
     for name in [
-        "perf-record",
+        "perf-start",
+        "perf-stop",
         "perf-report",
         "perf-series",
         "nginx-log-delta",
@@ -124,7 +125,8 @@ fn init_is_non_interactive_and_preserves_existing_files() {
     }
     for name in [
         "sysstat",
-        "perf-record",
+        "perf-start",
+        "perf-stop",
         "perf-report",
         "perf-series",
         "nginx-log-mark",
@@ -911,6 +913,13 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
         .output()
         .unwrap();
     assert!(run.status.success());
+    let run_dir = fs::read_dir(config_dir.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir() && path.file_name().unwrap() != ".incomplete")
+        .unwrap();
+    assert!(run_dir.join("structured.json.zst").is_file());
     let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
     let (value, labels): (f64, String) = database
         .query_row(
@@ -921,6 +930,30 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
         .unwrap();
     assert_eq!(value, 77.0);
     assert!(labels.contains("inline"));
+    drop(database);
+    for suffix in ["", "-wal", "-shm"] {
+        let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["show", "latest"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(restored.status.success());
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT value FROM metrics WHERE name='benchmark.viewer.completed'",
+                [],
+                |row| row.get::<_, f64>(0)
+            )
+            .unwrap(),
+        77.0
+    );
 }
 
 #[test]
@@ -1048,7 +1081,7 @@ history_dir = "docs/codex-history"
 
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "touch benchmark-ran; printf '%s\\n' '{\"pass\":true,\"score\":42}'"]
+command = ["sh", "-c", "touch benchmark-ran; printf '%s\\n' '{\"type\":\"isuscope.result\",\"pass\":true,\"score\":42}'"]
 "#,
     )
     .unwrap();
@@ -1234,7 +1267,7 @@ repo = "."
 
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "printf '%s\\n' '{\"pass\":false,\"score\":0,\"messages\":[\"initialize failed\"]}'; exit 1"]
+command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"isuscope.result\",\"pass\":false,\"score\":0,\"messages\":[\"initialize failed\"]}'; exit 1"]
 "#,
     )
     .unwrap();

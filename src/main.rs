@@ -79,6 +79,9 @@ enum Commands {
         /// bucket幅（秒）。
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
         bucket: u64,
+        /// 出力行数の上限。高cardinalityなperf seriesの端末氾濫を防ぎます。
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
     },
     /// 保存済みbenchmark logへ現在のparserを適用します。
     Enrich {
@@ -292,6 +295,7 @@ async fn real_main() -> Result<bool> {
             from,
             to,
             bucket,
+            limit,
         } => {
             show_series(
                 &config,
@@ -303,6 +307,7 @@ async fn real_main() -> Result<bool> {
                     from,
                     to,
                     bucket,
+                    limit,
                 },
             )?;
             Ok(true)
@@ -434,6 +439,7 @@ struct SeriesOptions {
     from: u64,
     to: Option<u64>,
     bucket: u64,
+    limit: usize,
 }
 
 fn parse_label_filter(value: &str) -> std::result::Result<(String, String), String> {
@@ -736,7 +742,10 @@ fn show_generic_series(
         "NODE", "ELAPSED", "METRIC", "VALUE", "UNIT", "AGGREGATION"
     );
     let empty = rows.is_empty();
-    for ((node, bucket, name, unit, labels), (aggregation, values)) in rows {
+    let row_count = rows.len();
+    for ((node, bucket, name, unit, labels), (aggregation, values)) in
+        rows.into_iter().take(options.limit)
+    {
         let value = match aggregation {
             SeriesAggregation::Sum => values.iter().sum(),
             SeriesAggregation::Average => values.iter().sum::<f64>() / values.len() as f64,
@@ -760,6 +769,11 @@ fn show_generic_series(
     }
     if empty {
         println!("no matching timestamped metrics");
+    } else if row_count > options.limit {
+        println!(
+            "... truncated {} rows (use --limit to change the cap)",
+            row_count - options.limit
+        );
     }
     Ok(())
 }

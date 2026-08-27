@@ -11,7 +11,7 @@ perf、alp、slp、sysstatは「必要になってから有効化する追加機
 | collector | phase | 常時取得するもの | unavailableの条件 |
 |---|---|---|---|
 | sysstat | during | CPU、diskのベンチ区間sample | `sar`がない |
-| perf | during | system-wide sampleとhot symbol | `perf`がない、権限不足、kernelが非対応 |
+| perf | before/after | detachしたsystem-wide sampleとhot symbol | `perf`がない、権限不足、kernelが非対応 |
 | alp | after | route別request数、p50/p95/p99、error、bytes | access logがない、alpがない |
 | slp | after | digest別query数、合計時間、p95、rows | MySQL slow logがない、slpがない、MySQLが退役済み |
 | PostgreSQL | after | `pg_stat_statements`のquery別差分 | PostgreSQLがない、extensionが無効 |
@@ -35,7 +35,7 @@ unavailable_exit_codes = [75]
 required = false
 ```
 
-ログ全体を毎回解析するとrun同士を比較できないため、before collectorでoffset・先頭最大64 KiBのSHA-256またはDB統計snapshotを保存し、after collectorで差分だけを処理します。perfとsysstatはduring collectorとしてベンチと同時に起動し、isuscopeがベンチ終了時に停止します。sysstatの値は終了後の1秒ではなく、ベンチ中に出力されたsampleから作ります。
+ログ全体を毎回解析するとrun同士を比較できないため、before collectorでoffset・先頭最大64 KiBのSHA-256またはDB統計snapshotを保存し、after collectorで差分だけを処理します。perfはbeforeでSSHからdetachしてPIDを保存し、afterでSIGINT、process終了、非空`perf.data`の順に確認してからreportとseriesを作ります。これによりduring collectorのprocess group終了に巻き込まれて未flushになることを防ぎます。sysstatの値は終了後の1秒ではなく、ベンチ中に出力されたsampleから作ります。
 
 ## bottleneckへ渡すmetric契約
 
@@ -66,6 +66,6 @@ ALP adapterと行動遷移helperは同じ`routes.toml`を使います。標準�
 
 after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
 
-parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式、MySQL 8.0 slow log、alp 1.0.21の表形式JSON、slp 0.2.1のTSV fixtureを使用します。公式Ubuntu Docker imageから、Ubuntu 20.04のsysstat 12.2.0、22.04の12.5.2、24.04の12.6.1、およびMySQL 8.0.46の完全な出力も採取して固定しています。fixtureの由来は`tests/fixtures/README.md`に記録します。Dockerでは保証できないperfとhost kernelの互換性はTODOで追跡します。
+parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式、MySQL 8.0 slow log、alp 1.0.21の表形式JSON、slp 0.2.1のTSV fixtureを使用します。公式Ubuntu Docker imageから、Ubuntu 20.04のsysstat 12.2.0、22.04の12.5.2、24.04の12.6.1、およびMySQL 8.0.46の完全な出力も採取して固定しています。fixtureの由来は`tests/fixtures/README.md`に記録します。perfはDockerだけで完了扱いにせず、公式ISUCON13 AMIの3 node実走でstart/stop/report/seriesと一時ファイル消去を確認済みです。
 
 標準log collectorは開始時のoffsetと先頭最大64 KiBのSHA-256を記録します。終了時は現在のfileと`.1`〜`.5`（各`.gz`も可）からfingerprintが一致する開始時fileを探し、そのoffset以降、中間世代、現在fileを時系列順に連結します。これによりrename、gzip、複数回rotation、copytruncateを同じ方式で扱い、世代欠落やfingerprint不一致は壊れた差分を成功扱いせず`unavailable`にします。
