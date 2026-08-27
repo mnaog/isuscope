@@ -15,6 +15,8 @@ pub struct Config {
     pub source: SourceConfig,
     #[serde(default)]
     pub tooling: ToolingConfig,
+    #[serde(default)]
+    pub context: ContextConfig,
     pub benchmark: BenchmarkConfig,
     #[serde(default)]
     pub ssh: SshConfig,
@@ -22,6 +24,16 @@ pub struct Config {
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub collectors: Vec<CollectorConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContextConfig {
+    pub codex: Option<CodexContextConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodexContextConfig {
+    pub history_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -272,9 +284,27 @@ impl LoadedConfig {
             .map(|path| resolve(&self.project_root, path))
             .unwrap_or_else(|| self.project_root.clone())
     }
+
+    pub fn codex_history_dir(&self) -> Option<PathBuf> {
+        self.config
+            .context
+            .codex
+            .as_ref()
+            .map(|codex| resolve(&self.source_repo(), &codex.history_dir))
+    }
 }
 
 fn validate(config: &Config) -> Result<()> {
+    if let Some(codex) = &config.context.codex
+        && (codex.history_dir.as_os_str().is_empty()
+            || codex.history_dir.is_absolute()
+            || codex
+                .history_dir
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_))))
+    {
+        bail!("context.codex.history_dir must be a non-empty relative path without `..`");
+    }
     if matches!(config.benchmark.mode, BenchmarkMode::Command)
         && config.benchmark.command.is_empty()
     {

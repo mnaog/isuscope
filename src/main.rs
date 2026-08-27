@@ -676,6 +676,13 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
     println!("state hash  {}", manifest.source.state_sha256);
     println!("isuscope    {}", manifest.tooling.isuscope_version);
     println!("config hash {}", manifest.tooling.config_sha256);
+    if let Some(context) = &manifest.codex_context {
+        println!("codex file  {}", context.history_path);
+        println!("codex input {}", context.input_id);
+        println!("codex sess  {}", context.session_id);
+        println!("codex hash  {}", context.sha256);
+        println!("codex copy  {}", context.snapshot_path);
+    }
     println!(
         "score       {}",
         manifest
@@ -729,11 +736,19 @@ fn print_sqlite_hint(store: &Store, run_id: Option<&str>) {
     let path = store.data_dir().join("isuscope.sqlite3");
     println!("sqlite      {} (shared by all runs)", path.display());
     match run_id {
-        Some(run_id) => println!(
-            "sql hint    sqlite3 {} \"SELECT observed_at,name,value,unit,labels_json FROM metrics WHERE run_id='{}' ORDER BY observed_at;\"",
-            shell_display(&path),
-            run_id.replace('\'', "''")
-        ),
+        Some(run_id) => {
+            let run_id = run_id.replace('\'', "''");
+            println!(
+                "sql hint    sqlite3 {} \"SELECT observed_at,name,value,unit,labels_json FROM metrics WHERE run_id='{}' ORDER BY observed_at;\"",
+                shell_display(&path),
+                run_id
+            );
+            println!(
+                "context     sqlite3 {} \"SELECT history_path,input_id,session_id,sha256 FROM run_codex_context WHERE run_id='{}';\"",
+                shell_display(&path),
+                run_id
+            );
+        }
         None => println!(
             "sql hint    sqlite3 {} \"SELECT id,started_at,score,state,analysis_status,hypothesis FROM runs ORDER BY started_at DESC;\"",
             shell_display(&path)

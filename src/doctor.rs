@@ -1,4 +1,7 @@
-use crate::config::{BenchmarkMode, LoadedConfig, Transport, resolve};
+use crate::{
+    codex_context,
+    config::{BenchmarkMode, LoadedConfig, Transport, resolve},
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::{
@@ -44,11 +47,41 @@ pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
     report.pass(format!("config {}", config.config_path.display()));
     check_data_dir(config, &mut report);
+    check_codex_context(config, &mut report);
     check_tooling(config, &mut report).await;
     check_commands(config, &mut report);
     check_identity(config, &mut report);
     check_nodes(config, &mut report).await;
     Ok(report)
+}
+
+fn check_codex_context(config: &LoadedConfig, report: &mut DoctorReport) {
+    let Some(history_dir) = config.codex_history_dir() else {
+        return;
+    };
+    match codex_context::valid_history_files(&history_dir) {
+        Ok(0) => report.fail(format!(
+            "Codex history directory has no valid session Markdown: {}",
+            history_dir.display()
+        )),
+        Ok(count) => report.pass(format!(
+            "Codex history directory: {} ({count} session file(s))",
+            history_dir.display()
+        )),
+        Err(error) => report.fail(format!("Codex history is not readable: {error:#}")),
+    }
+    if env::var_os("CODEX_SESSION_ID").is_none() && env::var_os("CODEX_THREAD_ID").is_none() {
+        report.warn("Codex session linkage cannot be verified outside a Codex-launched process");
+        return;
+    }
+    match codex_context::resolve(config) {
+        Ok(Some(context)) => report.pass(format!(
+            "Codex context resolved: {}#{}",
+            context.metadata.history_path, context.metadata.input_id
+        )),
+        Ok(None) => {}
+        Err(error) => report.fail(format!("Codex context cannot be resolved: {error:#}")),
+    }
 }
 
 fn check_data_dir(config: &LoadedConfig, report: &mut DoctorReport) {

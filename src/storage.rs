@@ -109,6 +109,7 @@ impl Store {
                     manifest.analysis_status.as_str(),
                 ],
             )?;
+            persist_codex_context(&self.connection, &manifest)?;
             self.connection.execute(
                 "UPDATE runs SET finished_at=?2, state=?3, score=?4, passed=0, exit_code=?5, analysis_status=?6 WHERE id=?1",
                 params![
@@ -157,6 +158,7 @@ impl Store {
                 manifest.analysis_status.as_str(),
             ],
         )?;
+        persist_codex_context(&self.connection, manifest)?;
         for tag in &manifest.tags {
             self.connection.execute(
                 "INSERT INTO run_tags (run_id, tag) VALUES (?1, ?2)",
@@ -201,6 +203,7 @@ impl Store {
                 manifest.analysis_status.as_str(),
             ],
         )?;
+        persist_codex_context(&transaction, manifest)?;
         for log in &manifest.logs {
             transaction.execute(
                 "INSERT INTO logs (id, run_id, kind, node) VALUES (?1, ?2, ?3, ?4)",
@@ -729,6 +732,7 @@ impl Store {
                 ],
             )?;
         }
+        persist_codex_context(&transaction, manifest)?;
         transaction.commit()?;
         Ok(())
     }
@@ -923,6 +927,14 @@ fn migrate(connection: &Connection) -> Result<()> {
             body TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS run_analyses_run_created ON run_analyses(run_id, created_at);
+        CREATE TABLE IF NOT EXISTS run_codex_context (
+            run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+            history_path TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            input_id TEXT NOT NULL,
+            snapshot_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL
+        );
         ",
     )?;
     ensure_column(connection, "runs", "note", "TEXT")?;
@@ -934,7 +946,25 @@ fn migrate(connection: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'not_required'",
     )?;
     ensure_column(connection, "metrics", "observed_at", "TEXT")?;
-    connection.pragma_update(None, "user_version", 5)?;
+    connection.pragma_update(None, "user_version", 6)?;
+    Ok(())
+}
+
+fn persist_codex_context(connection: &Connection, manifest: &RunManifest) -> Result<()> {
+    let Some(context) = &manifest.codex_context else {
+        return Ok(());
+    };
+    connection.execute(
+        "INSERT OR REPLACE INTO run_codex_context (run_id, history_path, session_id, input_id, snapshot_path, sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            manifest.id,
+            context.history_path,
+            context.session_id,
+            context.input_id,
+            context.snapshot_path,
+            context.sha256,
+        ],
+    )?;
     Ok(())
 }
 
@@ -960,7 +990,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = Store::open(directory.path()).unwrap();
         let manifest = RunManifest {
-            schema_version: 5,
+            schema_version: 6,
             id: "01a03df2-ecb2-72b3-aa1f-c952d3dd102b".into(),
             mode: RunMode::Run,
             state: RunState::Running,
@@ -973,6 +1003,7 @@ mod tests {
             tags: Vec::new(),
             source: SourceSnapshot::default(),
             tooling: ToolingSnapshot::default(),
+            codex_context: None,
             benchmark: BenchmarkResult::default(),
             collectors: Vec::new(),
             enrichments: Vec::new(),

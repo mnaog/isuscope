@@ -8,6 +8,7 @@
 
 - [ ] `isuscope --version`で事前に用意したbinaryを確認する
 - [ ] 対象プロジェクトで`isuscope init`を1回実行する
+- [ ] Codex会話を紐付ける場合は、事前に信頼済みhookと新しいCodexセッションを用意し、`[context.codex]`を有効化する
 - [ ] `.isuscope/benchmark.sh`へ当日の起動・完了待ち・結果取得を実装する
 - [ ] 必要なら`.isuscope/parse-benchmark.sh`へ問題固有の出力parserを実装する
 - [ ] `.isuscope/config.toml`へSSH、node、role、collectorを設定する
@@ -28,6 +29,7 @@
 - SSH client、`sqlite3`、`zstd`を操作端末へ用意する
 - SSH鍵と競技用credentialを、リポジトリ外の安全な場所へ用意する
 - isuscopeの保存先に十分な空き容量があることを確認する
+- Codex会話をrunへ残す場合は、`UserPromptSubmit` hookを導入・信頼して新しいセッションで動作確認する
 
 release bundleにはREADME、この文書、LICENSEが含まれます。isuscope自体は操作端末で動き、通常は競技サーバーへRust agentを常駐させません。
 

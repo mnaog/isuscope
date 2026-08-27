@@ -9,6 +9,11 @@ exclude = [".pprotein"]
 # 当日実装したベンチアダプターと問題固有scriptを各runへ保存します。
 include = ["benchmark.sh", "parse-benchmark.sh", "fingerprint.sh"]
 
+# Codex hookが生成する会話履歴と各ベンチを厳密に紐付ける場合だけ有効化します。
+# 設定するとCodex session/inputを解決できないrunはベンチ開始前に拒否されます。
+# [context.codex]
+# history_dir = "docs/codex-history"
+
 [benchmark]
 mode = "command"
 # 当日の起動方法はbenchmark.shだけに実装します。入出力契約は同script冒頭を参照します。

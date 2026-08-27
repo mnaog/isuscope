@@ -121,6 +121,15 @@ pub struct ToolingSnapshot {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexContext {
+    pub history_path: String,
+    pub session_id: String,
+    pub input_id: String,
+    pub snapshot_path: String,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BenchmarkResult {
     pub mode: String,
@@ -221,6 +230,8 @@ pub struct RunManifest {
     pub source: SourceSnapshot,
     #[serde(default)]
     pub tooling: ToolingSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_context: Option<CodexContext>,
     pub benchmark: BenchmarkResult,
     pub collectors: Vec<CollectorResult>,
     #[serde(default)]

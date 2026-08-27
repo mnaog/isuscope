@@ -45,15 +45,16 @@ cargo install --path .
 isuscope init
 ```
 
-### 初回runまでの7ステップ
+### 初回runまでの8ステップ
 
 1. `isuscope init`でscaffoldを生成する。この時点ではまだ`setup.sh`を実行しない。
-2. `.isuscope/benchmark.sh`へベンチの起動、完了待ち、結果JSON出力を実装する。
-3. `.isuscope/config.toml`の`[ssh]`と`[[nodes]]`を実環境へ合わせる。
-4. alpのaccess log path・format、slpのslow log path・format、perfの`sudo -n`権限を確認する。
-5. `bash -n .isuscope/benchmark.sh`、`bash -n .isuscope/setup.sh`、`isuscope show`で副作用なしの検査をする。
-6. 不足する環境変更だけを`setup.sh`へ記述し、`.isuscope/setup.sh`を実行する。
-7. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`、`isuscope show latest`、`isuscope bottleneck latest`の順に実行し、collector状態、metric、coverageを確認する。
+2. Codex会話履歴を紐付ける場合は、hookを導入・信頼して新しいCodexセッションを開始し、`.isuscope/config.toml`の`[context.codex]`を有効化する。
+3. `.isuscope/benchmark.sh`へベンチの起動、完了待ち、結果JSON出力を実装する。
+4. `.isuscope/config.toml`の`[ssh]`と`[[nodes]]`を実環境へ合わせる。
+5. alpのaccess log path・format、slpのslow log path・format、perfの`sudo -n`権限を確認する。
+6. `bash -n .isuscope/benchmark.sh`、`bash -n .isuscope/setup.sh`、`isuscope show`で副作用なしの検査をする。
+7. 不足する環境変更だけを`setup.sh`へ記述し、`.isuscope/setup.sh`を実行する。
+8. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`、`isuscope show latest`、`isuscope bottleneck latest`の順に実行し、collector状態、metric、coverageを確認する。
 
 最低限編集するのは`benchmark.sh`、`config.toml`の`[ssh]`、`[[nodes]]`です。標準ツールの自動installやsudoers変更は行いません。必要な場合だけ、利用者が`setup.sh`の`apply_environment`へ冪等な処理を追加します。
 
@@ -89,6 +90,19 @@ isuscope score-run --hypothesis "観測負荷を外すと最終スコアが上�
 ```
 
 `--hypothesis`は全ベンチで必須です。ベンチ開始前に`run.json`とSQLiteへ保存され、後から変更できません。PASSしたrunは`analysis_status=pending`となり、結果分析を記録するまで次のベンチを開始できません。FAILまたは中断したrunは分析不要として確定するため、失敗原因を直した次のベンチを妨げません。
+
+### Codex会話コンテキスト
+
+Codexの`UserPromptSubmit` hookが`docs/codex-history`へ保存する会話とrunを紐付ける場合は、初回runより前に次を有効化します。
+
+```toml
+[context.codex]
+history_dir = "docs/codex-history"
+```
+
+この設定はopt-inですが、有効化後は必須条件です。`CODEX_SESSION_ID`または`CODEX_THREAD_ID`と一致するMarkdownの`- Session:` headerを探し、最後の`<!-- codex-event:<session>:<turn>:user -->`に含まれるturn IDをinput IDとして採用します。通常ターミナル、別セッション、hookを導入する前から継続しているセッション、marker欠損では推測によるfallbackを行わず、benchmark開始前にrunを拒否します。
+
+解決した元path、session ID、input ID、SHA-256は`run.json`とSQLiteの`run_codex_context`へ保存します。会話本文もrun時点の内容を`context/codex-history.md`へsnapshotするため、元ファイルが未追跡・後から追記・移動されても当時の文脈が残ります。hookの`session_id`と`turn_id`はCodex公式のevent fieldです。[OpenAI Docs: Hooks](https://learn.chatgpt.com/docs/hooks)
 
 分析では、仮説が支持されたか、棄却されたか、1回の結果では判断不能かを明示します。再評価した場合も上書きせず、revisionとして追記します。
 
@@ -217,12 +231,14 @@ initializeの開始・終了を取得できる場合は、任意のevent行も�
             │   ├── extra/parse-benchmark.sh
             │   ├── enrichments/
             │   └── isuscope-version.txt
+            ├── context/
+            │   └── codex-history.md
             └── logs/
                 ├── benchmark-stdout.zst
                 └── <collector-log-id>.zst
 ```
 
-SQLiteにはrunのメタデータ、仮説、分析状態、追記式の分析履歴、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログの本文はSQLiteへ入れません。
+SQLiteにはrunのメタデータ、仮説、分析状態、追記式の分析履歴、Codex context参照、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログとCodex会話の本文はSQLiteへ入れません。
 
 `tooling/`には実際に使った設定、route規則、setup状態、isuscope versionをrunごとに保存します。各ファイルのSHA-256も`run.json`へ入るため、計測構成の違いを後から判別できます。
 

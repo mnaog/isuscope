@@ -1,5 +1,5 @@
 use crate::{
-    benchmark,
+    benchmark, codex_context,
     collector::{self, CollectorOutput},
     config::{CollectorPhase, LoadedConfig},
     enrichment::{self, EnrichmentOutput},
@@ -57,11 +57,15 @@ pub async fn execute(
             short_id(&run.id),
         );
     }
+    let codex_context = codex_context::resolve(&config)?;
     let id = Uuid::now_v7().to_string();
     let staging = store.staging_dir(&id);
     fs::create_dir_all(staging.join("source"))?;
     fs::create_dir_all(staging.join("logs"))?;
     fs::create_dir_all(staging.join("tmp"))?;
+    if let Some(context) = &codex_context {
+        context.write_snapshot(&staging)?;
+    }
 
     let source = git_snapshot::capture(
         &config.source_repo(),
@@ -85,7 +89,7 @@ pub async fn execute(
     annotations.tags.sort();
     annotations.tags.dedup();
     let mut manifest = RunManifest {
-        schema_version: 5,
+        schema_version: 6,
         id: id.clone(),
         mode,
         state: RunState::Running,
@@ -98,6 +102,7 @@ pub async fn execute(
         tags: annotations.tags,
         source,
         tooling,
+        codex_context: codex_context.map(|context| context.metadata),
         benchmark: BenchmarkResult::default(),
         collectors: Vec::new(),
         enrichments: Vec::new(),
@@ -370,6 +375,13 @@ fn print_header(manifest: &RunManifest, config: &LoadedConfig) {
             ""
         }
     );
+    if let Some(context) = &manifest.codex_context {
+        println!(
+            "context   {}#{}",
+            context.history_path,
+            short_id(&context.input_id)
+        );
+    }
     println!("data      {}", config.data_dir.display());
     println!();
 }
