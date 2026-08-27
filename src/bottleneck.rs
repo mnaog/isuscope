@@ -233,6 +233,7 @@ fn cpu(metrics: &[Metric], out: &mut BTreeMap<&'static str, Vec<Bottleneck>>) {
             && m.timestamp.is_none()
             && valid(m.value)
             && m.value > 0.0
+            && !is_idle_cpu_sample(m)
         {
             out.entry("cpu").or_default().push(Bottleneck {
                 category: "cpu",
@@ -246,6 +247,14 @@ fn cpu(metrics: &[Metric], out: &mut BTreeMap<&'static str, Vec<Bottleneck>>) {
             });
         }
     }
+}
+
+fn is_idle_cpu_sample(metric: &Metric) -> bool {
+    let process = label(metric, "process");
+    process == "swapper"
+        || process.starts_with("swapper/")
+        || process == "idle"
+        || process.starts_with("idle/")
 }
 
 fn host(metrics: &[Metric], out: &mut BTreeMap<&'static str, Vec<Bottleneck>>) {
@@ -526,6 +535,41 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.strength == "summary-only")
         );
+    }
+
+    #[test]
+    fn ignores_kernel_idle_task_as_cpu_bottleneck() {
+        let metrics = vec![
+            m(
+                "cpu.sample_percent",
+                80.,
+                &[
+                    ("node", "app1"),
+                    ("process", "swapper"),
+                    ("binary", "[kernel.kallsyms]"),
+                    ("symbol", "[k] native_safe_halt"),
+                ],
+            ),
+            m(
+                "cpu.sample_percent",
+                12.,
+                &[
+                    ("node", "app1"),
+                    ("process", "nginx"),
+                    ("binary", "nginx"),
+                    ("symbol", "ngx_http_process_request"),
+                ],
+            ),
+        ];
+
+        let report = rank(&metrics, &[]);
+
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].target,
+            "nginx ngx_http_process_request"
+        );
+        assert_eq!(report.candidates[0].evidence, "sample_share=12.00%");
     }
 
     #[test]
