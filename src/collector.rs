@@ -550,9 +550,17 @@ fn parse_standard_output(
 ) -> Result<Vec<Metric>> {
     let input = fs::File::open(path)?;
     let mut decoder = zstd::stream::read::Decoder::new(input)?;
-    let mut raw = String::new();
     use std::io::Read;
-    decoder.read_to_string(&mut raw)?;
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes)?;
+    // MySQL slow logs may contain raw binary SQL literals (for example icon
+    // blobs). Keep record boundaries and replace only invalid byte sequences;
+    // JSON/TSV/perf adapters remain strict so malformed tool output is visible.
+    let raw = if matches!(parser, CollectorParser::MysqlSlow) {
+        String::from_utf8_lossy(&bytes).into_owned()
+    } else {
+        String::from_utf8(bytes).context("stream did not contain valid UTF-8")?
+    };
     match parser {
         CollectorParser::AlpJson => parse_alp_json(&raw, routes),
         CollectorParser::MysqlSlow => Ok(parse_mysql_slow_series(&raw, interval)),
@@ -1624,6 +1632,26 @@ mod tests {
                 metric.name == "db.query.total_duration" && metric.value == 350.0
             })
         );
+    }
+
+    #[test]
+    fn mysql_slow_log_tolerates_binary_query_literals() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mysql-slow.zst");
+        let mut encoder =
+            zstd::stream::write::Encoder::new(fs::File::create(&path).unwrap(), 1).unwrap();
+        use std::io::Write;
+        encoder
+            .write_all(
+                b"# Time: 2026-08-27T12:00:01.000000Z\n# Query_time: 0.001000  Lock_time: 0.000000 Rows_sent: 0 Rows_examined: 0\nINSERT INTO icons(image) VALUES ('\xff\xfe');\n",
+            )
+            .unwrap();
+        encoder.finish().unwrap();
+
+        let metrics = parse_standard_output(&path, CollectorParser::MysqlSlow, None, None)
+            .expect("binary literals should be decoded lossily");
+
+        assert!(metrics.iter().any(|metric| metric.name == "db.query.calls"));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 - `slp-tsv-v0.2.1.tsv` matches the four-column output captured from `slp v0.2.1` for Linux arm64 with `slp my --format tsv --noheaders --output count,query,sum-query-time,p95-query-time --percentiles 95`.
 - `perf-script-series.txt` represents the supported `perf script --reltime --ns -F comm,time,event,ip,sym,dso` shape with the standard collector's wall-clock marker.
 
-- `isupipe-practice-bottleneck.json` is a minimal, anonymized subset of run `d7555a6b` from the 2026-08-26 ISUCON13 practice. It retains only the leading HTTP observations and host CPU values needed to regress candidate ordering. Cookies, request bodies, addresses, source snapshots, and raw logs are excluded.
+- `isupipe-practice-bottleneck.json` is a minimal, anonymized subset of run `e3f6c73f` from the 2026-08-27 stock ISUCON13 environment. It retains the leading HTTP, MySQL, perf, and host observations plus one shared five-second bucket. This regresses cross-source coverage and `summary-only` / `direct` / `corroborated` strength without retaining cookies, binary literals, request bodies, addresses, source snapshots, or raw logs.
 - `sysstat-ubuntu-20.04-sysstat-12.2.0.txt` was captured with Ubuntu 20.04 package `sysstat 12.2.0-2ubuntu0.3`.
 - `sysstat-ubuntu-22.04-sysstat-12.5.2.txt` was captured with Ubuntu 22.04 package `sysstat 12.5.2-2ubuntu0.2`.
 - `sysstat-ubuntu-24.04-sysstat-12.6.1.txt` was captured with Ubuntu 24.04 package `sysstat 12.6.1-2`.

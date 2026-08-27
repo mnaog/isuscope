@@ -1,56 +1,79 @@
 [
   {
     "name": "http.requests",
-    "value": 3887.0,
+    "value": 1674.0,
     "unit": "requests",
-    "labels": {"node": "app2", "method": "POST", "route": "/api/icon"}
+    "labels": {"collector": "user-transition", "node": "app1", "method": "GET", "route": "/api/user/:name/icon"}
   },
   {
     "name": "http.request_duration",
-    "value": 41.0,
+    "value": 354.0,
     "unit": "ms",
-    "labels": {"node": "app2", "method": "POST", "route": "/api/icon", "quantile": "0.95"}
+    "labels": {"collector": "user-transition", "node": "app1", "method": "GET", "route": "/api/user/:name/icon", "quantile": "0.95"}
   },
   {
     "name": "http.requests",
-    "value": 38.0,
+    "value": 245.0,
     "unit": "requests",
-    "labels": {"node": "app1", "method": "POST", "route": "/api/livestream/:id/moderate"}
+    "timestamp": "2026-08-27T13:56:30Z",
+    "labels": {"collector": "user-transition", "node": "app1", "method": "GET", "route": "/api/user/:name/icon"}
   },
   {
     "name": "http.request_duration",
-    "value": 2002.0,
+    "value": 134.0,
     "unit": "ms",
-    "labels": {"node": "app1", "method": "POST", "route": "/api/livestream/:id/moderate", "quantile": "0.95"}
+    "timestamp": "2026-08-27T13:56:30Z",
+    "labels": {"collector": "user-transition", "node": "app1", "method": "GET", "route": "/api/user/:name/icon", "quantile": "0.95"}
   },
   {
-    "name": "http.requests",
-    "value": 151.0,
-    "unit": "requests",
-    "labels": {"node": "app2", "method": "GET", "route": "/api/livestream"}
+    "name": "db.query.calls",
+    "value": 5712.0,
+    "unit": "queries",
+    "labels": {"collector": "mysql-log-delta", "node": "app1", "engine": "mysql", "digest": "select * from livestream_tags where livestream_id = ?"}
   },
   {
-    "name": "http.request_duration",
-    "value": 502.0,
+    "name": "db.query.total_duration",
+    "value": 131470.98,
     "unit": "ms",
-    "labels": {"node": "app2", "method": "GET", "route": "/api/livestream", "quantile": "0.95"}
+    "labels": {"collector": "mysql-log-delta", "node": "app1", "engine": "mysql", "digest": "select * from livestream_tags where livestream_id = ?"}
+  },
+  {
+    "name": "db.query.calls",
+    "value": 554.0,
+    "unit": "queries",
+    "timestamp": "2026-08-27T13:56:30Z",
+    "labels": {"collector": "mysql-log-delta", "node": "app1", "engine": "mysql", "digest": "select * from livestream_tags where livestream_id = ?"}
+  },
+  {
+    "name": "db.query.total_duration",
+    "value": 16656.817,
+    "unit": "ms",
+    "timestamp": "2026-08-27T13:56:30Z",
+    "labels": {"collector": "mysql-log-delta", "node": "app1", "engine": "mysql", "digest": "select * from livestream_tags where livestream_id = ?"}
+  },
+  {
+    "name": "cpu.sample_percent",
+    "value": 33.54,
+    "unit": "percent",
+    "labels": {"collector": "perf-report", "node": "app1", "process": "swapper", "binary": "[kernel.kallsyms]", "symbol": "[k] native_safe_halt"}
+  },
+  {
+    "name": "cpu.sample_percent",
+    "value": 3.54,
+    "unit": "percent",
+    "labels": {"collector": "perf-report", "node": "app1", "process": "connection", "binary": "mysqld", "symbol": "[.] row_search_mvcc"}
   },
   {
     "name": "host.cpu_percent",
-    "value": 23.3319,
+    "value": 69.83,
     "unit": "percent",
-    "labels": {"node": "app1"}
+    "labels": {"collector": "host-sampler", "node": "app1"}
   },
   {
     "name": "host.cpu_percent",
-    "value": 39.5886,
+    "value": 100.0,
     "unit": "percent",
-    "labels": {"node": "app2"}
-  },
-  {
-    "name": "host.cpu_percent",
-    "value": 23.5496,
-    "unit": "percent",
-    "labels": {"node": "app3"}
+    "timestamp": "2026-08-27T13:56:30Z",
+    "labels": {"collector": "host-sampler", "node": "app1"}
   }
 ]

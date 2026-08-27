@@ -573,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn isupipe_practice_run_keeps_real_world_candidate_order() {
+    fn isupipe_practice_run_keeps_cross_source_strength_and_order() {
         let metrics: Vec<Metric> = serde_json::from_str(include_str!(
             "../tests/fixtures/isupipe-practice-bottleneck.json"
         ))
@@ -593,11 +593,14 @@ mod tests {
         assert_eq!(
             candidates,
             vec![
-                ("http", "app2", "POST /api/icon"),
-                ("host", "app2", "cpu"),
-                ("host", "app3", "cpu"),
+                ("http", "app1", "GET /api/user/:name/icon"),
+                (
+                    "database",
+                    "app1",
+                    "mysql select * from livestream_tags where livestream_id = ?",
+                ),
+                ("cpu", "app1", "mysqld [.] row_search_mvcc"),
                 ("host", "app1", "cpu"),
-                ("http", "app1", "POST /api/livestream/:id/moderate"),
             ]
         );
         assert_eq!(
@@ -608,15 +611,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("http", true),
-                ("database", false),
-                ("cpu", false),
+                ("database", true),
+                ("cpu", true),
                 ("host", true),
             ]
         );
         assert_eq!(
             report.candidates[0].evidence,
-            "requests=3887 p95=41.00ms impact=159367.00ms"
+            "requests=1674 p95=354.00ms impact=592596.00ms"
         );
+        assert_eq!(report.candidates[0].strength, "corroborated");
+        assert_eq!(report.candidates[1].strength, "corroborated");
+        assert_eq!(report.candidates[2].strength, "summary-only");
+        assert_eq!(report.candidates[3].strength, "direct");
     }
 
     #[test]
