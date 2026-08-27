@@ -153,6 +153,7 @@ pub enum CollectorParser {
     AlpJson,
     MysqlSlow,
     SlpJson,
+    SlpTsv,
     Sysstat,
 }
 

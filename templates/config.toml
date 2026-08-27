@@ -63,55 +63,241 @@ unavailable_exit_codes = [75]
 # alp/slpはログ形式とpathが問題ごとに異なるため、SETUP.mdに従い以下の
 # placeholderを実環境へ合わせます。設定から削除せず、対象がなければ75を返します。
 [[collectors]]
-name = "alp-mark"
+name = "nginx-log-mark"
 phase = "before"
 transport = "ssh"
-command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; test -r /var/log/nginx/access.log || exit 75; stat -c '%i %s' /var/log/nginx/access.log > /tmp/isuscope-{run_id}.alp.offset"]
+command = ["sh", "-c", '''
+set -eu
+log=/var/log/nginx/access.log
+marker=/tmp/isuscope-{run_id}.nginx.marker
+command -v sha256sum >/dev/null 2>&1 || exit 75
+test -r "$log" || exit 75
+offset=$(wc -c < "$log" | tr -d ' ')
+sample=$offset
+test "$sample" -le 65536 || sample=65536
+digest=$(head -c "$sample" "$log" | sha256sum)
+prefix=${digest%% *}
+printf '%s %s %s\n' "$offset" "$sample" "$prefix" > "$marker"
+''']
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "nginx-log-delta"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -eu
+log=/var/log/nginx/access.log
+marker=/tmp/isuscope-{run_id}.nginx.marker
+output=/tmp/isuscope-{run_id}.nginx.log
+temporary=$output.tmp
+trap 'rm -f "$temporary" "$marker"' EXIT
+command -v sha256sum >/dev/null 2>&1 || exit 75
+test -r "$log" || exit 75
+test -r "$marker" || exit 75
+read offset sample prefix < "$marker" || exit 75
+case "$offset:$sample" in *[!0-9:]*|:*|*:) exit 75 ;; esac
+
+stream_file() {
+  case "$1" in
+    *.gz) gzip -cd -- "$1" ;;
+    *) cat -- "$1" ;;
+  esac
+}
+pick_generation() {
+  plain=$log.$1
+  compressed=$plain.gz
+  if test -r "$plain"; then
+    printf '%s\n' "$plain"
+  elif test -r "$compressed" && gzip -t -- "$compressed"; then
+    printf '%s\n' "$compressed"
+  else
+    return 1
+  fi
+}
+matches_marker() {
+  size=$(stream_file "$1" | wc -c | tr -d ' ')
+  test "$size" -ge "$offset" || return 1
+  digest=$(stream_file "$1" | head -c "$sample" | sha256sum)
+  test "${digest%% *}" = "$prefix"
+}
+
+: > "$temporary"
+if matches_marker "$log"; then
+  tail -c +$((offset + 1)) "$log" > "$temporary"
+else
+  origin_generation=0
+  for generation in 1 2 3 4 5; do
+    if candidate=$(pick_generation "$generation") && matches_marker "$candidate"; then
+      origin_generation=$generation
+      origin=$candidate
+      break
+    fi
+  done
+  if test "$origin_generation" -eq 0; then
+    echo 'access log rotated beyond retained generations or failed fingerprint validation' >&2
+    exit 75
+  fi
+  stream_file "$origin" | tail -c +$((offset + 1)) > "$temporary"
+  generation=$((origin_generation - 1))
+  while test "$generation" -ge 1; do
+    candidate=$(pick_generation "$generation") || {
+      echo "access log rotation generation $generation is missing" >&2
+      exit 75
+    }
+    stream_file "$candidate" >> "$temporary"
+    generation=$((generation - 1))
+  done
+  cat "$log" >> "$temporary"
+fi
+mv "$temporary" "$output"
+cat "$output"
+''']
 unavailable_exit_codes = [75]
 
 [[collectors]]
 name = "alp"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 75; log=/var/log/nginx/access.log; marker=/tmp/isuscope-{run_id}.alp.offset; output=/tmp/isuscope-{run_id}.alp.log; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\" > \"$output\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\" > \"$output\"; cat \"$log\" >> \"$output\"; else echo 'access log rotated and original inode was not found' >&2; exit 75; fi; alp ltsv --file \"$output\" --output json; rm -f \"$output\""]
+command = ["sh", "-c", '''
+set -eu
+input=/tmp/isuscope-{run_id}.nginx.log
+result=/tmp/isuscope-{run_id}.alp.json
+trap 'rm -f "$input" "$result"' EXIT
+command -v alp >/dev/null 2>&1 || exit 75
+test -r "$input" || exit 75
+alp ltsv --file "$input" --format json --output count,method,uri,p95 --percentiles 95 > "$result"
+if test -s "$input"; then
+  compact=$(tr -d '[:space:]' < "$result")
+  test "$compact" != '[["count","method","uri","p95"]]' || {
+    echo 'alp parsed no records from a non-empty access-log delta' >&2
+    exit 65
+  }
+fi
+cat "$result"
+''']
 parser = "alp-json"
 unavailable_exit_codes = [75]
 
 # 同じaccess log差分を回収し、local helperが正規化route別の5秒bucketへ変換します。
 [[collectors]]
-name = "nginx-series-read"
-phase = "after"
-transport = "ssh"
-command = ["sh", "-c", "log=/var/log/nginx/access.log; marker=/tmp/isuscope-{run_id}.alp.offset; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\"; cat \"$log\"; else echo 'access log rotated and original inode was not found' >&2; exit 75; fi; rm -f \"$marker\""]
-unavailable_exit_codes = [75]
-
-[[collectors]]
 name = "nginx-series"
 phase = "after"
 transport = "local"
-command = ["isuscope", "__transition", "--series-only", "--run-dir", "{run_dir}", "--prefix", "nginx-series-read-", "--rules", ".isuscope/routes.toml"]
+command = ["isuscope", "__transition", "--series-only", "--run-dir", "{run_dir}", "--prefix", "nginx-log-delta-", "--rules", ".isuscope/routes.toml"]
 timeout_seconds = 30
 
 [[collectors]]
-name = "slp-mark"
+name = "mysql-log-mark"
 phase = "before"
 transport = "ssh"
-command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; test -r /var/log/mysql/mysql-slow.log || exit 75; stat -c '%i %s' /var/log/mysql/mysql-slow.log > /tmp/isuscope-{run_id}.slp.offset"]
+command = ["sh", "-c", '''
+set -eu
+log=/var/log/mysql/mysql-slow.log
+marker=/tmp/isuscope-{run_id}.mysql.marker
+command -v sha256sum >/dev/null 2>&1 || exit 75
+test -r "$log" || exit 75
+offset=$(wc -c < "$log" | tr -d ' ')
+sample=$offset
+test "$sample" -le 65536 || sample=65536
+digest=$(head -c "$sample" "$log" | sha256sum)
+prefix=${digest%% *}
+printf '%s %s %s\n' "$offset" "$sample" "$prefix" > "$marker"
+''']
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "mysql-log-delta"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -eu
+log=/var/log/mysql/mysql-slow.log
+marker=/tmp/isuscope-{run_id}.mysql.marker
+output=/tmp/isuscope-{run_id}.mysql.log
+temporary=$output.tmp
+trap 'rm -f "$temporary" "$marker"' EXIT
+command -v sha256sum >/dev/null 2>&1 || exit 75
+test -r "$log" || exit 75
+test -r "$marker" || exit 75
+read offset sample prefix < "$marker" || exit 75
+case "$offset:$sample" in *[!0-9:]*|:*|*:) exit 75 ;; esac
+
+stream_file() {
+  case "$1" in
+    *.gz) gzip -cd -- "$1" ;;
+    *) cat -- "$1" ;;
+  esac
+}
+pick_generation() {
+  plain=$log.$1
+  compressed=$plain.gz
+  if test -r "$plain"; then
+    printf '%s\n' "$plain"
+  elif test -r "$compressed" && gzip -t -- "$compressed"; then
+    printf '%s\n' "$compressed"
+  else
+    return 1
+  fi
+}
+matches_marker() {
+  size=$(stream_file "$1" | wc -c | tr -d ' ')
+  test "$size" -ge "$offset" || return 1
+  digest=$(stream_file "$1" | head -c "$sample" | sha256sum)
+  test "${digest%% *}" = "$prefix"
+}
+
+: > "$temporary"
+if matches_marker "$log"; then
+  tail -c +$((offset + 1)) "$log" > "$temporary"
+else
+  origin_generation=0
+  for generation in 1 2 3 4 5; do
+    if candidate=$(pick_generation "$generation") && matches_marker "$candidate"; then
+      origin_generation=$generation
+      origin=$candidate
+      break
+    fi
+  done
+  if test "$origin_generation" -eq 0; then
+    echo 'slow log rotated beyond retained generations or failed fingerprint validation' >&2
+    exit 75
+  fi
+  stream_file "$origin" | tail -c +$((offset + 1)) > "$temporary"
+  generation=$((origin_generation - 1))
+  while test "$generation" -ge 1; do
+    candidate=$(pick_generation "$generation") || {
+      echo "slow log rotation generation $generation is missing" >&2
+      exit 75
+    }
+    stream_file "$candidate" >> "$temporary"
+    generation=$((generation - 1))
+  done
+  cat "$log" >> "$temporary"
+fi
+mv "$temporary" "$output"
+cat "$output"
+''']
+parser = "mysql-slow"
 unavailable_exit_codes = [75]
 
 [[collectors]]
 name = "slp"
 phase = "after"
 transport = "ssh"
-command = ["sh", "-c", "command -v slp >/dev/null 2>&1 || exit 75; log=/var/log/mysql/mysql-slow.log; marker=/tmp/isuscope-{run_id}.slp.offset; output=/tmp/isuscope-{run_id}.slp.log; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\" > \"$output\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\" > \"$output\"; cat \"$log\" >> \"$output\"; else echo 'slow log rotated and original inode was not found' >&2; exit 75; fi; slp --format json \"$output\"; rm -f \"$output\""]
-parser = "slp-json"
-unavailable_exit_codes = [75]
-
-# MySQL slow logを5秒bucketのquery数・合計時間へ変換します。slp-markのoffsetを共有します。
-[[collectors]]
-name = "mysql-slow-series"
-phase = "after"
-transport = "ssh"
-command = ["sh", "-c", "log=/var/log/mysql/mysql-slow.log; marker=/tmp/isuscope-{run_id}.slp.offset; test -r \"$log\" || exit 75; test -r \"$marker\" || exit 75; read inode offset < \"$marker\"; current=$(stat -c %i \"$log\"); if [ \"$inode\" = \"$current\" ]; then tail -c +$((offset+1)) \"$log\"; elif [ -r \"$log.1\" ] && [ \"$inode\" = \"$(stat -c %i \"$log.1\")\" ]; then tail -c +$((offset+1)) \"$log.1\"; cat \"$log\"; else echo 'slow log rotated and original inode was not found' >&2; exit 75; fi; rm -f \"$marker\""]
-parser = "mysql-slow"
+command = ["sh", "-c", '''
+set -eu
+input=/tmp/isuscope-{run_id}.mysql.log
+result=/tmp/isuscope-{run_id}.slp.tsv
+trap 'rm -f "$input" "$result"' EXIT
+command -v slp >/dev/null 2>&1 || exit 75
+test -r "$input" || exit 75
+slp my --file "$input" --format tsv --noheaders --output count,query,sum-query-time,p95-query-time --percentiles 95 > "$result"
+if test -s "$input" && ! test -s "$result"; then
+  echo 'slp parsed no records from a non-empty slow-log delta' >&2
+  exit 65
+fi
+cat "$result"
+''']
+parser = "slp-tsv"
 unavailable_exit_codes = [75]

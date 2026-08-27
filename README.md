@@ -308,7 +308,7 @@ perf、alp、slp、sysstatを常設する場合の役割分担、collector構成
 
 collectorの出力はすべて圧縮ログとして保存します。加えて、1行に1つのJSON objectをstdoutへ出力すると、計算済みの値をSQLiteにも記録できます。
 
-標準ツールのnative出力には`parser = "sysstat"`、`parser = "alp-json"`、`parser = "slp-json"`を指定できます。adapterは生ログを残したまま共通metricへ変換し、変換できない出力をcollectorの成功として扱いません。
+標準ツールのnative出力には`parser = "sysstat"`、`parser = "alp-json"`、`parser = "slp-tsv"`を指定できます。`alp-json`はalp 1.0.21のheader付き表形式JSON、`slp-tsv`はslp 0.2.1のheaderなし4列TSVを受け取ります。旧設定向けの`slp-json`も読み込み互換性のため残しています。adapterは生ログを残したまま共通metricへ変換し、変換できない出力をcollectorの成功として扱いません。
 
 ```json
 {"type":"metric","name":"process.cpu_percent","value":34.2,"unit":"percent","labels":{"role":"app"}}

@@ -29,13 +29,13 @@ phase = "after"
 transport = "ssh"
 roles = ["db"]
 modes = ["run", "discovery-run"]
-command = ["slp", "--format", "json", "/tmp/isuscope-{run_id}.slp.log"]
-parser = "slp-json"
+command = ["slp", "my", "--file", "/tmp/isuscope-{run_id}.mysql.log", "--format", "tsv", "--noheaders", "--output", "count,query,sum-query-time,p95-query-time", "--percentiles", "95"]
+parser = "slp-tsv"
 unavailable_exit_codes = [75]
 required = false
 ```
 
-ログ全体を毎回解析するとrun同士を比較できないため、before collectorでinode・offsetまたはDB統計snapshotを保存し、after collectorで差分だけを処理します。perfとsysstatはduring collectorとしてベンチと同時に起動し、isuscopeがベンチ終了時に停止します。sysstatの値は終了後の1秒ではなく、ベンチ中に出力されたsampleから作ります。
+ログ全体を毎回解析するとrun同士を比較できないため、before collectorでoffset・先頭最大64 KiBのSHA-256またはDB統計snapshotを保存し、after collectorで差分だけを処理します。perfとsysstatはduring collectorとしてベンチと同時に起動し、isuscopeがベンチ終了時に停止します。sysstatの値は終了後の1秒ではなく、ベンチ中に出力されたsampleから作ります。
 
 ## bottleneckへ渡すmetric契約
 
@@ -44,7 +44,7 @@ required = false
 | source | metric | 必須label |
 |---|---|---|
 | alp | `http.requests`, `http.request_duration` | `node`, `method`, `route`; durationは`quantile` |
-| slp/pg_stat_statements | `db.query.calls`, `db.query.total_duration` | `node`, `engine`, `digest` |
+| slp/pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration` | `node`, `engine`, `digest` |
 | perf | `cpu.sample_percent` | `node`, `symbol`, `binary` |
 | sysstat | `host.cpu_percent`, `host.disk_util_percent`, `host.disk_await` | `node`; diskは`device` |
 
@@ -67,10 +67,10 @@ ALP adapterと行動遷移helperは同じ`routes.toml`を使います。ALPが�
 
 `host-sampler`は追加packageなしで`/proc`からCPU使用率、使用memory、load averageを1秒間隔で記録します。sysstatが利用できる環境では、CPUとdiskの各`sar` sampleもUTCの観測時刻付きで保存し、従来のrun全体平均もbottleneck判定用に残します。
 
-行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logは`mysql-slow-series`が5秒bucketのquery数と合計実行時間へ変換します。bucket値には`timestamp`があり、`isuscope series`またはSQLiteから参照できます。
+行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logは`mysql-log-delta`が5秒bucketのquery数と合計実行時間へ変換します。bucket値には`timestamp`があり、`isuscope series`またはSQLiteから参照できます。
 
 after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
 
-parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式とMySQL 8.0 slow log形式のfixtureを使用します。公式Ubuntu Docker imageから、Ubuntu 20.04のsysstat 12.2.0、22.04の12.5.2、24.04の12.6.1、およびMySQL 8.0.46の完全な出力も採取して固定しています。fixtureの由来は`tests/fixtures/README.md`に記録します。Dockerでは保証できないperfとhost kernelの互換性、およびalp/slpの実環境versionはTODOで追跡します。
+parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式、MySQL 8.0 slow log、alp 1.0.21の表形式JSON、slp 0.2.1のTSV fixtureを使用します。公式Ubuntu Docker imageから、Ubuntu 20.04のsysstat 12.2.0、22.04の12.5.2、24.04の12.6.1、およびMySQL 8.0.46の完全な出力も採取して固定しています。fixtureの由来は`tests/fixtures/README.md`に記録します。Dockerでは保証できないperfとhost kernelの互換性はTODOで追跡します。
 
-標準log collectorは、計測中に対象fileが`.1`へrenameされた場合、記録したinodeを照合して旧fileのoffset以降と新fileを連結します。既にgzip圧縮されたrotation、複数回rotation、旧inodeを保持しないcopytruncateは`unavailable`となるため、ベンチ起動時のrotationをoffset記録より前に済ませる構成を優先します。
+標準log collectorは開始時のoffsetと先頭最大64 KiBのSHA-256を記録します。終了時は現在のfileと`.1`〜`.5`（各`.gz`も可）からfingerprintが一致する開始時fileを探し、そのoffset以降、中間世代、現在fileを時系列順に連結します。これによりrename、gzip、複数回rotation、copytruncateを同じ方式で扱い、世代欠落やfingerprint不一致は壊れた差分を成功扱いせず`unavailable`にします。

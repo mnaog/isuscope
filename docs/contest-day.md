@@ -144,7 +144,7 @@ role名は自由ですが、collectorの対象選択に使うため、実際の�
 
 ベンチ中のSSH転送、圧縮、ログ解析はスコアへ影響しやすいため避けます。ログ系collectorは開始前にoffsetだけ記録し、終了後に差分を回収・解析する構成を推奨します。perfはベンチと同時にsamplingするため、全runで同じ条件にします。
 
-`before` collectorでベンチ実行の前提になるものには`required = true`を設定します。ログローテーションをベンチ起動コマンドが行う場合は、offset記録より先に同じrotationを済ませ、計測中のinode消失を防ぎます。
+`before` collectorでベンチ実行の前提になるものには`required = true`を設定します。標準log collectorは開始時のoffsetと先頭SHA-256で最大5世代のrotationを追跡しますが、保持世代を越える可能性があるなら、ベンチ起動コマンドによるrotationをoffset記録より先に済ませます。
 
 ### 6.1 benchmark parserを設定する
 

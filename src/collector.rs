@@ -557,6 +557,7 @@ fn parse_standard_output(
         CollectorParser::AlpJson => parse_alp_json(&raw, routes),
         CollectorParser::MysqlSlow => Ok(parse_mysql_slow_series(&raw, interval)),
         CollectorParser::SlpJson => parse_slp_json(&raw),
+        CollectorParser::SlpTsv => parse_slp_tsv(&raw),
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
     }
 }
@@ -654,7 +655,39 @@ fn string(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<Str
 
 fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
     let normalizer = RouteNormalizer::load(routes)?;
-    let records = json_records(raw)?;
+    let value: Value = serde_json::from_str(raw).context("ALP output is not valid JSON")?;
+    let records = match value {
+        Value::Array(values) if values.first().is_some_and(Value::is_array) => {
+            let mut rows = values.into_iter();
+            let header = rows
+                .next()
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("ALP table header must contain strings")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.map(|row| {
+                let values = row.as_array().context("ALP table row must be an array")?;
+                if values.len() != header.len() {
+                    anyhow::bail!(
+                        "ALP table row has {} fields but header has {}",
+                        values.len(),
+                        header.len()
+                    );
+                }
+                Ok(Value::Object(
+                    header.iter().cloned().zip(values.iter().cloned()).collect(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+        }
+        value => json_records(&serde_json::to_string(&value)?)?,
+    };
     let mut routes = BTreeMap::<(String, String), (f64, Option<f64>)>::new();
     for value in &records {
         let Some(object) = value.as_object() else {
@@ -740,6 +773,65 @@ fn parse_slp_json(raw: &str) -> Result<Vec<Metric>> {
     }
     if !records.is_empty() && metrics.is_empty() {
         anyhow::bail!("SLP JSON contained records but no supported calls/duration fields");
+    }
+    Ok(metrics)
+}
+
+fn parse_slp_tsv(raw: &str) -> Result<Vec<Metric>> {
+    let mut metrics = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = line.splitn(4, '\t').collect::<Vec<_>>();
+        if fields.len() != 4 {
+            anyhow::bail!("SLP TSV line {} must contain four fields", index + 1);
+        }
+        let calls = fields[0]
+            .parse::<f64>()
+            .with_context(|| format!("invalid SLP count on line {}", index + 1))?;
+        let total_seconds = fields[2]
+            .parse::<f64>()
+            .with_context(|| format!("invalid SLP total query time on line {}", index + 1))?;
+        let p95_seconds = fields[3]
+            .parse::<f64>()
+            .with_context(|| format!("invalid SLP p95 query time on line {}", index + 1))?;
+        if !calls.is_finite()
+            || calls < 0.0
+            || !total_seconds.is_finite()
+            || total_seconds < 0.0
+            || !p95_seconds.is_finite()
+            || p95_seconds < 0.0
+        {
+            anyhow::bail!("SLP TSV line {} contains an invalid metric", index + 1);
+        }
+        let labels = BTreeMap::from([
+            ("digest".into(), fields[1].to_owned()),
+            ("engine".into(), "mysql".into()),
+        ]);
+        metrics.extend([
+            Metric {
+                name: "db.query.calls".into(),
+                value: calls,
+                unit: "queries".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.total_duration".into(),
+                value: total_seconds * 1_000.0,
+                unit: "ms".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.p95_duration".into(),
+                value: p95_seconds * 1_000.0,
+                unit: "ms".into(),
+                timestamp: None,
+                labels,
+            },
+        ]);
     }
     Ok(metrics)
 }
@@ -1077,6 +1169,52 @@ mod tests {
         );
         assert!(parse_alp_json(r#"[{"url":"/unknown","number":1}]"#, None).is_err());
         assert!(parse_slp_json(r#"[{"sql":"SELECT 1","elapsed":1}]"#).is_err());
+    }
+
+    #[test]
+    fn current_alp_table_json_and_slp_tsv_emit_bottleneck_metrics() {
+        let alp = parse_alp_json(
+            include_str!("../tests/fixtures/alp-json-v1.0.21.json"),
+            None,
+        )
+        .unwrap();
+        assert!(alp.iter().any(|metric| {
+            metric.name == "http.requests"
+                && metric.value == 1.0
+                && metric.labels.get("route").map(String::as_str) == Some("/api/users/1")
+        }));
+        assert!(
+            alp.iter()
+                .any(|metric| { metric.name == "http.request_duration" && metric.value == 200.0 })
+        );
+        assert!(
+            parse_alp_json(
+                include_str!("../tests/fixtures/alp-json-v1.0.21-empty.json"),
+                None,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(parse_alp_json(r#"[["count","uri"],[1]]"#, None).is_err());
+
+        let slp = parse_slp_tsv(include_str!("../tests/fixtures/slp-tsv-v0.2.1.tsv")).unwrap();
+        assert!(slp.iter().any(|metric| {
+            metric.name == "db.query.calls"
+                && metric.value == 3.0
+                && metric.labels.get("digest").map(String::as_str)
+                    == Some("SELECT * FROM users WHERE id = ?")
+        }));
+        assert!(
+            slp.iter().any(|metric| {
+                metric.name == "db.query.total_duration" && metric.value == 800.0
+            })
+        );
+        assert!(
+            slp.iter()
+                .any(|metric| { metric.name == "db.query.p95_duration" && metric.value == 400.0 })
+        );
+        assert!(parse_slp_tsv("").unwrap().is_empty());
+        assert!(parse_slp_tsv("not tsv").is_err());
     }
 
     #[test]

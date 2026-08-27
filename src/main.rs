@@ -501,9 +501,9 @@ fn print_series_coverage(collectors: &[isuscope::model::CollectorResult]) {
     const SERIES_COLLECTORS: [&str; 5] = [
         "host-sampler",
         "sysstat",
-        "nginx-series-read",
+        "nginx-log-delta",
         "nginx-series",
-        "mysql-slow-series",
+        "mysql-log-delta",
     ];
     println!("coverage");
     let relevant = collectors
