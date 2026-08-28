@@ -120,6 +120,91 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert!(show_stdout.contains("compare     sqlite3 "));
     assert!(show_stdout.contains("view    zstd -dc -- "));
 
+    let report = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["report", "latest"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(report.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["run"]["benchmark"]["score"], 12345);
+    assert!(report.get("full").is_none());
+    assert_eq!(report["transitions"]["items"][0]["count"], 7);
+
+    let full = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["report", "latest", "--full"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(full.status.success());
+    let full: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
+    assert_eq!(full["full"]["series_metrics"][0]["name"], "cpu");
+
+    let html_path = project.path().join("report.html");
+    let html = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "report",
+            "latest",
+            "--format",
+            "html",
+            "--output",
+            html_path.to_str().unwrap(),
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(html.status.success());
+    let html = fs::read_to_string(html_path).unwrap();
+    assert!(html.contains("<!doctype html>"));
+    assert!(html.contains("HTTP routes · total time"));
+    assert!(html.contains("Collectors"));
+    assert!(html.contains("id=\"isuscope-report\""));
+
+    let mut ui = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .arg("ui")
+        .current_dir(project.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut connection = (0..50)
+        .find_map(|_| {
+            std::net::TcpStream::connect("127.0.0.1:3000")
+                .ok()
+                .or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                })
+        })
+        .expect("UI did not listen on localhost:3000");
+    std::io::Write::write_all(
+        &mut connection,
+        b"GET /api/report HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("application/json"));
+    assert!(response.contains("\"score\": 12345"));
+    ui.kill().unwrap();
+    ui.wait().unwrap();
+
+    let latest = config_dir.join("latest");
+    assert!(latest.join("run.json").is_file());
+    assert!(latest.join("logs.json").is_file());
+    let readable_logs = fs::read_dir(latest.join("logs")).unwrap().count();
+    assert_eq!(readable_logs, 4);
+    assert!(
+        fs::read_dir(latest.join("logs")).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .unwrap()
+            == "log")
+    );
+
     let runs = config_dir.join("runs");
     let run_dir = fs::read_dir(&runs)
         .unwrap()

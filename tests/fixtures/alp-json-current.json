@@ -1,4 +1,4 @@
 [
-  {"count":12,"method":"GET","uri":"/items/:id","p95":0.125},
-  {"count":3,"method":"POST","uri":"/items","p95":0.250}
+  {"count":12,"method":"GET","uri":"/items/:id","min":0.001,"max":0.500,"sum":0.960,"avg":0.080,"p50":0.050,"p95":0.125,"p99":0.400,"2xx":10,"4xx":1,"5xx":1,"response_bytes":24000},
+  {"count":3,"method":"POST","uri":"/items","min":0.100,"max":0.300,"sum":0.600,"avg":0.200,"p50":0.200,"p95":0.250,"p99":0.290,"2xx":3,"4xx":0,"5xx":0,"response_bytes":1200}
 ]

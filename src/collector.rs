@@ -175,16 +175,19 @@ pub async fn stop_during(running: Vec<RunningCollector>, run_dir: &Path) -> Vec<
     let mut outputs = Vec::new();
     for mut collector in running {
         let already_finished = collector.child.try_wait().ok().flatten();
-        let status = match already_finished {
-            Some(status) => Some(status),
-            None => process::terminate_group(&mut collector.child).await.ok(),
+        let (status, intentionally_stopped) = match already_finished {
+            Some(status) => (Some(status), false),
+            None => (
+                process::terminate_group(&mut collector.child).await.ok(),
+                true,
+            ),
         };
         outputs.push(
             finalize(
                 collector,
                 status.and_then(|value| value.code()),
                 None,
-                true,
+                intentionally_stopped,
                 run_dir,
             )
             .await,
@@ -357,6 +360,13 @@ async fn finalize(
             Err(error) => compression_errors.push(format!("standard output parse failed: {error}")),
         }
     }
+    if error.is_none()
+        && (intentionally_stopped || exit_code == Some(0))
+        && let Err(validation_error) =
+            validate_profile_artifact(&spec.collector.name, &stdout_destination)
+    {
+        compression_errors.push(validation_error.to_string());
+    }
     for metric in &mut metrics {
         normalize_perf_labels(metric);
         metric
@@ -409,6 +419,33 @@ async fn finalize(
         fingerprints,
         transitions,
     }
+}
+
+fn validate_profile_artifact(name: &str, path: &Path) -> Result<()> {
+    if !matches!(name, "perf-flamegraph" | "offcpu") {
+        return Ok(());
+    }
+    let input = fs::File::open(path)?;
+    let mut decoder = zstd::stream::read::Decoder::new(input)?;
+    let mut value = String::new();
+    use std::io::Read;
+    decoder.read_to_string(&mut value)?;
+    if name == "perf-flamegraph" {
+        let trimmed = value.trim();
+        if !trimmed.contains("<svg") || !trimmed.ends_with("</svg>") {
+            anyhow::bail!("perf-flamegraph output is not a complete SVG document");
+        }
+    } else {
+        for line in value.lines().filter(|line| !line.trim().is_empty()) {
+            let Some((stack, count)) = line.rsplit_once(' ') else {
+                anyhow::bail!("offcpu output is not folded stack format");
+            };
+            if stack.is_empty() || count.parse::<u64>().is_err() {
+                anyhow::bail!("offcpu output is not folded stack format");
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn capture_capped<R>(mut reader: R, path: PathBuf, limit: u64) -> Result<bool>
@@ -705,12 +742,18 @@ fn parse_mysql_slow_reader<R: std::io::BufRead>(
     struct Event {
         timestamp: Option<chrono::DateTime<Utc>>,
         duration_ms: Option<f64>,
+        lock_ms: f64,
+        rows_sent: f64,
+        rows_examined: f64,
         query: Vec<String>,
     }
     #[derive(Default)]
     struct Stats {
         calls: u64,
         total_ms: f64,
+        lock_ms: f64,
+        rows_sent: f64,
+        rows_examined: f64,
         durations_ms: Vec<f64>,
     }
     fn flush(
@@ -748,10 +791,16 @@ fn parse_mysql_slow_reader<R: std::io::BufRead>(
             let stats = buckets.entry((bucket, digest.clone())).or_default();
             stats.calls += 1;
             stats.total_ms += duration_ms;
+            stats.lock_ms += event.lock_ms;
+            stats.rows_sent += event.rows_sent;
+            stats.rows_examined += event.rows_examined;
         }
         let stats = aggregate.entry(digest).or_default();
         stats.calls += 1;
         stats.total_ms += duration_ms;
+        stats.lock_ms += event.lock_ms;
+        stats.rows_sent += event.rows_sent;
+        stats.rows_examined += event.rows_examined;
         stats.durations_ms.push(duration_ms);
         *event = Event::default();
     }
@@ -770,11 +819,21 @@ fn parse_mysql_slow_reader<R: std::io::BufRead>(
                 .ok()
                 .map(|value| value.with_timezone(&Utc));
         } else if let Some(rest) = line.strip_prefix("# Query_time: ") {
-            event.duration_ms = rest
-                .split_whitespace()
-                .next()
+            let fields = rest.split_whitespace().collect::<Vec<_>>();
+            event.duration_ms = fields
+                .first()
                 .and_then(|value| value.parse::<f64>().ok())
                 .map(|seconds| seconds * 1_000.0);
+            for pair in fields.windows(2) {
+                match pair[0] {
+                    "Lock_time:" => {
+                        event.lock_ms = pair[1].parse::<f64>().unwrap_or_default() * 1_000.0
+                    }
+                    "Rows_sent:" => event.rows_sent = pair[1].parse().unwrap_or_default(),
+                    "Rows_examined:" => event.rows_examined = pair[1].parse().unwrap_or_default(),
+                    _ => {}
+                }
+            }
         } else if event.duration_ms.is_some() && !line.starts_with("# User@Host:") {
             event.query.push(line.into_owned());
         }
@@ -796,6 +855,27 @@ fn parse_mysql_slow_reader<R: std::io::BufRead>(
                 value: stats.total_ms,
                 unit: "ms".into(),
                 timestamp: Some(timestamp),
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.lock_duration".into(),
+                value: stats.lock_ms,
+                unit: "ms".into(),
+                timestamp: Some(timestamp),
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.rows_sent".into(),
+                value: stats.rows_sent,
+                unit: "rows".into(),
+                timestamp: Some(timestamp),
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.rows_examined".into(),
+                value: stats.rows_examined,
+                unit: "rows".into(),
+                timestamp: Some(timestamp),
                 labels,
             },
         ]);
@@ -816,6 +896,27 @@ fn parse_mysql_slow_reader<R: std::io::BufRead>(
                 name: "db.query.total_duration".into(),
                 value: stats.total_ms,
                 unit: "ms".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.lock_duration".into(),
+                value: stats.lock_ms,
+                unit: "ms".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.rows_sent".into(),
+                value: stats.rows_sent,
+                unit: "rows".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            },
+            Metric {
+                name: "db.query.rows_examined".into(),
+                value: stats.rows_examined,
+                unit: "rows".into(),
                 timestamp: None,
                 labels: labels.clone(),
             },
@@ -988,7 +1089,18 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
         }
         value => json_records(&serde_json::to_string(&value)?)?,
     };
-    let mut routes = BTreeMap::<(String, String), (f64, Option<f64>)>::new();
+    #[derive(Default)]
+    struct HttpStats {
+        count: f64,
+        sum_seconds: Option<f64>,
+        avg_seconds: Option<f64>,
+        min_seconds: Option<f64>,
+        max_seconds: Option<f64>,
+        percentiles: BTreeMap<&'static str, f64>,
+        statuses: BTreeMap<String, f64>,
+        response_bytes: Option<f64>,
+    }
+    let mut routes = BTreeMap::<(String, String), HttpStats>::new();
     for value in &records {
         let Some(object) = value.as_object() else {
             continue;
@@ -999,36 +1111,124 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
         let route = normalizer.normalize(route.split('?').next().unwrap_or(&route));
         let method = string(object, &["method"]).unwrap_or_else(|| "-".into());
         let stats = routes.entry((method, route)).or_default();
-        if let Some(count) = number(object, &["count", "requests"]) {
-            stats.0 += count;
+        stats.count += number(object, &["count", "requests"]).unwrap_or_default();
+        if let Some(value) = number(object, &["sum", "sum_time", "request_time_sum"]) {
+            *stats.sum_seconds.get_or_insert(0.0) += value;
         }
-        if let Some(p95_seconds) = number(object, &["p95", "p95_time", "request_time_p95"]) {
-            stats.1 = Some(
+        stats.avg_seconds =
+            number(object, &["avg", "average", "request_time_avg"]).or(stats.avg_seconds);
+        if let Some(value) = number(object, &["min", "min_time", "request_time_min"]) {
+            stats.min_seconds = Some(
                 stats
-                    .1
-                    .map_or(p95_seconds, |current| current.max(p95_seconds)),
+                    .min_seconds
+                    .map_or(value, |current| current.min(value)),
             );
+        }
+        if let Some(value) = number(object, &["max", "max_time", "request_time_max"]) {
+            stats.max_seconds = Some(
+                stats
+                    .max_seconds
+                    .map_or(value, |current| current.max(value)),
+            );
+        }
+        for (quantile, names) in [
+            ("0.50", &["p50", "p50_time", "request_time_p50"][..]),
+            ("0.95", &["p95", "p95_time", "request_time_p95"][..]),
+            ("0.99", &["p99", "p99_time", "request_time_p99"][..]),
+        ] {
+            if let Some(value) = number(object, names) {
+                stats
+                    .percentiles
+                    .entry(quantile)
+                    .and_modify(|current| *current = current.max(value))
+                    .or_insert(value);
+            }
+        }
+        for class in ["1xx", "2xx", "3xx", "4xx", "5xx"] {
+            if let Some(value) = number(object, &[class]) {
+                *stats.statuses.entry(class.into()).or_default() += value;
+            }
+        }
+        if let Some(value) = number(
+            object,
+            &["response_bytes", "body_bytes_sent", "sum_body_bytes_sent"],
+        ) {
+            *stats.response_bytes.get_or_insert(0.0) += value;
         }
     }
     let mut metrics = Vec::new();
-    for ((method, route), (requests, p95_seconds)) in routes {
+    for ((method, route), stats) in routes {
         let labels = BTreeMap::from([("method".into(), method), ("route".into(), route)]);
-        if requests > 0.0 {
+        if stats.count > 0.0 {
             metrics.push(Metric {
                 name: "http.requests".into(),
-                value: requests,
+                value: stats.count,
                 unit: "requests".into(),
                 timestamp: None,
                 labels: labels.clone(),
             });
         }
-        if let Some(p95_seconds) = p95_seconds {
-            let mut labels = labels;
-            labels.insert("quantile".into(), "0.95".into());
+        for (status_class, value) in &stats.statuses {
+            let mut status_labels = labels.clone();
+            status_labels.insert("status_class".into(), status_class.clone());
+            metrics.push(Metric {
+                name: "http.requests".into(),
+                value: *value,
+                unit: "requests".into(),
+                timestamp: None,
+                labels: status_labels,
+            });
+        }
+        let errors =
+            stats.statuses.get("4xx").unwrap_or(&0.0) + stats.statuses.get("5xx").unwrap_or(&0.0);
+        if !stats.statuses.is_empty() {
+            metrics.push(Metric {
+                name: "http.errors".into(),
+                value: errors,
+                unit: "requests".into(),
+                timestamp: None,
+                labels: labels.clone(),
+            });
+        }
+        for (name, value) in [
+            ("http.request_duration_sum", stats.sum_seconds),
+            (
+                "http.request_duration_mean",
+                stats
+                    .sum_seconds
+                    .filter(|_| stats.count > 0.0)
+                    .map(|sum| sum / stats.count)
+                    .or(stats.avg_seconds),
+            ),
+            ("http.request_duration_min", stats.min_seconds),
+            ("http.request_duration_max", stats.max_seconds),
+        ] {
+            if let Some(seconds) = value {
+                metrics.push(Metric {
+                    name: name.into(),
+                    value: seconds * 1000.0,
+                    unit: "ms".into(),
+                    timestamp: None,
+                    labels: labels.clone(),
+                });
+            }
+        }
+        for (quantile, seconds) in stats.percentiles {
+            let mut quantile_labels = labels.clone();
+            quantile_labels.insert("quantile".into(), quantile.into());
             metrics.push(Metric {
                 name: "http.request_duration".into(),
-                value: p95_seconds * 1000.0,
+                value: seconds * 1000.0,
                 unit: "ms".into(),
+                timestamp: None,
+                labels: quantile_labels,
+            });
+        }
+        if let Some(bytes) = stats.response_bytes {
+            metrics.push(Metric {
+                name: "http.response_bytes".into(),
+                value: bytes,
+                unit: "bytes".into(),
                 timestamp: None,
                 labels,
             });
@@ -1469,7 +1669,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn standard_json_adapters_emit_bottleneck_metrics() {
+    fn profile_artifacts_require_svg_and_folded_shapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let write = |name: &str, value: &str| {
+            let path = directory.path().join(name);
+            let output = fs::File::create(&path).unwrap();
+            let mut encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
+            use std::io::Write;
+            encoder.write_all(value.as_bytes()).unwrap();
+            encoder.finish().unwrap();
+            path
+        };
+        assert!(
+            validate_profile_artifact(
+                "perf-flamegraph",
+                &write("valid-svg.zst", "<svg><g/></svg>")
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_profile_artifact("perf-flamegraph", &write("invalid-svg.zst", "<svg>"))
+                .is_err()
+        );
+        assert!(
+            validate_profile_artifact("offcpu", &write("valid-folded.zst", "app;lock 12\n"))
+                .is_ok()
+        );
+        assert!(
+            validate_profile_artifact("offcpu", &write("invalid-folded.zst", "not-folded"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn standard_json_adapters_emit_common_metrics() {
         let alp = parse_alp_json(
             include_str!("../tests/fixtures/alp-json-current.json"),
             None,
@@ -1482,6 +1715,24 @@ mod tests {
         assert!(
             alp.iter()
                 .any(|metric| metric.name == "http.request_duration" && metric.value == 125.0)
+        );
+        assert!(
+            alp.iter().any(|metric| {
+                metric.name == "http.request_duration_sum" && metric.value == 960.0
+            })
+        );
+        assert!(alp.iter().any(|metric| {
+            metric.name == "http.request_duration"
+                && metric.value == 400.0
+                && metric.labels.get("quantile").map(String::as_str) == Some("0.99")
+        }));
+        assert!(
+            alp.iter()
+                .any(|metric| metric.name == "http.errors" && metric.value == 2.0)
+        );
+        assert!(
+            alp.iter()
+                .any(|metric| { metric.name == "http.response_bytes" && metric.value == 24_000.0 })
         );
 
         let slp = parse_slp_json(include_str!("../tests/fixtures/slp-json-current.json")).unwrap();
@@ -1498,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn current_alp_table_json_and_slp_tsv_emit_bottleneck_metrics() {
+    fn current_alp_table_json_and_slp_tsv_emit_common_metrics() {
         let alp = parse_alp_json(
             include_str!("../tests/fixtures/alp-json-v1.0.21.json"),
             None,
@@ -1513,6 +1764,11 @@ mod tests {
             alp.iter()
                 .any(|metric| { metric.name == "http.request_duration" && metric.value == 200.0 })
         );
+        assert!(alp.iter().any(|metric| {
+            metric.name == "http.errors"
+                && metric.value == 1.0
+                && metric.labels.get("route").map(String::as_str) == Some("/api/users/2")
+        }));
         assert!(
             parse_alp_json(
                 include_str!("../tests/fixtures/alp-json-v1.0.21-empty.json"),
@@ -1684,6 +1940,14 @@ mod tests {
                 metric.name == "db.query.total_duration" && metric.value == 350.0
             })
         );
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "db.query.rows_examined"
+                && metric.value == 2.0
+                && metric.timestamp.is_some()
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "db.query.rows_sent" && metric.value == 2.0 && metric.timestamp.is_some()
+        }));
     }
 
     #[test]
@@ -1736,6 +2000,11 @@ mod tests {
             metrics
                 .iter()
                 .any(|metric| metric.name == "db.query.p95_duration")
+        );
+        assert!(
+            metrics
+                .iter()
+                .any(|metric| metric.name == "db.query.lock_duration" && metric.value > 0.0)
         );
     }
 }

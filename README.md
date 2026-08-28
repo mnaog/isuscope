@@ -9,7 +9,8 @@ isuscope run --hypothesis "変更理由と改善を期待する観測値"
 isuscope analyze latest --verdict supported --analysis "観測結果と判断"
 isuscope discovery-run --hypothesis "ボトルネックがDBからHTTPへ移ったはず"
 isuscope show [latest|RUN_ID]
-isuscope bottleneck [latest|RUN_ID]
+isuscope ui
+isuscope report [latest|RUN_ID]
 isuscope metrics [latest|RUN_ID]
 isuscope series [latest|RUN_ID]
 ```
@@ -58,7 +59,7 @@ isuscope init
 5. alpのaccess log path・format、slpのslow log path・format、perfの`sudo -n`権限を確認する。
 6. `bash -n .isuscope/benchmark.sh`、`bash -n .isuscope/setup.sh`、`isuscope show`で副作用なしの検査をする。
 7. 不足する環境変更だけを`setup.sh`へ記述し、`.isuscope/setup.sh`を実行する。
-8. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`、`isuscope show latest`、`isuscope bottleneck latest`の順に実行し、collector状態、metric、coverageを確認する。
+8. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`、`isuscope report latest`の順に実行し、必要な時間帯だけ`isuscope series latest`で掘り下げる。
 
 最低限編集するのは`benchmark.sh`、`config.toml`の`[ssh]`、`[[nodes]]`です。標準ツールの自動installやsudoers変更は行いません。必要な場合だけ、利用者が`setup.sh`の`apply_environment`へ冪等な処理を追加します。
 
@@ -152,18 +153,29 @@ run詳細には、SQLiteへ保存されたcollectorごとの`complete` / `unavai
 
 SQLiteはrunごとに独立しておらず、1つの`data_dir`につき1ファイルを全runで共有します。各tableの`run_id`でrunを区別するため、commit、score、同じmetric・labelなどをJOINしてrun間比較できます。run配下の`run.json`と圧縮ログはrunごとに独立した正本で、SQLiteはそれらを横断する索引です。
 
-`show`の末尾にはSQLiteファイルの絶対パスと、そのままコピーして実行できる`sqlite3`のquery例を表示します。一覧ではrun履歴、run詳細ではそのrunのmetric全行を確認するqueryになり、さらに同じmetricをrun横断で並べる比較queryも表示します。通常は`show`と`bottleneck`を使い、独自の比較やlabel単位の調査が必要な場合だけquery例を入口にSQLiteを直接参照します。
+`report`は指定runのmanifest、カテゴリ別coverageと欠測metric、HTTP、database、CPU、host、profile artifact、transition、run正本logの場所をcompactな単一JSONへ出力します。各sectionは上位20件、全件数、打ち切り有無を返します。HTTP表にはcount、total/avg/min/p50/p95/p99/max、error数・率、status class別count、取得できる場合はresponse bytesを保持し、total時間順に並べます。DBはtotal時間、CPUはsample比率、hostはaverage/peakと発生時刻を保持します。異なる指標を一つの推測scoreへ潰しません。
 
-runのHTTP、database、CPU、hostメトリクスから、ボトルネック候補を上位5件表示します。
+全summary metricと時刻付きmetricが必要な場合だけ`--full`を付けます。
 
 ```console
-isuscope bottleneck
-isuscope bottleneck 8c9f021a
+isuscope report latest --full
 ```
 
-HTTP、database、CPU、host saturationのカテゴリごとに候補を作り、観測できた各カテゴリの首位を残してから、カテゴリ内で正規化した深刻度で最大5件を表示します。異なる単位の生値は加算しません。表示番号はカテゴリ横断の改善優先順位ではありません。各候補には根拠、source、改善後に確認するmetricと`strength`を表示します。`summary-only`はrun全体の集約値だけ、`direct`は同じ対象の時系列も取得済み、`corroborated`は同じnode・5秒bucketでhost高負荷も観測したことを表します。相関は因果の証明ではありません。
+同じReport modelから、server不要の人間向けHTMLも生成できます。
 
-coverageにはカテゴリの有無だけでなく、関連collectorごとのnode、`complete` / `unavailable` / `failed`とerrorも表示します。集約値は候補の順位、時刻付きmetricは裏付けに役割を分離しており、同じアクセスログ由来のALP集約と5秒seriesを二重加算しません。
+```console
+isuscope report latest --format html --output .isuscope/latest/report.html
+```
+
+最新runをブラウザで確認する場合は、オプションなしでlocalhost専用UIを起動します。`http://127.0.0.1:3000`を開き、終了するときはCtrl-Cを押します。外部interfaceへはbindしません。
+
+```console
+isuscope ui
+```
+
+SQLite、Report生成、CLI JSON、静的HTML、将来のlocalhost UIの責務分担は[ReportとUIのアーキテクチャ](docs/report-architecture.md)にまとめています。
+
+`show`の末尾にはSQLiteファイルの絶対パスと、そのままコピーして実行できる`sqlite3`のquery例を表示します。一覧ではrun履歴、run詳細ではそのrunのmetric全行を確認するqueryになり、さらに同じmetricをrun横断で並べる比較queryも表示します。独自の比較やlabel単位の調査が必要な場合だけquery例を入口にSQLiteを直接参照します。
 
 ## Benchmark parserと後処理
 
@@ -222,7 +234,7 @@ initializeの開始・終了を取得できる場合は、任意のevent行も�
 ├── config.toml
 └── data/
     ├── isuscope.sqlite3
-    └── runs/
+    ├── runs/
         └── <run-id>/
             ├── run.json
             ├── source/
@@ -244,9 +256,13 @@ initializeの開始・終了を取得できる場合は、任意のevent行も�
                 ├── benchmark-stdout.zst
                 ├── benchmark-stderr.zst
                 └── <collector-log-id>.zst
+    └── latest/
+        ├── run.json
+        ├── logs.json
+        └── logs/<log-id>.log
 ```
 
-SQLiteにはrunのメタデータ、仮説、分析状態、追記式の分析履歴、Codex context参照、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログとCodex会話の本文はSQLiteへ入れません。`structured.json.zst`にはSQLiteへ入れたmetric、fingerprint、transitionの正規化済み行を圧縮保存します。
+SQLiteにはrunのメタデータ、仮説、分析状態、追記式の分析履歴、Codex context参照、note/tag、スコア、数値メトリクス、行動遷移の集計、log IDを保存します。生ログとCodex会話の本文はSQLiteへ入れません。`structured.json.zst`にはSQLiteへ入れたmetric、fingerprint、transitionの正規化済み行を圧縮保存します。完成済みrunは従来どおり圧縮した正本を保持し、直近runだけは`latest/logs/`へ自動展開するため、`zstd`なしですぐ読めます。次のrunが完成すると内容は置き換わります。
 
 `tooling/`には実際に使った設定、route規則、setup状態、isuscope versionをrunごとに保存します。各ファイルのSHA-256も`run.json`へ入るため、計測構成の違いを後から判別できます。
 
@@ -322,7 +338,7 @@ collectorの失敗は記録しますが、ベンチは停止しません。例�
 
 標準観測collectorのように「毎回試すが、そのrunでは対象が存在しない」ものは、終了コード`75`で終了してください。isuscopeはこれを失敗ではなく`unavailable`として記録します。たとえばMySQLを退役してPostgreSQLへ移行した後は、MySQL slow log collectorが`75`を返せばrunをdegradedにせず、観測対象が消えた事実を履歴へ残せます。終了コードはcollectorごとの`unavailable_exit_codes = [75]`で変更できます。
 
-perf、alp、slp、sysstatを常設する場合の役割分担、collector構成、ツールやDBが消えた場合の扱い、およびbottleneckランキングへ渡すmetric契約は[標準観測スタックの設計](docs/standard-observability.md)にまとめています。
+perf、alp、slp、sysstatを常設する場合の役割分担、collector構成、ツールやDBが消えた場合の扱い、および共通metric契約は[標準観測スタックの設計](docs/standard-observability.md)にまとめています。
 
 `isuscope init`が生成するconfigにはsysstat、perf、alp、slpの標準collectorが最初から含まれます。roleを空にして全nodeを対象にし、両方のrun modeで同じ観測を試みます。ツール、権限、対象ログがなければ終了コード75で`unavailable`になります。alpとslpのログpath・formatだけは問題環境に合わせてください。
 
@@ -382,6 +398,21 @@ discovery用テンプレートから呼び出す、非公開のcollector helper�
 [`examples/routes-isupipe.toml`](examples/routes-isupipe.toml)は、ISUCON13用のroute正規化規則です。ISUCONプロジェクトの`.isuscope/routes.toml`へコピーします。[`examples/config.toml`](examples/config.toml)には、このhelperを呼び出す`after` collectorも含まれています。
 
 session cookieが発行される前のrequestは、同一ユーザーとして関連付けできないため集計から除外します。ベンチ中のSSH転送を避けるには、開始前にaccess logのbyte offsetを記録し、終了後に差分だけ回収する[`examples/config.toml`](examples/config.toml)の構成を使用します。
+
+### discovery-runのHTTP body capture
+
+最初の`discovery-run`で通常HTTPの入力値と出力値を後から調査する場合は、内蔵capture proxyを`during` collectorとして起動できます。benchmarkの接続先をproxy（次の例では`127.0.0.1:18080`）へ向け、proxyから実際のHTTP applicationへ転送します。proxyはrequestとresponseを対応付けたJSON Linesをstdoutへ出し、collectorがrunの正本logとしてzstd圧縮保存します。SSE、WebSocket、HTTPS upstreamには対応しません。
+
+```toml
+[[collectors]]
+name = "discovery-http"
+phase = "during"
+transport = "local"
+modes = ["discovery-run"]
+command = ["isuscope", "__discovery-capture", "--listen", "127.0.0.1:18080", "--upstream", "http://127.0.0.1:8080", "--max-body-bytes", "1048576", "--session-cookie", "session"]
+```
+
+起動前に`ISUSCOPE_DISCOVERY_SESSION_KEY`へrun内だけで使う秘密値を設定します。各eventには時刻、request ID、method、path、query、status、所要時間、request/responseのcontent type・byte数・SHA-256・bodyを含めます。JSONはJSON valueのまま、form/textは文字列として保持します。設定したsession Cookieは生値を保存せず、HMAC-SHA-256へ変換します。1 MiBを超えるbodyとJSON/form/text以外はbody本体を省略しますが、byte数、hash、content type、省略理由は残します。captureは観測用proxyでありHTTP responseをbufferするため、通常runや最終scoreの計測には使いません。
 
 ベンチ出力は常に`benchmark-stdout.zst`と`benchmark-stderr.zst`へ保存します。大量出力による端末のノイズと計測への影響を避けるため、既定では端末へ転送しません。実行中にも全行を見たい場合は`[benchmark]`へ`stream_output = true`を追加します。
 

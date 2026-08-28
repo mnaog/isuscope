@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use isuscope::{
-    bottleneck,
     config::LoadedConfig,
     doctor, enrichment, init,
     model::{AnalysisVerdict, RunMode},
@@ -10,6 +9,7 @@ use isuscope::{
     storage::{RunSummary, Store},
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
@@ -44,11 +44,22 @@ enum Commands {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
         run: Option<String>,
     },
-    /// 指定したrunでカテゴリ別のボトルネック候補を最大5件表示します。
-    Bottleneck {
+    /// 最新runの人間向けUIをlocalhostで起動します。
+    Ui,
+    /// 1回のrunのmanifest、collector状態、metric、transitionをJSONで出力します。
+    Report {
         /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
         #[arg(default_value = "latest")]
         run: String,
+        /// 出力形式。
+        #[arg(long, value_enum, default_value = "json")]
+        format: ReportFormat,
+        /// 出力先。省略時は標準出力へ書きます。
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// 全summary metricと時刻付きmetricを含めます。
+        #[arg(long)]
+        full: bool,
     },
     /// metric名、時刻範囲、label cardinalityを一覧表示します。
     Metrics {
@@ -155,6 +166,20 @@ enum Commands {
         #[arg(long)]
         series_only: bool,
     },
+    /// discovery-run用のHTTP入出力capture proxyです。
+    #[command(name = "__discovery-capture", hide = true)]
+    InternalDiscoveryCapture {
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        upstream: String,
+        #[arg(long, default_value_t = 1_048_576)]
+        max_body_bytes: usize,
+        #[arg(long)]
+        session_cookie: Option<String>,
+        #[arg(long, env = "ISUSCOPE_DISCOVERY_SESSION_KEY", hide_env_values = true)]
+        session_key: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -211,6 +236,24 @@ async fn main() -> ExitCode {
 
 async fn real_main() -> Result<bool> {
     let cli = Cli::parse();
+    if let Commands::InternalDiscoveryCapture {
+        listen,
+        upstream,
+        max_body_bytes,
+        session_cookie,
+        session_key,
+    } = &cli.command
+    {
+        isuscope::discovery_capture::serve(isuscope::discovery_capture::CaptureOptions {
+            listen: *listen,
+            upstream: upstream.clone(),
+            max_body_bytes: *max_body_bytes,
+            session_cookie: session_cookie.clone(),
+            session_key: session_key.as_bytes().to_vec(),
+        })
+        .await?;
+        return Ok(true);
+    }
     if let Commands::InternalTransition {
         run_dir,
         prefix,
@@ -252,6 +295,9 @@ async fn real_main() -> Result<bool> {
     let config = LoadedConfig::discover(&current)?;
     match cli.command {
         Commands::Init => unreachable!(),
+        Commands::InternalDiscoveryCapture { .. } | Commands::InternalTransition { .. } => {
+            unreachable!()
+        }
         Commands::Run { annotations } => {
             Ok(
                 runner::execute(config, RunMode::Run, Shutdown::listen(), annotations.into())
@@ -279,8 +325,17 @@ async fn real_main() -> Result<bool> {
             show(&config, run.as_deref())?;
             Ok(true)
         }
-        Commands::Bottleneck { run } => {
-            show_bottlenecks(&config, &run)?;
+        Commands::Ui => {
+            isuscope::ui::serve(config, Shutdown::listen()).await?;
+            Ok(true)
+        }
+        Commands::Report {
+            run,
+            format,
+            output,
+            full,
+        } => {
+            show_report(&config, &run, format, output.as_deref(), full)?;
             Ok(true)
         }
         Commands::Metrics { run } => {
@@ -411,7 +466,6 @@ async fn real_main() -> Result<bool> {
             println!("revisions {}", manifest.analyses.len());
             Ok(true)
         }
-        Commands::InternalTransition { .. } => unreachable!(),
     }
 }
 
@@ -863,52 +917,6 @@ fn sum_or_missing(value: f64, p95: &[f64], errors: f64) -> String {
     }
 }
 
-fn show_bottlenecks(config: &LoadedConfig, requested: &str) -> Result<()> {
-    let store = Store::open(&config.data_dir)?;
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run `{requested}` was not found"))?;
-    let manifest = store.load(&id)?;
-    let report = bottleneck::rank(&store.metrics(&id)?, &manifest.collectors);
-    println!("run {id}");
-    println!("candidates: one leader per observed category, then category-local severity");
-    println!("note: numbers are not a cross-category remediation priority");
-    if report.candidates.is_empty() {
-        println!("no supported metrics were collected");
-    }
-    println!(
-        "{:<4}  {:<10}  {:<12}  {:<32}  {:<38}  {:<20}",
-        "NO.", "CATEGORY", "NODE", "TARGET", "EVIDENCE", "SOURCE"
-    );
-    for (index, item) in report.candidates.iter().enumerate() {
-        println!(
-            "{:<4}  {:<10}  {:<12}  {:<32}  {:<38}  {:<20}",
-            index + 1,
-            item.category,
-            item.node,
-            item.target,
-            item.evidence,
-            item.source
-        );
-        println!("      verify: {}", item.verify_metric);
-        println!("      strength: {}", item.strength);
-    }
-    println!("coverage");
-    for coverage in report.coverage {
-        println!(
-            "  {:<10} {:<11} {}",
-            coverage.category,
-            if coverage.available {
-                "complete"
-            } else {
-                "unavailable"
-            },
-            coverage.detail
-        );
-    }
-    Ok(())
-}
-
 fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     let Some(requested) = requested else {
@@ -1020,6 +1028,45 @@ fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
         runner::run_path(store.data_dir(), &id).display()
     );
     print_sqlite_hint(&store, Some(&id));
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ReportFormat {
+    Json,
+    Html,
+}
+
+fn show_report(
+    config: &LoadedConfig,
+    requested: &str,
+    format: ReportFormat,
+    output: Option<&std::path::Path>,
+    full: bool,
+) -> Result<()> {
+    let store = Store::open(&config.data_dir)?;
+    let id = store
+        .resolve_id(requested)?
+        .with_context(|| format!("run `{requested}` was not found"))?;
+    let latest_logs = (store.resolve_id("latest")?.as_deref() == Some(id.as_str()))
+        .then(|| config.data_dir.join("latest/logs"));
+    let report = isuscope::report::build(
+        store.load(&id)?,
+        store.metrics(&id)?,
+        store.transitions(&id)?,
+        store.final_dir(&id).join("logs"),
+        latest_logs,
+        full,
+    );
+    let mut writer: Box<dyn std::io::Write> = match output {
+        Some(path) => Box::new(fs::File::create(path)?),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    match format {
+        ReportFormat::Json => isuscope::report::write_json(&report, &mut writer)?,
+        ReportFormat::Html => isuscope::report::write_html(&report, &mut writer)?,
+    }
+    writeln!(writer)?;
     Ok(())
 }
 
