@@ -26,6 +26,9 @@ isuscope series [latest|RUN_ID]
 
 ## インストール
 
+ソースからのbuild・installにはRust 1.88以降が必要です。大会当日は事前に作成した
+release bundleのbinaryを利用するため、競技環境へRust toolchainを導入する必要はありません。
+
 ```console
 cargo install --path .
 ```
@@ -239,6 +242,7 @@ initializeの開始・終了を取得できる場合は、任意のevent行も�
             ├── structured.json.zst
             └── logs/
                 ├── benchmark-stdout.zst
+                ├── benchmark-stderr.zst
                 └── <collector-log-id>.zst
 ```
 

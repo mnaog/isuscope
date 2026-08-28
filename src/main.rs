@@ -41,7 +41,7 @@ enum Commands {
     },
     /// run一覧、または指定したrunの詳細を表示します。
     Show {
-        /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
         run: Option<String>,
     },
     /// 指定したrunでカテゴリ別のボトルネック候補を最大5件表示します。
@@ -481,7 +481,7 @@ fn show_metrics(config: &LoadedConfig, requested: &str) -> Result<()> {
             entry.labels.entry(key).or_default().insert(value);
         }
     }
-    println!("run {}", id);
+    println!("run {id}");
     println!(
         "{:<34} {:>8} {:>8}  {:<16}  {:<20}",
         "NAME", "ROWS", "TIMED", "UNIT", "TIME RANGE"
@@ -589,7 +589,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             rows.entry((node.clone(), bucket)).or_default();
         }
     }
-    println!("run {}", id);
+    println!("run {id}");
     println!("benchmark {} .. {}", start.to_rfc3339(), end.to_rfc3339());
     print_series_coverage(&manifest.collectors);
     println!(
@@ -870,7 +870,7 @@ fn show_bottlenecks(config: &LoadedConfig, requested: &str) -> Result<()> {
         .with_context(|| format!("run `{requested}` was not found"))?;
     let manifest = store.load(&id)?;
     let report = bottleneck::rank(&store.metrics(&id)?, &manifest.collectors);
-    println!("run {}", id);
+    println!("run {id}");
     println!("candidates: one leader per observed category, then category-local severity");
     println!("note: numbers are not a cross-category remediation priority");
     if report.candidates.is_empty() {
@@ -1093,10 +1093,7 @@ fn print_metric_overview(metrics: &[isuscope::model::Metric]) {
         "NAME", "ROWS", "MIN", "MAX"
     );
     for ((name, unit), (rows, min, max)) in series {
-        println!(
-            "  {:<34} {:>6}  {:>12.2}  {:>12.2}  {}",
-            name, rows, min, max, unit
-        );
+        println!("  {name:<34} {rows:>6}  {min:>12.2}  {max:>12.2}  {unit}");
     }
 }
 
