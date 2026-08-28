@@ -2,7 +2,7 @@
 name = "isuscope"
 version = "0.8.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Run recorder and discovery harness for ISUCON"
 authors = ["Naohiro Matsuda"]
 license = "MIT"

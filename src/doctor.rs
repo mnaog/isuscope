@@ -381,6 +381,10 @@ async fn check_sudo(config: &LoadedConfig, target: &str, report: &mut DoctorRepo
 #[cfg(unix)]
 fn free_bytes(path: &Path) -> Result<u64> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    fn widen<T: Into<u64>>(value: T) -> u64 {
+        value.into()
+    }
+
     let path = CString::new(path.as_os_str().as_bytes()).context("data path contains NUL")?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: path is a valid NUL-terminated string and stats points to writable memory.
@@ -390,5 +394,6 @@ fn free_bytes(path: &Path) -> Result<u64> {
     }
     // SAFETY: statvfs initialized stats after returning success.
     let stats = unsafe { stats.assume_init() };
-    Ok(u64::from(stats.f_bavail).saturating_mul(stats.f_frsize))
+    // statvfs field widths vary across Unix targets.
+    Ok(widen(stats.f_bavail).saturating_mul(widen(stats.f_frsize)))
 }

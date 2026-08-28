@@ -143,23 +143,24 @@ fn http(metrics: &[Metric], out: &mut BTreeMap<&'static str, Vec<Bottleneck>>) {
         }
     }
     for ((node, method, route), (collector, s)) in stats {
-        if let Some(p95) = s.p95 {
-            if s.requests > 0.0 && valid(p95) {
-                out.entry("http").or_default().push(Bottleneck {
-                    category: "http",
-                    node,
-                    target: format!("{method} {route}"),
-                    evidence: format!(
-                        "requests={:.0} p95={p95:.2}ms impact={:.2}ms",
-                        s.requests,
-                        s.requests * p95
-                    ),
-                    source: source_name("http", &collector),
-                    severity: s.requests * p95,
-                    verify_metric: "http.request_duration{quantile=0.95}",
-                    strength: "summary-only",
-                });
-            }
+        if let Some(p95) = s.p95
+            && s.requests > 0.0
+            && valid(p95)
+        {
+            out.entry("http").or_default().push(Bottleneck {
+                category: "http",
+                node,
+                target: format!("{method} {route}"),
+                evidence: format!(
+                    "requests={:.0} p95={p95:.2}ms impact={:.2}ms",
+                    s.requests,
+                    s.requests * p95
+                ),
+                source: source_name("http", &collector),
+                severity: s.requests * p95,
+                verify_metric: "http.request_duration{quantile=0.95}",
+                strength: "summary-only",
+            });
         }
     }
 }
@@ -315,7 +316,7 @@ fn host(metrics: &[Metric], out: &mut BTreeMap<&'static str, Vec<Bottleneck>>) {
                 category: "host",
                 node,
                 target,
-                evidence: format!("{}={:.2}{}", metric, observed, unit),
+                evidence: format!("{metric}={observed:.2}{unit}"),
                 source: source_name("host", &collector),
                 severity: weight,
                 verify_metric: match verify.as_str() {
