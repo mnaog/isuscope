@@ -276,6 +276,11 @@ impl Store {
             )?;
         }
         transaction.commit()?;
+        if let Err(error) = refresh_latest_view(&self.data_dir, &final_dir, manifest) {
+            eprintln!(
+                "! run was saved, but the latest log cache could not be refreshed: {error:#}"
+            );
+        }
         Ok(final_dir)
     }
 
@@ -394,6 +399,22 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    pub fn transitions(&self, id: &str) -> Result<Vec<Transition>> {
+        let mut statement = self.connection.prepare(
+            "SELECT from_route, to_route, count, p50_ms, p95_ms FROM transitions WHERE run_id=?1 ORDER BY count DESC, from_route, to_route",
+        )?;
+        let rows = statement.query_map([id], |row| {
+            Ok(Transition {
+                from_route: row.get(0)?,
+                to_route: row.get(1)?,
+                count: row.get(2)?,
+                p50_ms: row.get(3)?,
+                p95_ms: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -834,6 +855,43 @@ impl Store {
 
 fn structured_snapshot_path(run_dir: &Path) -> PathBuf {
     run_dir.join("structured.json.zst")
+}
+
+fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) -> Result<()> {
+    let temporary = data_dir.join(".latest.tmp");
+    if temporary.exists() {
+        fs::remove_dir_all(&temporary)?;
+    }
+    let logs_dir = temporary.join("logs");
+    fs::create_dir_all(&logs_dir)?;
+    fs::copy(run_dir.join("run.json"), temporary.join("run.json"))?;
+
+    for log in &manifest.logs {
+        let source = run_dir.join("logs").join(format!("{}.zst", log.id));
+        if !source.is_file() {
+            continue;
+        }
+        let input = fs::File::open(&source)?;
+        let mut decoder = zstd::stream::read::Decoder::new(input)?;
+        let extension = match log.kind.as_str() {
+            kind if kind.contains("perf-flamegraph") && kind.ends_with(":stdout") => "svg",
+            kind if kind.contains("offcpu") && kind.ends_with(":stdout") => "folded",
+            _ => "log",
+        };
+        let mut output = fs::File::create(logs_dir.join(format!("{}.{}", log.id, extension)))?;
+        std::io::copy(&mut decoder, &mut output)?;
+    }
+    fs::write(
+        temporary.join("logs.json"),
+        serde_json::to_vec_pretty(&manifest.logs)?,
+    )?;
+
+    let latest = data_dir.join("latest");
+    if latest.exists() {
+        fs::remove_dir_all(&latest)?;
+    }
+    fs::rename(&temporary, &latest)?;
+    Ok(())
 }
 
 fn write_structured_snapshot(

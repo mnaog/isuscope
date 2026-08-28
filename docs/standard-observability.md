@@ -2,7 +2,7 @@
 
 ## 結論
 
-perf、alp、slp、sysstatは「必要になってから有効化する追加機能」ではなく、`run`と`discovery-run`の全runで起動を試みる標準collectorとして設定します。一方、ツール、ログ、service、DB engineが存在することは前提にしません。各collectorは開始時に観測可能性を判定し、存在しなければ終了コード75で終了します。`discovery-run`だけが追加するのは、cookieなどの匿名識別子を利用したリクエスト間の行動遷移分析です。
+perf、alp、slp、sysstatは「必要になってから有効化する追加機能」ではなく、`run`と`discovery-run`の全runで起動を試みる標準collectorとして設定します。一方、ツール、ログ、service、DB engineが存在することは前提にしません。各collectorは開始時に観測可能性を判定し、存在しなければ終了コード75で終了します。`discovery-run`だけが追加するのは、cookieなどの匿名識別子を利用したリクエスト間の行動遷移分析と、最初の走行で必要な場合だけ有効化する通常HTTPのrequest/response body captureです。
 
 `edge`、`app`、`db`はマシンを固定的に分類する型ではなく、collectorの配置先を選ぶための任意のtagです。1台が複数tagを持ってよく、構成変更後のrunではtagを変更して構いません。実際に使用した設定はrunのtooling snapshotへ残るため、過去runの意味は変わりません。標準設定は複数roleの兼務を前提にし、DBの有無もcollector自身が実行時に判定します。
 
@@ -37,30 +37,26 @@ required = false
 
 ログ全体を毎回解析するとrun同士を比較できないため、before collectorでoffset・先頭最大64 KiBのSHA-256またはDB統計snapshotを保存し、after collectorで差分だけを処理します。perfはbeforeでSSHからdetachしてPIDを保存し、afterでSIGINT、process終了、非空`perf.data`の順に確認してからreportとseriesを作ります。これによりduring collectorのprocess group終了に巻き込まれて未flushになることを防ぎます。sysstatの値は終了後の1秒ではなく、ベンチ中に出力されたsampleから作ります。
 
-## bottleneckへ渡すmetric契約
+## 共通metric契約
 
 ツール固有の生出力は圧縮ログとして保存し、それとは別に次の共通metricへ変換します。
 
 | source | metric | 必須label |
 |---|---|---|
-| alp | `http.requests`, `http.request_duration` | `node`, `method`, `route`; durationは`quantile` |
-| slp/pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration` | `node`, `engine`, `digest` |
+| alp | `http.requests`, `http.errors`, `http.request_duration_sum`, `http.request_duration_mean`, `http.request_duration_min`, `http.request_duration`, `http.request_duration_max`, `http.response_bytes` | `node`, `method`, `route`; status別requestsは`status_class`、percentileは`quantile` |
+| slp/pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration`, `db.query.lock_duration`, `db.query.rows_sent`, `db.query.rows_examined` | `node`, `engine`, `digest` |
 | perf | `cpu.sample_percent`, `cpu.sample_count` | `node`, `process`, `symbol`, `binary` |
 | sysstat | `host.cpu_percent`, `host.disk_util_percent`, `host.disk_await` | `node`; diskは`device` |
 
-候補は単一の数式に混ぜません。HTTP、DB、CPU、host saturationの各カテゴリで候補を作り、根拠となる値とsourceを表示します。HTTPの`requests × p95`はendpoint内の順位には使えますが、CPU sampleやdisk awaitと直接比較できるスコアではありません。最大5件の表示では、まず観測できた各カテゴリの首位を1件ずつ残し、残枠をカテゴリ内の正規化値が高い候補で埋めます。表示番号はカテゴリ横断の改善優先順位を意味しません。
+`isuscope init`が生成するconfigにはsysstat、perf、alp、slp、optionalなFlame Graph/off-CPU collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`discovery-run`の両方で実行します。sysstat、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfは`perf record -g`でcall graphを採取し、`stackcollapse-perf.pl`と`flamegraph.pl`があればSVGを生成して完全なSVG documentか検証します。`offcputime-bpfcc`と権限があればduring phaseでfolded off-CPU stackを生成し、各非空行のstack/count形式を検証します。ツールやkernel capabilityがなければ終了コード75の`unavailable`であり、runをdegradedにしません。各ツールの生出力も圧縮保存され、直近runのSVG/folded stackは`latest/logs`へ直接展開されます。
 
-候補生成には`timestamp`のないrun集約だけを使い、5秒seriesを加算しません。同じ対象の時系列があれば`strength=direct`、さらに同じnode・bucketでCPU/disk高負荷があれば`corroborated`、なければ`summary-only`です。これは調査根拠の強さであって、相関から原因を断定するものではありません。coverageには関連collectorのnode、status、errorを併記し、metricがない理由を「未設定」「unavailable」「failed」から切り分けます。
+ALP adapterと行動遷移helperは同じ`routes.toml`を使います。標準設定は各正規表現をALP 1.0.21の`--matching-groups`へ解析前に渡すため、正規化route単位のcount、status class、min/max/sum/avg、p50/p95/p99をALP自身が集計します。adapterはこれらを単位付きmetricへ変換し、`report`はrouteごとのHTTP表としてtotal時間順に返します。ALPの区切り文字と衝突するcommaをpatternへ含められず、置換後routeを一意に戻すため`replace`の`$1`などのcaptureも使用できません。該当routeは1規則ずつに分割し、固定のcanonical routeへ置換します。制約違反はcollector実行前に設定エラーとして拒否します。
 
-`isuscope init`が生成するconfigにはsysstat、perf、alp、slp collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`discovery-run`の両方で実行します。sysstat、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfはrun集約のreportと5秒ごとのsymbol seriesの両方を生成します。alpとslpはログpathとformatが環境依存なので、生成された安全な既定値を実環境へ合わせます。各ツールの生出力も圧縮保存されます。
-
-ALP adapterと行動遷移helperは同じ`routes.toml`を使います。標準設定は各正規表現をALP 1.0.21の`--matching-groups`へ解析前に渡すため、正規化route単位の正確なp95をALP自身が計算します。ALPの区切り文字と衝突するcommaをpatternへ含められず、置換後routeを一意に戻すため`replace`の`$1`などのcaptureも使用できません。該当routeは1規則ずつに分割し、固定のcanonical routeへ置換します。制約違反はcollector実行前に設定エラーとして拒否します。
-
-`isuscope bottleneck`は上記の共通metricが存在するカテゴリを横断して候補を生成します。実環境では最初にlog path・formatを確定し、`isuscope metrics`でmetric/label一覧、`isuscope series`で該当時間帯、`bottleneck`で次の調査候補という順に確認します。
+実環境では最初にlog path・formatを確定し、`isuscope report`の統合JSONでrun全体を確認してから、`isuscope metrics`と`isuscope series`で対象とするmetricと時間帯を絞り込みます。
 
 ## 時系列
 
-`host-sampler`は追加packageなしで`/proc`からCPU使用率、使用memory、load averageを1秒間隔で記録します。sysstatが利用できる環境では、CPUとdiskの各`sar` sampleもUTCの観測時刻付きで保存し、従来のrun全体平均もbottleneck判定用に残します。
+`host-sampler`は追加packageなしで`/proc`からCPU使用率、使用memory、load averageを1秒間隔で記録します。sysstatが利用できる環境では、CPUとdiskの各`sar` sampleもUTCの観測時刻付きで保存し、run全体平均も比較用に残します。
 
 行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logはSQL literalを`?`へ正規化したdigestごとに、run集約のquery数・合計時間・p95と5秒bucketのquery数・合計時間を出します。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、`isuscope metrics`、filter可能な`isuscope series`またはSQLiteから参照できます。
 

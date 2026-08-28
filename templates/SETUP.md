@@ -7,12 +7,12 @@
 3. Codex会話履歴とrunを紐付ける場合は、新しいCodexセッションを開始する前に`UserPromptSubmit` hookを導入・信頼し、`[context.codex]`を有効化する
 4. SSH可能なnode、role、identity fileを`[[nodes]]`と`[ssh]`へ設定する。roleは固定的な種類ではなく、複数指定・run間の変更が可能なcollector選択tag
 5. Nginxアクセスログに時刻、匿名化session、method、URIがあるか確認する
-6. 生成済みのsysstat、perf、host-sampler、alp、slpと時系列collectorを確認し、アクセスログ・slow logのpathとformat（時系列用field名を含む）だけ実環境へ合わせる。既定commandはalp 1.0.21とslp 0.2.1で検証済み。ALPの正確なp95集約のため、`routes.toml`はpatternにcomma、replaceに`$1`などのcaptureを使わず、1規則から固定canonical routeへ置換する
+6. 生成済みのsysstat、perf、host-sampler、alp、slp、optionalなperf-flamegraph/offcpu collectorを確認し、アクセスログ・slow logのpathとformat（時系列用field名を含む）だけ実環境へ合わせる。Flame Graph scriptsや`offcputime-bpfcc`がなければcollectorは`unavailable`になる。既定commandはalp 1.0.21とslp 0.2.1で検証済み。ALPの正確なcount、status、sum/avg、p50/p95/p99集約のため、`routes.toml`はpatternにcomma、replaceに`$1`などのcaptureを使わず、1規則から固定canonical routeへ置換する
 7. `fingerprint.sh`のapp binaryやservice名を問題環境へ合わせ、各nodeへ冪等配置する
 8. `bash -n benchmark.sh`、`bash -n parse-benchmark.sh`、`bash -n setup.sh`、`isuscope show`を実行してから、不足する場合だけ`setup.sh`の`apply_environment`へ冪等な導入処理を追加する
 9. ここで初めて`setup.sh`を実行し、`setup-state.json`が生成されることを確認する。標準ツールは自動installされない
 10. `isuscope doctor`を実行し、failureを解消する
-11. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`を一度実行し、`isuscope metrics latest`、`isuscope series latest`、`isuscope bottleneck latest`でcollector、時系列、coverageとtransitionが0件でないことを確認する。PASS後は`isuscope analyze latest`で結果を記録する
+11. `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`を一度実行し、`isuscope report latest`でcollector、metric、時系列とtransitionが0件でないことを確認する。必要な時間帯は`isuscope series latest`で掘り下げ、PASS後は`isuscope analyze latest`で結果を記録する
 
 remote変更を行う場合は、既存ファイルのbackup、設定検証、atomicな配置、必要最小限のreloadを行います。パッケージ導入やremote build、常駐agentは既存機能で代替できない場合だけ使用します。
 
