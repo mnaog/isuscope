@@ -8,6 +8,8 @@ mod adapters;
 mod analysis;
 #[path = "e2e/codex_context.rs"]
 mod codex_context;
+#[path = "e2e/diff.rs"]
+mod diff;
 #[path = "e2e/discovery.rs"]
 mod discovery;
 #[path = "e2e/doctor.rs"]

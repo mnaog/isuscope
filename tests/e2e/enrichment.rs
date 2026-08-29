@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn enrich_replaces_parser_metrics_and_annotations_are_queryable() {
+fn enrich_replaces_parser_metrics_and_survives_reindexing() {
     let project = tempdir().unwrap();
     let config_dir = project.path().join(".isuscope");
     fs::create_dir_all(&config_dir).unwrap();
@@ -106,30 +106,21 @@ command = ["sh", "-c", "printf '%s\\n' '{{\"type\":\"metric\",\"name\":\"benchma
     );
     drop(database);
 
-    let annotate = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args([
-            "annotate",
-            "candidate",
-            "--note",
-            "parser updated",
-            "--tag",
-            "baseline",
-            "--remove-tag",
-            "candidate",
-        ])
+    let removed_annotate = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["annotate", "candidate"])
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(annotate.status.success());
-    let show = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "baseline"])
+    assert!(!removed_annotate.status.success());
+    let report = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["report", "candidate"])
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(show.status.success());
-    let output = String::from_utf8(show.stdout).unwrap();
-    assert!(output.contains("note        parser updated"));
-    assert!(output.contains("tags        baseline"));
+    assert!(report.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["run"]["note"], "initial parser");
+    assert_eq!(report["run"]["tags"], serde_json::json!(["candidate"]));
 
     for suffix in ["", "-wal", "-shm"] {
         let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
@@ -138,7 +129,7 @@ command = ["sh", "-c", "printf '%s\\n' '{{\"type\":\"metric\",\"name\":\"benchma
         }
     }
     let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "baseline"])
+        .args(["report", "candidate"])
         .current_dir(project.path())
         .output()
         .unwrap();

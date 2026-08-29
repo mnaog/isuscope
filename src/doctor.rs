@@ -1,6 +1,6 @@
 use crate::{
     codex_context,
-    config::{BenchmarkMode, LoadedConfig, Transport, resolve},
+    config::{BenchmarkMode, CollectorConfig, LoadedConfig, NodeConfig, Transport, resolve},
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -52,6 +52,7 @@ pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
     check_commands(config, &mut report);
     check_identity(config, &mut report);
     check_nodes(config, &mut report).await;
+    check_profile_collectors(config, &mut report).await;
     Ok(report)
 }
 
@@ -269,23 +270,7 @@ async fn check_nodes(config: &LoadedConfig, report: &mut DoctorReport) {
     for node in &config.config.nodes {
         let user = node.user.as_deref().unwrap_or(&config.config.ssh.user);
         let target = format!("{user}@{}", node.host);
-        let mut args = vec![
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            "-o".to_owned(),
-            format!(
-                "ConnectTimeout={}",
-                config.config.ssh.connect_timeout_seconds
-            ),
-        ];
-        if let Some(identity) = &config.config.ssh.identity_file {
-            args.push("-i".into());
-            args.push(
-                resolve(&config.project_root, identity)
-                    .display()
-                    .to_string(),
-            );
-        }
+        let mut args = ssh_args(config);
         args.extend([target.clone(), "--".into(), "date".into(), "+%s".into()]);
         let result = tokio::time::timeout(
             Duration::from_secs(config.config.ssh.connect_timeout_seconds + 3),
@@ -336,23 +321,7 @@ fn node_requires_sudo(config: &LoadedConfig, node: &crate::config::NodeConfig) -
 }
 
 async fn check_sudo(config: &LoadedConfig, target: &str, report: &mut DoctorReport) {
-    let mut args = vec![
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        format!(
-            "ConnectTimeout={}",
-            config.config.ssh.connect_timeout_seconds
-        ),
-    ];
-    if let Some(identity) = &config.config.ssh.identity_file {
-        args.push("-i".into());
-        args.push(
-            resolve(&config.project_root, identity)
-                .display()
-                .to_string(),
-        );
-    }
+    let mut args = ssh_args(config);
     args.extend([
         target.to_owned(),
         "--".into(),
@@ -376,6 +345,165 @@ async fn check_sudo(config: &LoadedConfig, target: &str, report: &mut DoctorRepo
         Ok(Err(error)) => report.fail(format!("SSH {target}: sudo check failed: {error}")),
         Err(_) => report.fail(format!("SSH {target}: sudo check timed out")),
     }
+}
+
+fn ssh_args(config: &LoadedConfig) -> Vec<String> {
+    let mut args = vec![
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        format!(
+            "ConnectTimeout={}",
+            config.config.ssh.connect_timeout_seconds
+        ),
+    ];
+    if let Some(identity) = &config.config.ssh.identity_file {
+        args.push("-i".into());
+        args.push(
+            resolve(&config.project_root, identity)
+                .display()
+                .to_string(),
+        );
+    }
+    args
+}
+
+async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorReport) {
+    for collector in &config.config.collectors {
+        let Some(script) = profile_preflight_script(&collector.name) else {
+            continue;
+        };
+        match collector.transport {
+            Transport::Local => {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    Command::new("sh")
+                        .arg("-c")
+                        .arg(script)
+                        .current_dir(&config.project_root)
+                        .output(),
+                )
+                .await;
+                record_profile_preflight(&collector.name, "local", result, report);
+            }
+            Transport::Ssh => {
+                let nodes = config
+                    .config
+                    .nodes
+                    .iter()
+                    .filter(|node| collector_matches_node(collector, node))
+                    .collect::<Vec<_>>();
+                if nodes.is_empty() {
+                    report.warn(format!(
+                        "profile `{}` unavailable: no SSH node matched roles",
+                        collector.name
+                    ));
+                    continue;
+                }
+                for node in nodes {
+                    let user = node.user.as_deref().unwrap_or(&config.config.ssh.user);
+                    let target = format!("{user}@{}", node.host);
+                    let remote = ["sh", "-c", script]
+                        .iter()
+                        .map(|part| shell_quote(part))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut args = ssh_args(config);
+                    args.extend([target.clone(), "--".into(), remote]);
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(config.config.ssh.connect_timeout_seconds + 15),
+                        Command::new("ssh").args(args).output(),
+                    )
+                    .await;
+                    record_profile_preflight(
+                        &collector.name,
+                        &format!("{} ({target})", node.name),
+                        result,
+                        report,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn collector_matches_node(collector: &CollectorConfig, node: &NodeConfig) -> bool {
+    collector.roles.is_empty() || collector.roles.iter().any(|role| node.roles.contains(role))
+}
+
+fn record_profile_preflight(
+    collector: &str,
+    target: &str,
+    result: std::result::Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
+    report: &mut DoctorReport,
+) {
+    match result {
+        Ok(Ok(output)) if output.status.success() => report.pass(format!(
+            "profile `{collector}` {target}: {}",
+            output_detail(&output)
+        )),
+        Ok(Ok(output)) if output.status.code() == Some(75) => report.warn(format!(
+            "profile `{collector}` {target}: unavailable ({})",
+            output_detail(&output)
+        )),
+        Ok(Ok(output)) => report.fail(format!(
+            "profile `{collector}` {target}: preflight failed with {} ({})",
+            output.status,
+            output_detail(&output)
+        )),
+        Ok(Err(error)) => report.fail(format!(
+            "profile `{collector}` {target}: cannot run preflight: {error}"
+        )),
+        Err(_) => report.fail(format!(
+            "profile `{collector}` {target}: preflight timed out"
+        )),
+    }
+}
+
+fn output_detail(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = if stdout.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    if detail.is_empty() {
+        "no diagnostic output".into()
+    } else {
+        detail.lines().collect::<Vec<_>>().join("; ")
+    }
+}
+
+fn profile_preflight_script(name: &str) -> Option<&'static str> {
+    match name {
+        "perf-flamegraph" => Some(
+            r#"set -u
+require() { command -v "$1" >/dev/null 2>&1 || { echo "missing executable: $1"; exit 75; }; }
+require perf
+require stackcollapse-perf.pl
+require flamegraph.pl
+require sudo
+sudo -n true >/dev/null 2>&1 || { echo "passwordless sudo is unavailable"; exit 75; }
+sudo -n env LC_ALL=C perf stat -a -- sleep 0.01 >/dev/null 2>&1 || { echo "system-wide perf probe failed for this kernel or permission set"; exit 75; }
+printf 'ready: perf=%s stackcollapse=%s flamegraph=%s\n' "$(command -v perf)" "$(command -v stackcollapse-perf.pl)" "$(command -v flamegraph.pl)""#,
+        ),
+        "offcpu" => Some(
+            r#"set -u
+require() { command -v "$1" >/dev/null 2>&1 || { echo "missing executable: $1"; exit 75; }; }
+require offcputime-bpfcc
+require python3
+require sudo
+sudo -n true >/dev/null 2>&1 || { echo "passwordless sudo is unavailable"; exit 75; }
+reason=$(sudo -n env LC_ALL=C offcputime-bpfcc -f 1 2>&1) || { reason=$(printf '%s\n' "$reason" | tail -n 1); echo "kernel/BPF probe failed: $reason"; exit 75; }
+printf 'ready: offcpu=%s launcher=%s kernel=%s\n' "$(command -v offcputime-bpfcc)" "$(command -v python3)" "$(uname -r)""#,
+        ),
+        _ => None,
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(unix)]

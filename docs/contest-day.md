@@ -2,7 +2,7 @@
 
 この文書は、競技開始後に初めて分かるベンチ起動方法、サーバー構成、ログ形式をisuscopeへ接続し、計測可能な状態にするためのランブックです。
 
-普段使うコマンドは`run`、`analyze`、`discovery-run`、`score-run`、`enrich`、`show`です。`init`と環境設定は開始直後に一度だけ行います。
+普段使うコマンドは`run`、`analyze`、`enrich`、`list`、`report`、`diff`です。`init`、環境設定、`survey-run`は開始直後の調査で一度だけ使います。
 
 ## 最短チェックリスト
 
@@ -16,10 +16,10 @@
 - [ ] アクセスログfieldと`.isuscope/routes.toml`を確認する
 - [ ] `.isuscope/setup.sh`を実行する
 - [ ] `isuscope doctor`がfailure 0になることを確認する
-- [ ] `isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"`を1回通し、run stateが`complete`になるまで直す
-- [ ] PASSしたrunへ`isuscope analyze latest`で結果分析を記録する
-- [ ] `isuscope show latest`とSQLiteで保存内容を確認する
-- [ ] 以後は通常`isuscope run`、必要時だけ`discovery-run`を使う
+- [ ] `isuscope survey-run --hypothesis "初期状態の負荷構造を記録する"`を1回通し、run stateが`complete`になるまで直す
+- [ ] PASSしたrunへ、出力されたIDを指定して`isuscope analyze RUN_ID VERDICT --analysis "結果"`で結果分析を記録する
+- [ ] `isuscope report latest`で保存内容を確認する
+- [ ] 序盤調査を終えたら`survey-run`には戻らず、以後は`isuscope run`を使う
 - [ ] 競技終了時にSQLiteだけでなくdata directory全体をbackupする
 
 ## 事前に済ませておくこと
@@ -132,7 +132,7 @@ role名は自由ですが、collectorの対象選択に使うため、実際の�
 
 ### 6. collectorを設定する
 
-生成された標準collectorは`run`と`discovery-run`の両方で起動を試みます。
+生成された標準collectorは`run`と`survey-run`の両方で起動を試みます。
 
 - sysstatによるhost CPU・disk
 - perfによるsystem-wide hot symbol
@@ -140,7 +140,7 @@ role名は自由ですが、collectorの対象選択に使うため、実際の�
 - slpによるslow query集計
 - remote fingerprint
 
-`discovery-run`だけが、標準観測にcookieなどの匿名識別子を使った行動遷移を追加します。
+`survey-run`だけが、標準観測にcookieなどの匿名識別子を使った行動遷移を追加します。
 
 - 匿名viewer単位の行動遷移
 
@@ -161,7 +161,7 @@ timeout_seconds = 30
 ```
 
 初回runの時点でparserが完成している必要はありません。stdoutは必ず保存されるため、run後に
-scriptを実装して`isuscope enrich latest`を実行できます。再解析だけではベンチを消費しません。
+scriptを実装して`isuscope enrich RUN_ID`を実行できます。再解析だけではベンチを消費しません。
 
 ### 7. アクセスログとroute規則を合わせる
 
@@ -194,20 +194,20 @@ remote変更では、既存ファイルのbackup、設定test、atomicな配置�
 
 ```console
 isuscope --version
-isuscope show
+isuscope list
 bash -n .isuscope/benchmark.sh
 bash -n .isuscope/parse-benchmark.sh
 bash -n .isuscope/setup.sh
 isuscope doctor
 ```
 
-`show`が設定を読めれば、configの構文とdata directoryを確認できます。
+`list`がJSONを返せれば、configの構文とdata directoryを確認できます。
 
-### 2. discovery-runを1回だけ通す
+### 2. survey-runを1回だけ通す
 
 ```console
-isuscope discovery-run --hypothesis "初期状態の負荷構造を記録する"
-isuscope show latest
+isuscope survey-run --hypothesis "初期状態の負荷構造を記録する"
+isuscope report latest
 ```
 
 投入完了の基準:
@@ -238,7 +238,7 @@ isuscope series latest --metric cpu.sample_percent --node app1 --bucket 5
 
 対象processのsampleが全bucketで0件なら、アプリが軽いと結論づける前にcollector logとprocess/binary labelを確認します。観測条件を変更した場合、その前後のrunは同条件のスコア比較に使いません。
 
-`isuscope show latest`は各圧縮ログの直下に`zstd -dc -- '<path>'`を表示します。collectorが`failed`の場合はstderr logの`view`行をそのままコピーして原因を確認します。
+`isuscope report latest`の`.run.collectors`と`.coverage`で異常を確認します。collector logは`.run_logs` directoryと`.run.logs[].id`から`<run_logs>/<id>.zst`として参照できます。
 
 ### 3. SQLiteを確認する
 
@@ -272,16 +272,17 @@ WHERE run_id = (SELECT id FROM runs ORDER BY started_at DESC LIMIT 1);
 
 ```console
 isuscope run --hypothesis "変更が対象metricを改善し、scoreを上げる"
-isuscope show latest
+isuscope report latest
+isuscope diff 変更前のRUN_ID latest
 ```
 
 仮説はrunと同時に必ず残します。PASS後は結果を判定・分析してから次のrunへ進みます。
 
 ```console
-isuscope analyze latest --verdict supported --analysis "期待したmetricが改善し、scoreも上昇した"
+isuscope analyze RUN_ID supported --analysis "期待したmetricが改善し、scoreも上昇した"
 ```
 
-`--verdict`は`supported`、`rejected`、`inconclusive`のいずれかです。分析を行えない場合は`isuscope analyze latest --skip --reason "理由"`を使います。FAILまたは中断runには分析は要求されません。
+判定は`supported`、`rejected`、`inconclusive`のいずれかです。分析を行えない場合は`isuscope analyze RUN_ID skipped --reason "理由"`を使います。FAILまたは中断runには分析は要求されません。
 
 noteとtagもrunと同時に残せます。
 
@@ -289,27 +290,24 @@ noteとtagもrunと同時に残せます。
 isuscope run --hypothesis "admission 64でviewer完走数が増える" --tag admission-64 --note "POST admission 63→64"
 ```
 
-最終確認など、collectorもbenchmark parserも動かしたくない場合は`score-run`を使います。
+最終確認では、負荷になる常駐観測、collector、benchmark parser、log設定を先に撤去し、その最終構成を通常の`run`で記録します。
 
 ```console
-isuscope score-run --hypothesis "collectorなしで最終scoreが上がる" --tag final
+isuscope run --hypothesis "観測を撤去した最終構成でscoreを確認する" --tag final
 ```
 
-source/tooling snapshot、benchmark結果、stdout/stderrは保存されますが、before/during/after
-collectorとbenchmark parserはすべてskipされます。
+撤去後のconfig、source/tooling snapshot、benchmark結果、stdout/stderrが同じrunへ保存されます。
 
 runの前に、変更目的をcommitまたは作業メモへ残します。dirty worktreeでもpatchとhashは保存されますが、意味のある単位でcommitすると比較しやすくなります。
 
-### discovery-runを使うタイミング
+### survey-runを使うタイミング
 
-`discovery-run`は次の場合だけ実行します。
+`survey-run`は競技序盤の調査フェーズだけで実行します。
 
 - 初回の負荷構造調査
-- routingやnode分担を大きく変えた後
-- ボトルネックが移動した可能性があるとき
-- 通常runでは説明できない失敗やスコア変動があるとき
+- 序盤にroutingやnode分担を組み立て直した直後の再調査
 
-小さな修正ごとには`run`を使います。discovery用ログや解析がスコアへ影響する場合があるため、最終スコアは通常runでも確認します。
+負荷構造を把握して改善サイクルへ入った後は、ボトルネックが移動しても`run`と保存済みmetricの比較で追います。survey用ログや解析がスコアへ影響するため、小さな修正と最終スコア確認には使いません。
 
 ### 比較時に見るもの
 
@@ -331,7 +329,7 @@ runの前に、変更目的をcommitまたは作業メモへ残します。dirty
 
 ### collectorが失敗した
 
-`isuscope show latest`でrun pathとlog IDを確認し、該当collectorのstderrを展開します。required before collectorが失敗した場合、ベンチは開始されません。
+`isuscope report latest`の`.run_logs`と`.run.logs`で該当collectorのstderrを特定し、圧縮logを展開します。required before collectorが失敗した場合、ベンチは開始されません。
 
 ### 実行を止めたい
 
@@ -342,7 +340,7 @@ Ctrl-CまたはSIGTERMを使います。isuscopeはbenchmark process groupを停
 `runs/`以下が測定結果の正本です。isuscopeを停止し、SQLite本体、WAL、SHMを削除せず別ディレクトリへ退避してから、次を実行します。
 
 ```console
-isuscope show
+isuscope list
 ```
 
 未登録runは`run.json`と圧縮collectorログから自動的に再構築されます。
@@ -369,6 +367,6 @@ isuscope show
 実際のベンチ起動方法を.isuscope/benchmark.shへ、node/role/SSH/collectorを.isuscope/config.tomlへ設定してください。
 既存ログで取得できる情報を優先し、remote変更は必要最小限かつ冪等にしてください。
 秘密情報をstdout、stderr、Git管理ファイルへ出さないでください。
-.isuscope/setup.shと構文検査が通った時点で変更内容を報告し、その後discovery-runを1回実行してください。
+.isuscope/setup.shと構文検査が通った時点で変更内容を報告し、その後survey-runを1回実行してください。
 結果はscore、run state、collector完走数、fingerprint数、metric数、transition数、保存ログ数で報告してください。
 ```

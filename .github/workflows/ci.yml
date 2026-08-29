@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,16 +41,95 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
 
+      - name: Verify crate package
+        run: cargo package --locked
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+
+      - name: Check shell scripts
+        run: shellcheck scripts/*.sh templates/*.sh
+
   security:
     name: Dependency audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@v2
+        uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component llvm-tools-preview
+          rustup default 1.88.0
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2.87.0
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate code coverage
+        run: cargo llvm-cov --locked --all-targets --workspace --lcov --output-path lcov.info --fail-under-lines 75
+
+      - name: Upload code coverage
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: isuscope-coverage
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 14
+
+  offline-bundle:
+    needs: [rust, shellcheck, security, coverage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88.0
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Build and verify offline bundle
+        run: ./scripts/build-release-bundle.sh
+
+      - name: Upload offline bundle
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: isuscope-offline-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

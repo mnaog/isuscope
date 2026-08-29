@@ -20,6 +20,8 @@ hash_file() {
 }
 
 emit kernel "$(uname -srmo)"
+# /etc/os-release is the standard source on the supported Linux hosts.
+# shellcheck disable=SC1091
 emit os.release "$(. /etc/os-release; printf '%s %s' "${ID:-unknown}" "${VERSION_ID:-unknown}")"
 emit app.binary.sha256 "$(hash_file /home/isucon/webapp/rust/target/release/isupipe)"
 emit app.env.sha256 "$(hash_file /home/isucon/env.sh)"

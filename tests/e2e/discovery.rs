@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn discovery_run_persists_score_metrics_transitions_and_logs() {
+fn survey_run_persists_score_metrics_transitions_and_logs() {
     let project = tempdir().unwrap();
     let config_dir = project.path().join(".isuscope");
     fs::create_dir_all(&config_dir).unwrap();
@@ -21,7 +21,7 @@ command = ["sh", "-c", "test \"$ISUSCOPE_BENCHMARK_PROTOCOL\" = v1; test \"$ISUS
 name = "calculated"
 phase = "after"
 transport = "local"
-modes = ["discovery-run"]
+modes = ["survey-run"]
 command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '%s\\n' '{\"type\":\"metric\",\"name\":\"cpu\",\"value\":12.5,\"unit\":\"percent\",\"timestamp\":\"2026-08-27T12:34:56.789Z\"}' '{\"type\":\"fingerprint\",\"name\":\"app.binary.sha256\",\"value\":\"abc123\"}' '{\"type\":\"transition\",\"from\":\"GET /a\",\"to\":\"GET /b\",\"count\":7}'"]
 "#,
     )
@@ -29,7 +29,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
 
     let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args([
-            "discovery-run",
+            "survey-run",
             "--hypothesis",
             "collectors preserve benchmark evidence",
         ])
@@ -99,26 +99,17 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         4
     );
 
-    let show = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "latest"])
+    let list = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .arg("list")
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(show.status.success());
-    let show_stdout = String::from_utf8(show.stdout).unwrap();
-    assert!(show_stdout.contains("score       12345"));
-    assert!(show_stdout.contains("transitions 1"));
-    assert!(show_stdout.contains("fingerprints 1"));
-    assert!(show_stdout.contains("observability"));
-    assert!(show_stdout.contains("complete     calculated"));
-    assert!(show_stdout.contains("metric series"));
-    assert!(show_stdout.contains("cpu"));
-    assert!(show_stdout.contains("sqlite      "));
-    assert!(show_stdout.contains("(shared by all runs)"));
-    assert!(show_stdout.contains("sql hint    sqlite3 "));
-    assert!(show_stdout.contains("FROM metrics WHERE run_id="));
-    assert!(show_stdout.contains("compare     sqlite3 "));
-    assert!(show_stdout.contains("view    zstd -dc -- "));
+    assert!(list.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list["schema_version"], 1);
+    assert_eq!(list["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(list["runs"][0]["score"], 12345);
+    assert_eq!(list["runs"][0]["analysis_status"], "pending");
 
     let report = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["report", "latest"])
@@ -127,39 +118,37 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .unwrap();
     assert!(report.status.success());
     let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 6);
     assert_eq!(report["run"]["benchmark"]["score"], 12345);
-    assert!(report.get("full").is_none());
+    assert!(report.get("evidence").is_none());
     assert_eq!(report["transitions"]["items"][0]["count"], 7);
 
-    let full = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+    let removed_include_evidence = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["report", "latest", "--include-evidence"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!removed_include_evidence.status.success());
+
+    let removed_full = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["report", "latest", "--full"])
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(full.status.success());
-    let full: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
-    assert_eq!(full["full"]["series_metrics"][0]["name"], "cpu");
+    assert!(!removed_full.status.success());
 
-    let html_path = project.path().join("report.html");
-    let html = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args([
-            "report",
-            "latest",
-            "--format",
-            "html",
-            "--output",
-            html_path.to_str().unwrap(),
-        ])
+    let removed_format = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["report", "latest", "--format", "html"])
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(html.status.success());
-    let html = fs::read_to_string(html_path).unwrap();
-    assert!(html.contains("<!doctype html>"));
-    assert!(html.contains("HTTP routes · total time"));
-    assert!(html.contains("Collectors"));
-    assert!(html.contains("id=\"isuscope-report\""));
+    assert!(!removed_format.status.success());
+    let removed_output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["report", "latest", "--output", "report.json"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!removed_output.status.success());
 
     let mut ui = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .arg("ui")
@@ -180,6 +169,27 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .expect("UI did not listen on localhost:3000");
     std::io::Write::write_all(
         &mut connection,
+        b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("text/html"));
+    assert!(response.contains("<!doctype html>"));
+    assert!(response.contains("HTTP routes · total time"));
+    assert!(response.contains("Coverage"));
+    assert!(response.contains("Database queries · total time"));
+    assert!(response.contains("CPU symbols · sample share"));
+    assert!(response.contains("Host metrics"));
+    assert!(response.contains("Profile artifacts"));
+    assert!(response.contains("Transitions"));
+    assert!(response.contains("Collectors"));
+    assert!(response.contains("id=\"isuscope-report\""));
+
+    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
+    std::io::Write::write_all(
+        &mut connection,
         b"GET /api/report HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
     )
     .unwrap();
@@ -188,6 +198,42 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("application/json"));
     assert!(response.contains("\"score\": 12345"));
+
+    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
+    std::io::Write::write_all(
+        &mut connection,
+        b"GET /diff HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("form-action 'self'"));
+    assert!(response.contains("<h1>Compare runs</h1>"));
+
+    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
+    std::io::Write::write_all(
+        &mut connection,
+        b"GET /diff?base=latest&candidate=latest HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("<h2>CPU symbols</h2>"));
+    assert!(response.contains("id=\"isuscope-diff\""));
+
+    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
+    std::io::Write::write_all(
+        &mut connection,
+        b"GET /api/diff?base=latest&candidate=latest HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("application/json"));
+    assert!(response.contains("\"schema_version\": 1"));
     ui.kill().unwrap();
     ui.wait().unwrap();
 
@@ -226,10 +272,12 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .output()
         .unwrap();
     assert!(series.status.success());
-    let series_stdout = String::from_utf8(series.stdout).unwrap();
-    assert!(series_stdout.contains("bucket 5s"));
-    assert!(series_stdout.contains("CPU A/M%"));
-    assert!(series_stdout.contains("0-"));
+    let series: serde_json::Value = serde_json::from_slice(&series.stdout).unwrap();
+    assert_eq!(series["schema_version"], 1);
+    assert_eq!(series["mode"], "overview");
+    assert_eq!(series["window"]["bucket_seconds"], 5);
+    assert_eq!(series["rows"][0]["from_seconds"], 0);
+    assert!(series["rows"][0]["cpu_percent_average"].is_null());
 
     let metrics = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["metrics", "latest"])
@@ -237,11 +285,17 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .output()
         .unwrap();
     assert!(metrics.status.success());
-    let metrics_stdout = String::from_utf8(metrics.stdout).unwrap();
-    assert!(metrics_stdout.contains("NAME"));
-    assert!(metrics_stdout.contains("cpu"));
-    assert!(metrics_stdout.contains("label collector"));
-    assert!(metrics_stdout.contains("calculated"));
+    let metrics: serde_json::Value = serde_json::from_slice(&metrics.stdout).unwrap();
+    assert_eq!(metrics["schema_version"], 1);
+    let cpu = metrics["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|metric| metric["name"] == "cpu")
+        .unwrap();
+    assert_eq!(cpu["timestamped_rows"], 1);
+    assert_eq!(cpu["labels"][0]["key"], "collector");
+    assert_eq!(cpu["labels"][0]["examples"][0], "calculated");
 
     let filtered = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args([
@@ -258,12 +312,15 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .output()
         .unwrap();
     assert!(filtered.status.success());
-    let filtered_stdout = String::from_utf8(filtered.stdout).unwrap();
-    assert!(filtered_stdout.contains("bucket 10s"));
-    assert!(filtered_stdout.contains("cpu"));
-    assert!(filtered_stdout.contains("12.500"));
-    assert!(filtered_stdout.contains("average"));
-    assert!(filtered_stdout.contains("collector=calculated"));
+    let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(filtered["mode"], "metrics");
+    assert_eq!(filtered["window"]["bucket_seconds"], 10);
+    assert_eq!(filtered["filters"]["labels"][0]["key"], "collector");
+    assert_eq!(filtered["filters"]["labels"][0]["value"], "calculated");
+    assert_eq!(filtered["rows"][0]["metric"], "cpu");
+    assert_eq!(filtered["rows"][0]["value"], 12.5);
+    assert_eq!(filtered["rows"][0]["aggregation"], "average");
+    assert_eq!(filtered["rows"][0]["labels"]["collector"], "calculated");
     assert!(run_dir.join("tooling/config.toml").is_file());
     assert!(run_dir.join("tooling/isuscope-version.txt").is_file());
     assert_eq!(manifest["schema_version"], 6);
@@ -272,7 +329,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         "collectors preserve benchmark evidence"
     );
     assert_eq!(manifest["analysis_status"], "pending");
-    assert_eq!(manifest["tooling"]["isuscope_version"], "0.8.0");
+    assert_eq!(manifest["tooling"]["isuscope_version"], "0.9.0");
     assert_eq!(
         manifest["tooling"]["config_sha256"].as_str().unwrap().len(),
         64
@@ -285,17 +342,17 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
             fs::remove_file(path).unwrap();
         }
     }
-    let restored_show = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "latest"])
+    let restored_list = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .arg("list")
         .current_dir(project.path())
         .output()
         .unwrap();
     assert!(
-        restored_show.status.success(),
+        restored_list.status.success(),
         "{}",
-        String::from_utf8_lossy(&restored_show.stderr)
+        String::from_utf8_lossy(&restored_list.stderr)
     );
-    assert!(String::from_utf8_lossy(&restored_show.stderr).contains("reindexed"));
+    assert!(String::from_utf8_lossy(&restored_list.stderr).contains("reindexed"));
     let restored = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
     assert_eq!(
         restored

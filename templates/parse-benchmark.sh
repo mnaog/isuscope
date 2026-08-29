@@ -10,7 +10,7 @@ set -euo pipefail
 #     '{"type":"metric","name":"benchmark.scenario.success","value":123,"unit":"runs","labels":{"scenario":"viewer"}}'
 #
 # 当日は、まず何も解析せずベンチを保存し、このscriptを編集してから次を実行できます。
-#   isuscope enrich latest
+#   isuscope enrich RUN_ID
 
 input=${1:?benchmark stdout path is required}
 

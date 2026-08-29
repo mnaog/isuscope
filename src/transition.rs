@@ -240,6 +240,12 @@ fn emit_route_metrics(
             ("route".into(), route.clone()),
         ]);
         let mut errors = 0_u64;
+        emit_metric(
+            "http.requests",
+            stats.requests_by_status.values().sum::<u64>() as f64,
+            "requests",
+            base_labels.clone(),
+        )?;
         for (status_class, count) in &stats.requests_by_status {
             let mut labels = base_labels.clone();
             labels.insert("status_class".into(), status_class.clone());
@@ -266,9 +272,19 @@ fn emit_route_metrics(
             "requests",
             base_labels.clone(),
         )?;
+        emit_duration_summary(
+            "http.request_duration",
+            &stats.request_durations_ms,
+            &base_labels,
+        )?;
         emit_quantiles(
             "http.request_duration",
             &mut stats.request_durations_ms,
+            &base_labels,
+        )?;
+        emit_duration_summary(
+            "http.upstream_duration",
+            &stats.upstream_durations_ms,
             &base_labels,
         )?;
         emit_quantiles(
@@ -276,6 +292,48 @@ fn emit_route_metrics(
             &mut stats.upstream_durations_ms,
             &base_labels,
         )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+struct DurationSummary {
+    sum: f64,
+    mean: f64,
+    min: f64,
+    max: f64,
+}
+
+fn duration_summary(values: &[f64]) -> Option<DurationSummary> {
+    let (&first, rest) = values.split_first()?;
+    let (sum, min, max) = rest
+        .iter()
+        .fold((first, first, first), |(sum, min, max), value| {
+            (sum + value, min.min(*value), max.max(*value))
+        });
+    Some(DurationSummary {
+        sum,
+        mean: sum / values.len() as f64,
+        min,
+        max,
+    })
+}
+
+fn emit_duration_summary(
+    name: &str,
+    values: &[f64],
+    labels: &BTreeMap<String, String>,
+) -> Result<()> {
+    let Some(summary) = duration_summary(values) else {
+        return Ok(());
+    };
+    for (suffix, value) in [
+        ("sum", summary.sum),
+        ("mean", summary.mean),
+        ("min", summary.min),
+        ("max", summary.max),
+    ] {
+        emit_metric(&format!("{name}_{suffix}"), value, "ms", labels.clone())?;
     }
     Ok(())
 }
@@ -739,6 +797,15 @@ mod tests {
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.95), Some(4.0));
         assert_eq!(status_class("304"), "3xx");
         assert_eq!(parse_upstream_seconds_ms("0.001, 0.002"), Some(3.0));
+        assert_eq!(
+            duration_summary(&[2.0, 4.0, 9.0]),
+            Some(DurationSummary {
+                sum: 15.0,
+                mean: 5.0,
+                min: 2.0,
+                max: 9.0,
+            })
+        );
     }
 
     #[test]

@@ -55,7 +55,6 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         .args([
             "analyze",
             "latest",
-            "--verdict",
             "supported",
             "--analysis",
             "Score reached 100 and the benchmark passed.",
@@ -69,7 +68,6 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         .args([
             "analyze",
             "latest",
-            "--verdict",
             "inconclusive",
             "--analysis",
             "One sample is insufficient; retain the change provisionally.",
@@ -95,7 +93,7 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         .args([
             "analyze",
             "latest",
-            "--skip",
+            "skipped",
             "--reason",
             "practice window ended before analysis",
         ])
@@ -144,11 +142,11 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
             .unwrap(),
         3
     );
-    let (hypothesis, body): (String, String) = database
+    let (analyzed_run, hypothesis, body): (String, String, String) = database
         .query_row(
-            "SELECT r.hypothesis, a.body FROM runs r JOIN run_analyses a ON a.run_id=r.id WHERE a.verdict='supported'",
+            "SELECT r.id, r.hypothesis, a.body FROM runs r JOIN run_analyses a ON a.run_id=r.id WHERE a.verdict='supported'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(
@@ -165,14 +163,21 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         }
     }
     let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .arg("show")
+        .args(["report", &analyzed_run])
         .current_dir(project.path())
         .output()
         .unwrap();
     assert!(restored.status.success());
-    let restored_output = String::from_utf8(restored.stdout).unwrap();
-    assert!(restored_output.contains("removing one allocation raises score without errors"));
-    assert!(restored_output.contains("inconclusive: One sample is insufficient"));
+    let report: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(
+        report["run"]["hypothesis"],
+        "removing one allocation raises score without errors"
+    );
+    assert_eq!(report["run"]["analyses"][1]["verdict"], "inconclusive");
+    assert_eq!(
+        report["run"]["analyses"][1]["body"],
+        "One sample is insufficient; retain the change provisionally."
+    );
     let restored = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
     assert_eq!(
         restored

@@ -1,0 +1,13 @@
+multipathd;[unknown];[unknown];entry_SYSCALL_64_after_hwframe;do_syscall_64;__x64_sys_futex;do_futex;futex_wait;futex_wait_queue;schedule;finish_task_switch.isra.0 3
+swapper/1;secondary_startup_64_no_verify;start_secondary;cpu_startup_entry;do_idle;schedule_idle;finish_task_switch.isra.0 59
+swapper/0;secondary_startup_64_no_verify;x86_64_start_kernel;start_kernel;arch_call_rest_init;rest_init;cpu_startup_entry;do_idle;schedule_idle;finish_task_switch.isra.0 518
+jbd2/nvme0n1p1-;ret_from_fork;kthread;kjournald2;jbd2_journal_commit_transaction;__wait_on_buffer;out_of_line_wait_on_bit;__wait_on_bit;bit_wait_io;io_schedule;schedule;finish_task_switch.isra.0 708
+jbd2/nvme0n1p1-;ret_from_fork;kthread;kjournald2;jbd2_journal_commit_transaction;__wait_on_buffer;out_of_line_wait_on_bit;__wait_on_bit;bit_wait_io;io_schedule;schedule;finish_task_switch.isra.0 1555
+rcu_sched;ret_from_fork;kthread;rcu_gp_kthread;rcu_gp_fqs_loop;schedule_timeout;schedule;finish_task_switch.isra.0 15974
+kworker/0:0;ret_from_fork;kthread;worker_thread;schedule;finish_task_switch.isra.0 127950
+rcu_sched;ret_from_fork;kthread;rcu_gp_kthread;schedule;finish_task_switch.isra.0 451999
+kworker/u4:0;ret_from_fork;kthread;worker_thread;schedule;finish_task_switch.isra.0 511797
+kcompactd0;ret_from_fork;kthread;kcompactd;schedule_timeout;schedule;finish_task_switch.isra.0 511995
+kworker/1:0;ret_from_fork;kthread;worker_thread;schedule;finish_task_switch.isra.0 895972
+isupipe-journal;syscall;entry_SYSCALL_64_after_hwframe;do_syscall_64;__x64_sys_futex;do_futex;futex_wait;futex_wait_queue;schedule;finish_task_switch.isra.0 985447
+offcputime-bpfc;select;entry_SYSCALL_64_after_hwframe;do_syscall_64;__x64_sys_pselect6;do_pselect.constprop.0;core_sys_select;do_select;schedule_hrtimeout_range;schedule_hrtimeout_range_clock;schedule;finish_task_switch.isra.0 1001004

@@ -33,7 +33,7 @@ struct StructuredSnapshot {
     transitions: Vec<Transition>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct RunSummary {
     pub id: String,
     pub started_at: String,
@@ -494,48 +494,6 @@ impl Store {
             "UPDATE runs SET analysis_status=?2 WHERE id=?1",
             params![manifest.id, manifest.analysis_status.as_str()],
         )?;
-        transaction.commit()?;
-        write_manifest(&self.final_dir(id), &manifest)?;
-        Ok(manifest)
-    }
-
-    pub fn annotate(
-        &mut self,
-        id: &str,
-        note: Option<String>,
-        tags: &[String],
-        remove_tags: &[String],
-    ) -> Result<RunManifest> {
-        if !self.final_dir(id).is_dir() {
-            bail!("run `{id}` is not finalized");
-        }
-        let mut manifest = self.load(id)?;
-        if let Some(note) = note {
-            manifest.note = (!note.trim().is_empty()).then_some(note);
-        }
-        for tag in tags {
-            let tag = tag.trim();
-            if !tag.is_empty() && !manifest.tags.iter().any(|value| value == tag) {
-                manifest.tags.push(tag.to_owned());
-            }
-        }
-        manifest
-            .tags
-            .retain(|tag| !remove_tags.iter().any(|removed| removed == tag));
-        manifest.tags.sort();
-        manifest.tags.dedup();
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "UPDATE runs SET note=?2 WHERE id=?1",
-            params![id, manifest.note],
-        )?;
-        transaction.execute("DELETE FROM run_tags WHERE run_id=?1", [id])?;
-        for tag in &manifest.tags {
-            transaction.execute(
-                "INSERT INTO run_tags (run_id, tag) VALUES (?1, ?2)",
-                params![id, tag],
-            )?;
-        }
         transaction.commit()?;
         write_manifest(&self.final_dir(id), &manifest)?;
         Ok(manifest)
@@ -1134,6 +1092,7 @@ fn migrate(connection: &Connection) -> Result<()> {
             snapshot_path TEXT NOT NULL,
             sha256 TEXT NOT NULL
         );
+        UPDATE runs SET mode = 'survey-run' WHERE mode = 'discovery-run';
         ",
     )?;
     ensure_column(connection, "runs", "note", "TEXT")?;
@@ -1145,7 +1104,7 @@ fn migrate(connection: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'not_required'",
     )?;
     ensure_column(connection, "metrics", "observed_at", "TEXT")?;
-    connection.pragma_update(None, "user_version", 6)?;
+    connection.pragma_update(None, "user_version", 7)?;
     Ok(())
 }
 
@@ -1224,5 +1183,29 @@ mod tests {
         assert!(recovered.benchmark.interrupted);
         assert!(!store.staging_dir(&manifest.id).exists());
         assert!(store.final_dir(&manifest.id).is_dir());
+    }
+
+    #[test]
+    fn migrates_legacy_discovery_run_mode_to_survey_run() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO runs (id, started_at, mode, state, dirty, hypothesis, analysis_status) VALUES (?1, ?2, 'discovery-run', 'complete', 0, '', 'not_required')",
+                ["legacy-run", "2026-08-28T00:00:00Z"],
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(directory.path()).unwrap();
+        assert_eq!(store.list(1).unwrap()[0].mode, "survey-run");
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            7
+        );
     }
 }

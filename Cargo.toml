@@ -1,12 +1,26 @@
 [package]
 name = "isuscope"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Run recorder and discovery harness for ISUCON"
 authors = ["Naohiro Matsuda"]
 license = "MIT"
 repository = "https://github.com/mnaog/isuscope"
+include = [
+    "src/**",
+    "tests/**",
+    "templates/**",
+    "scripts/**",
+    "examples/**",
+    "docs/contest-day.md",
+    "docs/profile-acceptance-isucon13.md",
+    "docs/report-architecture.md",
+    "docs/standard-observability.md",
+    "docs/validation-history.md",
+    "README.md",
+    "LICENSE",
+]
 
 [dependencies]
 anyhow = "1.0"

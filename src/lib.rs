@@ -2,6 +2,7 @@ pub mod benchmark;
 pub mod codex_context;
 pub mod collector;
 pub mod config;
+pub mod diff;
 pub mod discovery_capture;
 pub mod doctor;
 pub mod enrichment;

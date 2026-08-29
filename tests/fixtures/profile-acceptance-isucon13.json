@@ -1,0 +1,22 @@
+{
+  "captured_at": "2026-08-28",
+  "environment": "official ISUCON13 AMI, Ubuntu 22.04, Linux 6.2.0-1016-aws, x86_64",
+  "successful_run": "01a04847-d5dd-75e0-89ca-e73907403683",
+  "normal": {
+    "perf_flamegraph": "complete",
+    "offcpu": "complete",
+    "nodes": 3
+  },
+  "empty_sample": {
+    "perf_folded_bytes": 0,
+    "perf_flamegraph": "unavailable",
+    "offcpu_folded_bytes": 0,
+    "offcpu_command_exit_code": 0,
+    "offcpu": "unavailable"
+  },
+  "missing_dependency": {
+    "path": "/usr/bin:/bin",
+    "stackcollapse_perf": "unavailable",
+    "offcputime_bpfcc": "unavailable"
+  }
+}

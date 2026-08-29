@@ -1,0 +1,30 @@
+<?xml version="1.0" standalone="no"?>
+<svg version="1.1" width="1200" height="310" viewBox="0 0 1200 310" xmlns="http://www.w3.org/2000/svg">
+  <title>isuscope CPU Flame Graph fixture</title>
+  <g id="frames">
+    <g><title>acpi_idle_enter (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>call_cpuidle (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>cpuidle_enter_state (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>cpuidle_enter (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>do_idle (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>do_idle (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>cpuidle_enter_state (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>native_safe_halt (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>native_safe_halt (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>call_cpuidle (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>cpu_startup_entry (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>rest_init (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>cpu_startup_entry (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>swapper (4,000,000,000 samples, 100.00%)</title></g>
+    <g><title>start_kernel (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>all (4,000,000,000 samples, 100%)</title></g>
+    <g><title>x86_64_start_kernel (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>cpuidle_idle_call (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>secondary_startup_64_no_verify (4,000,000,000 samples, 100.00%)</title></g>
+    <g><title>cpuidle_idle_call (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>start_secondary (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>arch_call_rest_init (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>cpuidle_enter (2,000,000,000 samples, 50.00%)</title></g>
+    <g><title>acpi_idle_enter (2,000,000,000 samples, 50.00%)</title></g>
+  </g>
+</svg>

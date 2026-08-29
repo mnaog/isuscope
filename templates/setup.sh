@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-readonly PROJECT_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly SCRIPT_DIR
+PROJECT_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+readonly PROJECT_ROOT
 readonly CONFIG_FILE="${SCRIPT_DIR}/config.toml"
 readonly ROUTES_FILE="${SCRIPT_DIR}/routes.toml"
 readonly STATE_FILE="${SCRIPT_DIR}/setup-state.json"
@@ -25,8 +27,8 @@ command -v isuscope >/dev/null
 test -f "${CONFIG_FILE}"
 apply_environment
 
-# configが読み取れることを副作用のないshowで検証します。
-(cd "${PROJECT_ROOT}" && isuscope show >/dev/null)
+# configが読み取れることを副作用のないlistで検証します。
+(cd "${PROJECT_ROOT}" && isuscope list >/dev/null)
 
 config_hash=$(hash_file "${CONFIG_FILE}")
 routes_hash=""

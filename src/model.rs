@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 #[serde(rename_all = "kebab-case")]
 pub enum RunMode {
     Run,
-    DiscoveryRun,
+    #[serde(alias = "discovery-run")]
+    SurveyRun,
+    /// Legacy persisted value. New runs cannot select this mode.
     ScoreRun,
 }
 
@@ -14,7 +16,7 @@ impl RunMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Run => "run",
-            Self::DiscoveryRun => "discovery-run",
+            Self::SurveyRun => "survey-run",
             Self::ScoreRun => "score-run",
         }
     }
@@ -241,4 +243,22 @@ pub struct RunManifest {
     #[serde(default)]
     pub fingerprint_count: usize,
     pub transition_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunMode;
+
+    #[test]
+    fn legacy_score_run_mode_remains_deserializable() {
+        let mode: RunMode = serde_json::from_str("\"score-run\"").unwrap();
+        assert_eq!(mode, RunMode::ScoreRun);
+    }
+
+    #[test]
+    fn legacy_discovery_run_mode_maps_to_survey_run() {
+        let legacy: RunMode = serde_json::from_str("\"discovery-run\"").unwrap();
+        assert_eq!(legacy, RunMode::SurveyRun);
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), "\"survey-run\"");
+    }
 }

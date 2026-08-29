@@ -163,6 +163,54 @@ command = ["sh", "-c", "exit 75"]
 }
 
 #[test]
+fn required_collector_is_matched_by_name_and_phase() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "touch benchmark-ran; printf 'スコア: 1\n'"]
+
+[[collectors]]
+name = "same-name"
+phase = "before"
+command = ["sh", "-c", "exit 1"]
+required = false
+
+[[collectors]]
+name = "same-name"
+phase = "after"
+command = ["sh", "-c", "exit 0"]
+required = true
+"#,
+    )
+    .unwrap();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "run",
+            "--hypothesis",
+            "required collectors are scoped to their configured phase",
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+
+    assert!(run.status.success());
+    assert!(project.path().join("benchmark-ran").is_file());
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    assert_eq!(
+        database
+            .query_row("SELECT state FROM runs", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "degraded"
+    );
+}
+
+#[test]
 fn nonzero_adapter_exit_cannot_report_a_passing_run() {
     let project = tempdir().unwrap();
     let config_dir = project.path().join(".isuscope");

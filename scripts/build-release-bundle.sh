@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+readonly PROJECT_ROOT
 readonly DIST_DIR="${PROJECT_ROOT}/dist"
 
 cd "${PROJECT_ROOT}"
@@ -19,9 +20,11 @@ cp docs/contest-day.md "${temporary}/docs/contest-day.md"
 mkdir -p "${DIST_DIR}"
 tar -C "${temporary}" -czf "${DIST_DIR}/${bundle}.tar.gz" isuscope README.md LICENSE docs/contest-day.md
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum "${DIST_DIR}/${bundle}.tar.gz" >"${DIST_DIR}/${bundle}.tar.gz.sha256"
+  (cd "${DIST_DIR}" && sha256sum "${bundle}.tar.gz" >"${bundle}.tar.gz.sha256")
+  (cd "${DIST_DIR}" && sha256sum -c "${bundle}.tar.gz.sha256")
 else
-  shasum -a 256 "${DIST_DIR}/${bundle}.tar.gz" >"${DIST_DIR}/${bundle}.tar.gz.sha256"
+  (cd "${DIST_DIR}" && shasum -a 256 "${bundle}.tar.gz" >"${bundle}.tar.gz.sha256")
+  (cd "${DIST_DIR}" && shasum -a 256 -c "${bundle}.tar.gz.sha256")
 fi
 tar -C "${verification}" -xzf "${DIST_DIR}/${bundle}.tar.gz"
 test "$("${verification}/isuscope" --version)" = "isuscope ${version}"

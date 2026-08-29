@@ -1,5 +1,6 @@
 /target/
 /dist/
+/docs/codex-history/
 /.isuscope/runs/
 /.isuscope/isuscope.sqlite3
 /.isuscope/isuscope.sqlite3-shm

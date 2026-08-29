@@ -37,6 +37,11 @@ pub async fn execute(
     shutdown: Shutdown,
     mut annotations: RunAnnotations,
 ) -> Result<RunOutcome> {
+    if mode == RunMode::ScoreRun {
+        bail!(
+            "score-run is no longer supported; remove observation settings and use `isuscope run`"
+        );
+    }
     if annotations.hypothesis.trim().is_empty() {
         bail!("hypothesis must not be empty");
     }
@@ -118,32 +123,23 @@ pub async fn execute(
     let mut fingerprints = Vec::new();
     let mut transitions = Vec::new();
 
-    let score_only = mode == RunMode::ScoreRun;
-    if score_only {
-        println!("→ collectors: skipped (score-run)");
-    } else {
-        println!("→ collectors: before");
-    }
-    let before = if score_only {
-        Vec::new()
-    } else {
-        collector::run_phase(
-            &config,
-            mode,
-            CollectorPhase::Before,
-            &id,
-            &staging,
-            Some(shutdown.clone()),
-        )
-        .await
-    };
+    println!("→ collectors: before");
+    let before = collector::run_phase(
+        &config,
+        mode,
+        CollectorPhase::Before,
+        &id,
+        &staging,
+        Some(shutdown.clone()),
+    )
+    .await;
     let required_failed = before.iter().any(|output| {
         output.result.status == "failed"
-            && config
-                .config
-                .collectors
-                .iter()
-                .any(|collector| collector.name == output.result.name && collector.required)
+            && config.config.collectors.iter().any(|collector| {
+                matches!(collector.phase, CollectorPhase::Before)
+                    && collector.name == output.result.name
+                    && collector.required
+            })
     });
     absorb(
         before,
@@ -163,14 +159,9 @@ pub async fn execute(
             ..Default::default()
         };
     } else {
-        if !score_only {
-            println!("→ collectors: during");
-        }
-        let (running, startup_failures) = if score_only {
-            (Vec::new(), Vec::new())
-        } else {
-            collector::start_during(&config, mode, &id, &staging).await
-        };
+        println!("→ collectors: during");
+        let (running, startup_failures) =
+            collector::start_during(&config, mode, &id, &staging).await;
         absorb(
             startup_failures,
             &mut manifest,
@@ -180,13 +171,11 @@ pub async fn execute(
         );
 
         println!("→ benchmark");
-        let execution = benchmark::execute(&config, &staging, shutdown.clone(), !score_only).await;
+        let execution = benchmark::execute(&config, &staging, shutdown.clone(), true).await;
         manifest.benchmark = execution.result;
         manifest.logs.extend(execution.logs);
         store.checkpoint(&manifest)?;
-        if !score_only {
-            metrics.extend(execution.metrics);
-        }
+        metrics.extend(execution.metrics);
 
         let during = collector::stop_during(running, &staging).await;
         absorb(
@@ -197,21 +186,14 @@ pub async fn execute(
             &mut transitions,
         );
 
-        if !score_only {
-            println!("→ benchmark parsers");
-            let enriched = enrichment::run_all(&config, &id, &staging).await;
-            absorb_enrichments(enriched, &mut manifest, &mut metrics);
-        }
+        println!("→ benchmark parsers");
+        let enriched = enrichment::run_all(&config, &id, &staging).await;
+        absorb_enrichments(enriched, &mut manifest, &mut metrics);
     }
 
-    if !score_only {
-        println!("→ collectors: after");
-    }
-    let after = if score_only {
-        Vec::new()
-    } else {
-        collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None).await
-    };
+    println!("→ collectors: after");
+    let after =
+        collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None).await;
     absorb(
         after,
         &mut manifest,
@@ -220,12 +202,10 @@ pub async fn execute(
         &mut transitions,
     );
 
-    if !score_only
-        && let (Some(start), Some(end)) = (
-            manifest.benchmark.initialize_started_at,
-            manifest.benchmark.initialize_finished_at,
-        )
-    {
+    if let (Some(start), Some(end)) = (
+        manifest.benchmark.initialize_started_at,
+        manifest.benchmark.initialize_finished_at,
+    ) {
         metrics.push(crate::model::Metric {
             name: "benchmark.initialize_duration".into(),
             value: (end - start).num_microseconds().unwrap_or_default() as f64 / 1_000.0,
@@ -284,7 +264,7 @@ pub async fn execute(
     if manifest.analysis_status == AnalysisStatus::Pending {
         println!();
         println!(
-            "next      isuscope analyze {} --verdict <supported|rejected|inconclusive> --analysis <text>",
+            "next      isuscope analyze {} <supported|rejected|inconclusive> --analysis <text>",
             short_id(&id)
         );
     }

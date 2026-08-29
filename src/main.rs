@@ -2,14 +2,14 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use isuscope::{
     config::LoadedConfig,
-    doctor, enrichment, init,
+    diff, doctor, enrichment, init,
     model::{AnalysisVerdict, RunMode},
+    report::{self, RunDiagnostics, RunReport},
     runner::{self, RunAnnotations},
     shutdown::Shutdown,
     storage::{RunSummary, Store},
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::{env, fs, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
@@ -29,50 +29,44 @@ enum Commands {
         #[command(flatten)]
         annotations: AnnotationArgs,
     },
-    /// 標準collectorに行動遷移分析を加えてベンチを実行します。
-    DiscoveryRun {
+    /// 序盤の全体調査として行動遷移分析を加えてベンチを実行します。
+    SurveyRun {
         #[command(flatten)]
         annotations: AnnotationArgs,
     },
-    /// collectorを起動せず、スコア取得だけを行います。
-    ScoreRun {
-        #[command(flatten)]
-        annotations: AnnotationArgs,
-    },
-    /// run一覧、または指定したrunの詳細を表示します。
-    Show {
-        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
-        run: Option<String>,
+    /// 保存済みrunを新しい順にJSONで一覧表示します。
+    List {
+        /// 返すrun数の上限。
+        #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
+        limit: usize,
     },
     /// 最新runの人間向けUIをlocalhostで起動します。
     Ui,
-    /// 1回のrunのmanifest、collector状態、metric、transitionをJSONで出力します。
+    /// 1回のrunを構造化したReport JSONとして出力します。
     Report {
-        /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
         #[arg(default_value = "latest")]
         run: String,
-        /// 出力形式。
-        #[arg(long, value_enum, default_value = "json")]
-        format: ReportFormat,
-        /// 出力先。省略時は標準出力へ書きます。
-        #[arg(long)]
-        output: Option<PathBuf>,
-        /// 全summary metricと時刻付きmetricを含めます。
-        #[arg(long)]
-        full: bool,
     },
-    /// metric名、時刻範囲、label cardinalityを一覧表示します。
+    /// 2回のrunを全件比較後にcompact化したDiff JSONとして出力します。
+    Diff {
+        /// 比較基準のrun ID、一意な短縮ID、または一意なtagを指定します。
+        base: String,
+        /// 比較対象のrun ID、一意な短縮ID、または一意なtagを指定します。
+        candidate: String,
+    },
+    /// metric名、時刻範囲、label cardinalityをJSONで出力します。
     Metrics {
-        /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
         #[arg(default_value = "latest")]
         run: String,
     },
-    /// 時刻付きmetricをbucket化した表で表示します。
+    /// 時刻付きmetricをbucket化したJSONで出力します。
     Series {
-        /// `latest`、完全なrun ID、または一意な短縮IDを指定します。
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
         #[arg(default_value = "latest")]
         run: String,
-        /// 表示するmetric名。複数回指定できます。指定時は汎用metric表になります。
+        /// 返すmetric名。複数回指定できます。指定時は汎用metric行になります。
         #[arg(long = "metric")]
         metrics: Vec<String>,
         /// node labelで絞り込みます。
@@ -81,58 +75,39 @@ enum Commands {
         /// `key=value`形式のlabel完全一致。複数回指定できます。
         #[arg(long = "label", value_parser = parse_label_filter)]
         labels: Vec<(String, String)>,
-        /// benchmark開始からの表示開始秒。
+        /// benchmark開始からの取得開始秒。
         #[arg(long, default_value_t = 0)]
         from: u64,
-        /// benchmark開始からの表示終了秒。省略時は終了までです。
+        /// benchmark開始からの取得終了秒。省略時は終了までです。
         #[arg(long)]
         to: Option<u64>,
         /// bucket幅（秒）。
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
         bucket: u64,
-        /// 出力行数の上限。高cardinalityなperf seriesの端末氾濫を防ぎます。
+        /// 出力行数の上限。高cardinalityなperf seriesのJSON肥大化を防ぎます。
         #[arg(long, default_value_t = 1000)]
         limit: usize,
     },
     /// 保存済みbenchmark logへ現在のparserを適用します。
     Enrich {
-        /// `latest`、run ID、または一意なtagを指定します。
-        #[arg(default_value = "latest")]
+        /// run ID、一意な短縮ID、または一意なtagを指定します。
         run: String,
-    },
-    /// 保存済みrunへnoteとtagを追加・更新します。
-    Annotate {
-        /// `latest`、run ID、または一意なtagを指定します。
-        run: String,
-        /// runの説明。空文字を指定すると削除します。
-        #[arg(long)]
-        note: Option<String>,
-        /// 追加するtag。複数回指定できます。
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        /// 削除するtag。複数回指定できます。
-        #[arg(long = "remove-tag")]
-        remove_tags: Vec<String>,
     },
     /// ベンチを起動せず、設定・command・SSH・時刻・diskを検査します。
     Doctor,
     /// PASSしたrunへ仮説の判定と結果分析を追記します。
     Analyze {
-        /// `latest`、run ID、または一意なtagを指定します。
-        #[arg(default_value = "latest")]
+        /// run ID、一意な短縮ID、または一意なtagを指定します。
         run: String,
         /// 仮説の判定。
-        #[arg(long, value_enum)]
-        verdict: Option<VerdictArg>,
+        #[arg(value_enum)]
+        verdict: VerdictArg,
         /// 結果の分析本文。
         #[arg(long, conflicts_with = "analysis_file")]
         analysis: Option<String>,
         /// 結果の分析本文をUTF-8 fileから読み込みます。
         #[arg(long, conflicts_with = "analysis")]
         analysis_file: Option<PathBuf>,
-        /// 分析を省略します。理由の記録が必須です。
-        #[arg(long)]
-        skip: bool,
         /// 分析を省略する理由。
         #[arg(long)]
         reason: Option<String>,
@@ -166,7 +141,7 @@ enum Commands {
         #[arg(long)]
         series_only: bool,
     },
-    /// discovery-run用のHTTP入出力capture proxyです。
+    /// survey-run用のHTTP入出力capture proxyです。
     #[command(name = "__discovery-capture", hide = true)]
     InternalDiscoveryCapture {
         #[arg(long)]
@@ -210,6 +185,7 @@ enum VerdictArg {
     Supported,
     Rejected,
     Inconclusive,
+    Skipped,
 }
 
 impl From<VerdictArg> for AnalysisVerdict {
@@ -218,6 +194,7 @@ impl From<VerdictArg> for AnalysisVerdict {
             VerdictArg::Supported => Self::Supported,
             VerdictArg::Rejected => Self::Rejected,
             VerdictArg::Inconclusive => Self::Inconclusive,
+            VerdictArg::Skipped => Self::Skipped,
         }
     }
 }
@@ -305,37 +282,28 @@ async fn real_main() -> Result<bool> {
                     .passed,
             )
         }
-        Commands::DiscoveryRun { annotations } => Ok(runner::execute(
+        Commands::SurveyRun { annotations } => Ok(runner::execute(
             config,
-            RunMode::DiscoveryRun,
+            RunMode::SurveyRun,
             Shutdown::listen(),
             annotations.into(),
         )
         .await?
         .passed),
-        Commands::ScoreRun { annotations } => Ok(runner::execute(
-            config,
-            RunMode::ScoreRun,
-            Shutdown::listen(),
-            annotations.into(),
-        )
-        .await?
-        .passed),
-        Commands::Show { run } => {
-            show(&config, run.as_deref())?;
+        Commands::List { limit } => {
+            list_runs(&config, limit)?;
             Ok(true)
         }
         Commands::Ui => {
             isuscope::ui::serve(config, Shutdown::listen()).await?;
             Ok(true)
         }
-        Commands::Report {
-            run,
-            format,
-            output,
-            full,
-        } => {
-            show_report(&config, &run, format, output.as_deref(), full)?;
+        Commands::Report { run } => {
+            show_report(&config, &run)?;
+            Ok(true)
+        }
+        Commands::Diff { base, candidate } => {
+            show_diff(&config, &base, &candidate)?;
             Ok(true)
         }
         Commands::Metrics { run } => {
@@ -382,29 +350,6 @@ async fn real_main() -> Result<bool> {
             );
             Ok(!outcome.failed)
         }
-        Commands::Annotate {
-            run,
-            note,
-            tags,
-            remove_tags,
-        } => {
-            let mut store = Store::open(&config.data_dir)?;
-            let id = store
-                .resolve_id(&run)?
-                .with_context(|| format!("run `{run}` was not found"))?;
-            let manifest = store.annotate(&id, note, &tags, &remove_tags)?;
-            println!("run       {}", runner::short_id(&manifest.id));
-            println!("note      {}", manifest.note.as_deref().unwrap_or("-"));
-            println!(
-                "tags      {}",
-                if manifest.tags.is_empty() {
-                    "-".into()
-                } else {
-                    manifest.tags.join(",")
-                }
-            );
-            Ok(true)
-        }
         Commands::Doctor => {
             let report = doctor::run(&config).await?;
             println!();
@@ -418,25 +363,21 @@ async fn real_main() -> Result<bool> {
             verdict,
             analysis,
             analysis_file,
-            skip,
             reason,
         } => {
-            let (verdict, body) = if skip {
-                if verdict.is_some() || analysis.is_some() || analysis_file.is_some() {
+            let body = if matches!(verdict, VerdictArg::Skipped) {
+                if analysis.is_some() || analysis_file.is_some() {
                     anyhow::bail!(
-                        "--skip cannot be combined with --verdict, --analysis, or --analysis-file"
+                        "the skipped verdict cannot be combined with --analysis or --analysis-file"
                     );
                 }
-                let reason = reason
+                reason
                     .filter(|value| !value.trim().is_empty())
-                    .context("--skip requires a non-empty --reason")?;
-                (AnalysisVerdict::Skipped, reason)
+                    .context("the skipped verdict requires a non-empty --reason")?
             } else {
                 if reason.is_some() {
-                    anyhow::bail!("--reason may be used only with --skip");
+                    anyhow::bail!("--reason may be used only with the skipped verdict");
                 }
-                let verdict = verdict
-                    .context("analysis requires --verdict <supported|rejected|inconclusive>")?;
                 let body = match (analysis, analysis_file) {
                     (Some(body), None) => body,
                     (None, Some(path)) => fs::read_to_string(&path)
@@ -449,13 +390,13 @@ async fn real_main() -> Result<bool> {
                 if body.trim().is_empty() {
                     anyhow::bail!("analysis must not be empty");
                 }
-                (verdict.into(), body)
+                body
             };
             let mut store = Store::open(&config.data_dir)?;
             let id = store
                 .resolve_id(&run)?
                 .with_context(|| format!("run `{run}` was not found"))?;
-            let manifest = store.append_analysis(&id, verdict, body)?;
+            let manifest = store.append_analysis(&id, verdict.into(), body)?;
             let latest = manifest
                 .analyses
                 .last()
@@ -496,6 +437,111 @@ struct SeriesOptions {
     limit: usize,
 }
 
+#[derive(serde::Serialize)]
+struct SeriesOutput {
+    schema_version: u32,
+    run_id: String,
+    benchmark: SeriesInterval,
+    window: SeriesWindow,
+    filters: SeriesFilters,
+    coverage: Vec<SeriesCoverage>,
+    #[serde(flatten)]
+    data: SeriesData,
+}
+
+#[derive(serde::Serialize)]
+struct SeriesInterval {
+    started_at: String,
+    finished_at: String,
+}
+
+#[derive(serde::Serialize)]
+struct SeriesWindow {
+    started_at: String,
+    finished_at: String,
+    from_seconds: i64,
+    to_seconds: i64,
+    bucket_seconds: u64,
+}
+
+#[derive(serde::Serialize)]
+struct SeriesFilters {
+    metrics: Vec<String>,
+    node: Option<String>,
+    labels: Vec<SeriesLabelFilter>,
+}
+
+#[derive(serde::Serialize)]
+struct SeriesLabelFilter {
+    key: String,
+    value: String,
+}
+
+#[derive(serde::Serialize)]
+struct SeriesCoverage {
+    collector: String,
+    node: String,
+    phase: String,
+    status: String,
+    exit_code: Option<i32>,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum SeriesData {
+    Overview {
+        total_count: usize,
+        truncated: bool,
+        rows: Vec<OverviewSeriesRow>,
+    },
+    Metrics {
+        total_count: usize,
+        truncated: bool,
+        rows: Vec<MetricSeriesRow>,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct OverviewSeriesRow {
+    node: String,
+    from_seconds: i64,
+    to_seconds: i64,
+    cpu_percent_average: Option<f64>,
+    cpu_percent_max: Option<f64>,
+    memory_used_mib_average: Option<f64>,
+    load1_max: Option<f64>,
+    disk_util_percent_max: Option<f64>,
+    disk_await_ms_max: Option<f64>,
+    http_requests: Option<f64>,
+    http_p95_ms_max_of_quantile: Option<f64>,
+    http_errors: Option<f64>,
+    db_calls: Option<f64>,
+    db_total_duration_ms: Option<f64>,
+}
+
+#[derive(serde::Serialize)]
+struct MetricSeriesRow {
+    node: String,
+    from_seconds: i64,
+    to_seconds: i64,
+    metric: String,
+    value: f64,
+    unit: String,
+    aggregation: SeriesAggregation,
+    labels: BTreeMap<String, String>,
+}
+
+fn parse_list_limit(value: &str) -> std::result::Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer from 1 to 1000".to_string())?;
+    if !(1..=1000).contains(&limit) {
+        return Err("limit must be an integer from 1 to 1000".into());
+    }
+    Ok(limit)
+}
+
 fn parse_label_filter(value: &str) -> std::result::Result<(String, String), String> {
     let Some((key, value)) = value.split_once('=') else {
         return Err("label must use key=value syntax".into());
@@ -514,6 +560,31 @@ struct MetricInventory {
     first: Option<chrono::DateTime<chrono::Utc>>,
     last: Option<chrono::DateTime<chrono::Utc>>,
     labels: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(serde::Serialize)]
+struct MetricsOutput {
+    schema_version: u32,
+    run_id: String,
+    metrics: Vec<MetricInventoryOutput>,
+}
+
+#[derive(serde::Serialize)]
+struct MetricInventoryOutput {
+    name: String,
+    rows: usize,
+    timestamped_rows: usize,
+    units: Vec<String>,
+    first_observed_at: Option<String>,
+    last_observed_at: Option<String>,
+    labels: Vec<LabelInventoryOutput>,
+}
+
+#[derive(serde::Serialize)]
+struct LabelInventoryOutput {
+    key: String,
+    cardinality: usize,
+    examples: Vec<String>,
 }
 
 fn show_metrics(config: &LoadedConfig, requested: &str) -> Result<()> {
@@ -535,42 +606,31 @@ fn show_metrics(config: &LoadedConfig, requested: &str) -> Result<()> {
             entry.labels.entry(key).or_default().insert(value);
         }
     }
-    println!("run {id}");
-    println!(
-        "{:<34} {:>8} {:>8}  {:<16}  {:<20}",
-        "NAME", "ROWS", "TIMED", "UNIT", "TIME RANGE"
-    );
-    for (name, item) in &inventory {
-        let range = match (item.first, item.last) {
-            (Some(first), Some(last)) => format!("{}..{}", first.to_rfc3339(), last.to_rfc3339()),
-            _ => "aggregate-only".into(),
-        };
-        println!(
-            "{:<34} {:>8} {:>8}  {:<16}  {}",
+    let metrics = inventory
+        .into_iter()
+        .map(|(name, item)| MetricInventoryOutput {
             name,
-            item.rows,
-            item.timestamped,
-            item.units.iter().cloned().collect::<Vec<_>>().join("|"),
-            range
-        );
-        for (key, values) in &item.labels {
-            let examples = values
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "  label {:<18} values={:<6} examples={}",
-                key,
-                values.len(),
-                examples
-            );
-        }
-    }
-    if inventory.is_empty() {
-        println!("no metrics");
-    }
+            rows: item.rows,
+            timestamped_rows: item.timestamped,
+            units: item.units.into_iter().collect(),
+            first_observed_at: item.first.map(|value| value.to_rfc3339()),
+            last_observed_at: item.last.map(|value| value.to_rfc3339()),
+            labels: item
+                .labels
+                .into_iter()
+                .map(|(key, values)| LabelInventoryOutput {
+                    key,
+                    cardinality: values.len(),
+                    examples: values.into_iter().take(4).collect(),
+                })
+                .collect(),
+        })
+        .collect();
+    write_stdout_json(&MetricsOutput {
+        schema_version: 1,
+        run_id: id,
+        metrics,
+    })?;
     Ok(())
 }
 
@@ -602,7 +662,18 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         .filter(|metric| metric_matches(metric, &options, first_bucket, requested_end))
         .collect::<Vec<_>>();
     if !options.metrics.is_empty() {
-        return show_generic_series(&id, start, requested_end, &options, metrics);
+        let data = generic_series_data(start, requested_end, &options, metrics);
+        write_stdout_json(&series_output(
+            id,
+            start,
+            end,
+            requested_start,
+            requested_end,
+            &options,
+            series_coverage(&manifest.collectors),
+            data,
+        ))?;
+        return Ok(());
     }
     let mut rows = BTreeMap::<(String, i64), BucketRow>::new();
     let mut nodes = BTreeSet::new();
@@ -643,52 +714,91 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             rows.entry((node.clone(), bucket)).or_default();
         }
     }
-    println!("run {id}");
-    println!("benchmark {} .. {}", start.to_rfc3339(), end.to_rfc3339());
-    print_series_coverage(&manifest.collectors);
-    println!(
-        "bucket {}s; A/M=average/max; HTTP P95=max-of-p95 (not recomputed); -=not observed (see coverage)",
-        options.bucket
-    );
-    println!(
-        "{:<10} {:<7} {:>11} {:>9} {:>8} {:>11} {:>11} {:>9} {:>9} {:>7} {:>9} {:>10}",
-        "NODE",
-        "ELAPSED",
-        "CPU A/M%",
-        "MEM MiB",
-        "LOAD MAX",
-        "DISK U%",
-        "AWAIT ms",
-        "HTTP REQ",
-        "P95 ms",
-        "ERRORS",
-        "DB CALLS",
-        "DB TIME ms"
-    );
-    if rows.is_empty() {
-        println!("no timestamped metrics in benchmark interval");
-    }
-    for ((node, bucket), row) in rows {
-        let bucket_offset = bucket - start.timestamp();
-        let from = bucket_offset.max(0);
-        let to = (bucket_offset + bucket_seconds).min(duration.max(1));
-        println!(
-            "{:<10} {:<7} {:>11} {:>9} {:>8} {:>11} {:>11} {:>9} {:>9} {:>7} {:>9} {:>10}",
-            node,
-            format!("{from}-{to}s"),
-            avg_max(preferred_cpu(&row)),
-            average(&row.memory),
-            maximum(&row.load),
-            maximum(&row.disk_util),
-            maximum(&row.disk_await),
-            sum_or_missing(row.http_requests, &row.http_p95, row.http_errors),
-            maximum(&row.http_p95),
-            count_or_missing(row.http_errors, row.http_requests),
-            count_or_missing(row.db_calls, row.db_time),
-            count_or_missing(row.db_time, row.db_calls),
-        );
-    }
+    let rows = rows
+        .into_iter()
+        .map(|((node, bucket), row)| {
+            let bucket_offset = bucket - start.timestamp();
+            let from = bucket_offset.max(0);
+            let to = (bucket_offset + bucket_seconds).min(duration.max(1));
+            OverviewSeriesRow {
+                node,
+                from_seconds: from,
+                to_seconds: to,
+                cpu_percent_average: average_value(preferred_cpu(&row)),
+                cpu_percent_max: maximum_value(preferred_cpu(&row)),
+                memory_used_mib_average: average_value(&row.memory),
+                load1_max: maximum_value(&row.load),
+                disk_util_percent_max: maximum_value(&row.disk_util),
+                disk_await_ms_max: maximum_value(&row.disk_await),
+                http_requests: observed_sum(
+                    row.http_requests,
+                    !row.http_p95.is_empty() || row.http_errors != 0.0,
+                ),
+                http_p95_ms_max_of_quantile: maximum_value(&row.http_p95),
+                http_errors: observed_sum(row.http_errors, row.http_requests != 0.0),
+                db_calls: observed_sum(row.db_calls, row.db_time != 0.0),
+                db_total_duration_ms: observed_sum(row.db_time, row.db_calls != 0.0),
+            }
+        })
+        .collect::<Vec<_>>();
+    let total_count = rows.len();
+    write_stdout_json(&series_output(
+        id,
+        start,
+        end,
+        requested_start,
+        requested_end,
+        &options,
+        series_coverage(&manifest.collectors),
+        SeriesData::Overview {
+            total_count,
+            truncated: false,
+            rows,
+        },
+    ))?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn series_output(
+    run_id: String,
+    benchmark_start: chrono::DateTime<chrono::Utc>,
+    benchmark_end: chrono::DateTime<chrono::Utc>,
+    window_start: chrono::DateTime<chrono::Utc>,
+    window_end: chrono::DateTime<chrono::Utc>,
+    options: &SeriesOptions,
+    coverage: Vec<SeriesCoverage>,
+    data: SeriesData,
+) -> SeriesOutput {
+    SeriesOutput {
+        schema_version: 1,
+        run_id,
+        benchmark: SeriesInterval {
+            started_at: benchmark_start.to_rfc3339(),
+            finished_at: benchmark_end.to_rfc3339(),
+        },
+        window: SeriesWindow {
+            started_at: window_start.to_rfc3339(),
+            finished_at: window_end.to_rfc3339(),
+            from_seconds: (window_start - benchmark_start).num_seconds(),
+            to_seconds: (window_end - benchmark_start).num_seconds(),
+            bucket_seconds: options.bucket,
+        },
+        filters: SeriesFilters {
+            metrics: options.metrics.clone(),
+            node: options.node.clone(),
+            labels: options
+                .labels
+                .iter()
+                .map(|(key, value)| SeriesLabelFilter {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        },
+        coverage,
+        data,
+    }
 }
 
 fn metric_matches(
@@ -717,21 +827,12 @@ fn metric_matches(
         .is_some_and(|at| at.timestamp() >= first_bucket && at <= end)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 enum SeriesAggregation {
     Sum,
     Average,
     MaxOfQuantile,
-}
-
-impl SeriesAggregation {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Sum => "sum",
-            Self::Average => "average",
-            Self::MaxOfQuantile => "max-of-quantile",
-        }
-    }
 }
 
 fn aggregation_for(metric: &isuscope::model::Metric) -> SeriesAggregation {
@@ -754,14 +855,13 @@ fn aggregation_for(metric: &isuscope::model::Metric) -> SeriesAggregation {
     }
 }
 
-fn show_generic_series(
-    id: &str,
+fn generic_series_data(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
     options: &SeriesOptions,
     metrics: Vec<isuscope::model::Metric>,
-) -> Result<()> {
-    type SeriesKey = (String, i64, String, String, String);
+) -> SeriesData {
+    type SeriesKey = (String, i64, String, String, BTreeMap<String, String>);
     let mut rows = BTreeMap::<SeriesKey, (SeriesAggregation, Vec<f64>)>::new();
     let bucket_seconds = options.bucket as i64;
     for metric in metrics {
@@ -776,60 +876,48 @@ fn show_generic_series(
             .labels
             .iter()
             .filter(|(key, _)| key.as_str() != "node")
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(",");
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         let aggregation = aggregation_for(&metric);
         rows.entry((node, bucket, metric.name, metric.unit, labels))
             .or_insert_with(|| (aggregation, Vec::new()))
             .1
             .push(metric.value);
     }
-    println!("run {id}");
-    println!("benchmark {} .. {}", start.to_rfc3339(), end.to_rfc3339());
-    println!(
-        "bucket {}s; quantiles use max-of-quantile and are not recomputed",
-        options.bucket
-    );
-    println!(
-        "{:<10} {:<12} {:<34} {:>14} {:<14} {:<16}  LABELS",
-        "NODE", "ELAPSED", "METRIC", "VALUE", "UNIT", "AGGREGATION"
-    );
-    let empty = rows.is_empty();
-    let row_count = rows.len();
-    for ((node, bucket, name, unit, labels), (aggregation, values)) in
-        rows.into_iter().take(options.limit)
-    {
-        let value = match aggregation {
-            SeriesAggregation::Sum => values.iter().sum(),
-            SeriesAggregation::Average => values.iter().sum::<f64>() / values.len() as f64,
-            SeriesAggregation::MaxOfQuantile => {
-                values.iter().copied().reduce(f64::max).unwrap_or_default()
-            }
-        };
-        let from = (bucket - start.timestamp()).max(0);
-        let to =
-            (bucket - start.timestamp() + bucket_seconds).min((end - start).num_seconds().max(1));
-        println!(
-            "{:<10} {:<12} {:<34} {:>14.3} {:<14} {:<16}  {}",
-            node,
-            format!("{from}-{to}s"),
-            name,
-            value,
-            unit,
-            aggregation.name(),
-            labels
-        );
+    let total_count = rows.len();
+    let rows = rows
+        .into_iter()
+        .take(options.limit)
+        .map(
+            |((node, bucket, metric, unit, labels), (aggregation, values))| {
+                let value = match aggregation {
+                    SeriesAggregation::Sum => values.iter().sum(),
+                    SeriesAggregation::Average => values.iter().sum::<f64>() / values.len() as f64,
+                    SeriesAggregation::MaxOfQuantile => {
+                        values.iter().copied().reduce(f64::max).unwrap_or_default()
+                    }
+                };
+                let from_seconds = (bucket - start.timestamp()).max(0);
+                let to_seconds = (bucket - start.timestamp() + bucket_seconds)
+                    .min((end - start).num_seconds().max(1));
+                MetricSeriesRow {
+                    node,
+                    from_seconds,
+                    to_seconds,
+                    metric,
+                    value,
+                    unit,
+                    aggregation,
+                    labels,
+                }
+            },
+        )
+        .collect();
+    SeriesData::Metrics {
+        total_count,
+        truncated: total_count > options.limit,
+        rows,
     }
-    if empty {
-        println!("no matching timestamped metrics");
-    } else if row_count > options.limit {
-        println!(
-            "... truncated {} rows (use --limit to change the cap)",
-            row_count - options.limit
-        );
-    }
-    Ok(())
 }
 
 fn preferred_cpu(row: &BucketRow) -> &[f64] {
@@ -842,7 +930,7 @@ fn preferred_cpu(row: &BucketRow) -> &[f64] {
     }
 }
 
-fn print_series_coverage(collectors: &[isuscope::model::CollectorResult]) {
+fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<SeriesCoverage> {
     const SERIES_COLLECTORS: [&str; 6] = [
         "host-sampler",
         "sysstat",
@@ -851,351 +939,89 @@ fn print_series_coverage(collectors: &[isuscope::model::CollectorResult]) {
         "mysql-log-delta",
         "perf-series",
     ];
-    println!("coverage");
-    let relevant = collectors
+    collectors
         .iter()
         .filter(|collector| SERIES_COLLECTORS.contains(&collector.name.as_str()))
-        .collect::<Vec<_>>();
-    if relevant.is_empty() {
-        println!("  no standard series collectors recorded");
-    }
-    for collector in relevant {
-        let detail = collector.error.clone().unwrap_or_else(|| {
-            collector
-                .exit_code
-                .map(|code| format!("exit {code}"))
-                .unwrap_or_else(|| "-".into())
-        });
-        println!(
-            "  {:<20} {:<12} {:<10} {}",
-            collector.name,
-            collector.node.as_deref().unwrap_or("local"),
-            collector.status,
-            detail
-        );
-    }
+        .map(|collector| SeriesCoverage {
+            collector: collector.name.clone(),
+            node: collector.node.clone().unwrap_or_else(|| "local".into()),
+            phase: collector.phase.clone(),
+            status: collector.status.clone(),
+            exit_code: collector.exit_code,
+            error: collector.error.clone(),
+        })
+        .collect()
 }
 
-fn average(values: &[f64]) -> String {
-    if values.is_empty() {
-        "-".into()
-    } else {
-        format!("{:.1}", values.iter().sum::<f64>() / values.len() as f64)
-    }
+fn average_value(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
-fn maximum(values: &[f64]) -> String {
-    values
-        .iter()
-        .copied()
-        .reduce(f64::max)
-        .map(|value| format!("{value:.1}"))
-        .unwrap_or_else(|| "-".into())
+fn maximum_value(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(f64::max)
 }
 
-fn avg_max(values: &[f64]) -> String {
-    if values.is_empty() {
-        "-".into()
-    } else {
-        format!("{}/{}", average(values), maximum(values))
-    }
+fn observed_sum(value: f64, related_observed: bool) -> Option<f64> {
+    (value != 0.0 || related_observed).then_some(value)
 }
 
-fn count_or_missing(value: f64, evidence: f64) -> String {
-    if value == 0.0 && evidence == 0.0 {
-        "-".into()
-    } else {
-        format!("{value:.0}")
-    }
+#[derive(serde::Serialize)]
+struct RunListOutput {
+    schema_version: u32,
+    runs: Vec<RunSummary>,
 }
 
-fn sum_or_missing(value: f64, p95: &[f64], errors: f64) -> String {
-    if value == 0.0 && p95.is_empty() && errors == 0.0 {
-        "-".into()
-    } else {
-        format!("{value:.0}")
-    }
-}
-
-fn show(config: &LoadedConfig, requested: Option<&str>) -> Result<()> {
+fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
-    let Some(requested) = requested else {
-        let runs = store.list(20)?;
-        if runs.is_empty() {
-            println!("no runs");
-            print_sqlite_hint(&store, None);
-            return Ok(());
-        }
-        println!(
-            "{:<9}  {:<19}  {:<13}  {:<13}  {:<9}  {:>10}  {:<12}",
-            "RUN", "STARTED", "COMMIT", "MODE", "RESULT", "SCORE", "ANALYSIS"
-        );
-        for run in runs {
-            print_summary(&run);
-        }
-        print_sqlite_hint(&store, None);
-        return Ok(());
-    };
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run `{requested}` was not found"))?;
-    let manifest = store.load(&id)?;
-    println!("run         {}", manifest.id);
-    println!("started     {}", manifest.started_at.to_rfc3339());
-    println!(
-        "finished    {}",
-        manifest
-            .finished_at
-            .map(|value| value.to_rfc3339())
-            .unwrap_or_else(|| "-".into())
-    );
-    println!("mode        {}", manifest.mode.as_str());
-    println!("hypothesis  {}", manifest.hypothesis);
-    println!("analysis    {}", manifest.analysis_status.as_str());
-    println!("revisions   {}", manifest.analyses.len());
-    for analysis in &manifest.analyses {
-        println!(
-            "  {}  {}  {}",
-            analysis.created_at.to_rfc3339(),
-            analysis.verdict.as_str(),
-            analysis.body.replace('\n', "\n                          ")
-        );
-    }
-    println!("note        {}", manifest.note.as_deref().unwrap_or("-"));
-    println!(
-        "tags        {}",
-        if manifest.tags.is_empty() {
-            "-".into()
-        } else {
-            manifest.tags.join(",")
-        }
-    );
-    println!("state       {}", manifest.state.as_str());
-    println!(
-        "commit      {}",
-        manifest.source.commit_hash.as_deref().unwrap_or("-")
-    );
-    println!("dirty       {}", manifest.source.dirty);
-    println!("state hash  {}", manifest.source.state_sha256);
-    println!("isuscope    {}", manifest.tooling.isuscope_version);
-    println!("config hash {}", manifest.tooling.config_sha256);
-    if let Some(context) = &manifest.codex_context {
-        println!("codex file  {}", context.history_path);
-        println!("codex input {}", context.input_id);
-        println!("codex sess  {}", context.session_id);
-        println!("codex hash  {}", context.sha256);
-        println!("codex copy  {}", context.snapshot_path);
-    }
-    println!(
-        "score       {}",
-        manifest
-            .benchmark
-            .score
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".into())
-    );
-    println!(
-        "result      {}",
-        match manifest.benchmark.passed {
-            Some(true) => "PASS",
-            Some(false) => "FAIL",
-            None => "-",
-        }
-    );
-    println!("collectors  {}", manifest.collectors.len());
-    print_collector_overview(&manifest.collectors);
-    println!("enrichments {}", manifest.enrichments.len());
-    println!("metrics     {}", manifest.metric_count);
-    print_metric_overview(&store.metrics(&id)?);
-    println!("fingerprints {}", manifest.fingerprint_count);
-    println!("transitions {}", manifest.transition_count);
-    println!("logs        {}", manifest.logs.len());
-    for log in &manifest.logs {
-        println!("  {}", log.id);
-        let path = config
-            .data_dir
-            .join("runs")
-            .join(&manifest.id)
-            .join("logs")
-            .join(format!("{}.zst", log.id));
-        println!(
-            "    view    zstd -dc -- {}",
-            shell_quote(&path.display().to_string())
-        );
-    }
-    println!(
-        "path        {}",
-        runner::run_path(store.data_dir(), &id).display()
-    );
-    print_sqlite_hint(&store, Some(&id));
+    write_stdout_json(&RunListOutput {
+        schema_version: 1,
+        runs: store.list(limit)?,
+    })?;
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum ReportFormat {
-    Json,
-    Html,
+fn write_stdout_json(value: &impl serde::Serialize) -> Result<()> {
+    serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
+    println!();
+    Ok(())
 }
 
-fn show_report(
-    config: &LoadedConfig,
-    requested: &str,
-    format: ReportFormat,
-    output: Option<&std::path::Path>,
-    full: bool,
-) -> Result<()> {
+fn show_report(config: &LoadedConfig, requested: &str) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
+    let report = load_report(config, &store, requested)?;
+    write_stdout_json(&report)?;
+    Ok(())
+}
+
+fn load_report(config: &LoadedConfig, store: &Store, requested: &str) -> Result<RunReport> {
+    Ok(load_diagnostics(config, store, requested)?.into_report())
+}
+
+fn show_diff(config: &LoadedConfig, base: &str, candidate: &str) -> Result<()> {
+    let store = Store::open(&config.data_dir)?;
+    let base = load_diagnostics(config, &store, base)?;
+    let candidate = load_diagnostics(config, &store, candidate)?;
+    write_stdout_json(&diff::build(base, candidate))?;
+    Ok(())
+}
+
+fn load_diagnostics(
+    config: &LoadedConfig,
+    store: &Store,
+    requested: &str,
+) -> Result<RunDiagnostics> {
     let id = store
         .resolve_id(requested)?
         .with_context(|| format!("run `{requested}` was not found"))?;
     let latest_logs = (store.resolve_id("latest")?.as_deref() == Some(id.as_str()))
         .then(|| config.data_dir.join("latest/logs"));
-    let report = isuscope::report::build(
+    Ok(report::diagnose(
         store.load(&id)?,
         store.metrics(&id)?,
         store.transitions(&id)?,
         store.final_dir(&id).join("logs"),
         latest_logs,
-        full,
-    );
-    let mut writer: Box<dyn std::io::Write> = match output {
-        Some(path) => Box::new(fs::File::create(path)?),
-        None => Box::new(std::io::stdout().lock()),
-    };
-    match format {
-        ReportFormat::Json => isuscope::report::write_json(&report, &mut writer)?,
-        ReportFormat::Html => isuscope::report::write_html(&report, &mut writer)?,
-    }
-    writeln!(writer)?;
-    Ok(())
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn print_sqlite_hint(store: &Store, run_id: Option<&str>) {
-    let path = store.data_dir().join("isuscope.sqlite3");
-    println!("sqlite      {} (shared by all runs)", path.display());
-    match run_id {
-        Some(run_id) => {
-            let run_id = run_id.replace('\'', "''");
-            println!(
-                "sql hint    sqlite3 {} \"SELECT observed_at,name,value,unit,labels_json FROM metrics WHERE run_id='{}' ORDER BY observed_at;\"",
-                shell_display(&path),
-                run_id
-            );
-            println!(
-                "context     sqlite3 {} \"SELECT history_path,input_id,session_id,sha256 FROM run_codex_context WHERE run_id='{}';\"",
-                shell_display(&path),
-                run_id
-            );
-        }
-        None => println!(
-            "sql hint    sqlite3 {} \"SELECT id,started_at,score,state,analysis_status,hypothesis FROM runs ORDER BY started_at DESC;\"",
-            shell_display(&path)
-        ),
-    }
-    println!(
-        "compare     sqlite3 {} \"SELECT substr(run_id,-8) AS run,name,value,unit,labels_json FROM metrics WHERE name='http.request_duration' ORDER BY labels_json,run_id;\"",
-        shell_display(&path)
-    );
-}
-
-fn shell_display(path: &std::path::Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
-}
-
-fn print_collector_overview(collectors: &[isuscope::model::CollectorResult]) {
-    if collectors.is_empty() {
-        return;
-    }
-    println!("observability");
-    for collector in collectors {
-        let node = collector.node.as_deref().unwrap_or("local");
-        println!(
-            "  {:<12} {:<24} {:<12} {}",
-            collector.status, collector.name, node, collector.phase
-        );
-    }
-}
-
-fn print_metric_overview(metrics: &[isuscope::model::Metric]) {
-    if metrics.is_empty() {
-        return;
-    }
-    let mut series = BTreeMap::<(&str, &str), (usize, f64, f64)>::new();
-    for metric in metrics {
-        let entry =
-            series
-                .entry((&metric.name, &metric.unit))
-                .or_insert((0, metric.value, metric.value));
-        entry.0 += 1;
-        entry.1 = entry.1.min(metric.value);
-        entry.2 = entry.2.max(metric.value);
-    }
-    println!("metric series");
-    println!(
-        "  {:<34} {:>6}  {:>12}  {:>12}  UNIT",
-        "NAME", "ROWS", "MIN", "MAX"
-    );
-    for ((name, unit), (rows, min, max)) in series {
-        println!("  {name:<34} {rows:>6}  {min:>12.2}  {max:>12.2}  {unit}");
-    }
-}
-
-fn print_summary(run: &RunSummary) {
-    let started = run
-        .started_at
-        .get(..19)
-        .unwrap_or(&run.started_at)
-        .replace('T', " ");
-    let commit = run
-        .commit_hash
-        .as_deref()
-        .map(|value| &value[..value.len().min(10)])
-        .unwrap_or("-");
-    let dirty = if run.dirty { "*" } else { "" };
-    let result = match run.passed {
-        Some(true) => "PASS",
-        Some(false) => "FAIL",
-        None => run.state.as_str(),
-    };
-    let score = run
-        .score
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "-".into());
-    println!(
-        "{:<9}  {:<19}  {:<13}  {:<13}  {:<9}  {:>10}  {:<12}",
-        runner::short_id(&run.id),
-        started,
-        format!("{commit}{dirty}"),
-        run.mode,
-        result,
-        score,
-        run.analysis_status,
-    );
-    println!(
-        "           hypothesis  {}",
-        compact_text(&run.hypothesis, 100)
-    );
-    if let (Some(verdict), Some(body)) = (&run.latest_analysis_verdict, &run.latest_analysis_body) {
-        println!(
-            "           analysis    {}: {}",
-            verdict,
-            compact_text(body, 100)
-        );
-    }
-}
-
-fn compact_text(value: &str, max_chars: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= max_chars {
-        return compact;
-    }
-    let mut truncated = compact.chars().take(max_chars).collect::<String>();
-    truncated.push('…');
-    truncated
+    ))
 }
 
 #[cfg(test)]

@@ -74,7 +74,7 @@ async fn cleanup_node(config: &LoadedConfig, node: &NodeConfig, run_id: &str) ->
     args.push(format!("{user}@{}", node.host));
     args.push("--".into());
     let script = format!(
-        "base=/tmp/isuscope-{run_id}.perf; if sudo -n test -s \"$base.pid\" 2>/dev/null; then pid=$(sudo -n cat \"$base.pid\" 2>/dev/null || true); case $pid in ''|*[!0-9]*) ;; *) sudo -n kill -INT \"$pid\" 2>/dev/null || true ;; esac; fi; sudo -n rm -f \"$base.data\" \"$base.log\" \"$base.pid\" 2>/dev/null || true; find /tmp -maxdepth 1 -type f -name 'isuscope-{run_id}.*' -delete"
+        "base=/tmp/isuscope-{run_id}.perf; if sudo -n test -s \"$base.pid\" 2>/dev/null; then pid=$(sudo -n cat \"$base.pid\" 2>/dev/null || true); case $pid in ''|*[!0-9]*) ;; *) sudo -n kill -INT \"$pid\" 2>/dev/null || true ;; esac; fi; offcpu=/tmp/isuscope-{run_id}.offcpu; if sudo -n test -s \"$offcpu.pid\" 2>/dev/null; then pid=$(sudo -n cat \"$offcpu.pid\" 2>/dev/null || true); case $pid in ''|*[!0-9]*) ;; *) sudo -n kill -INT -- \"-$pid\" 2>/dev/null || true ;; esac; fi; sudo -n rm -f \"$base.data\" \"$base.log\" \"$base.pid\" \"$offcpu.pid\" \"$offcpu.out\" \"$offcpu.err\" 2>/dev/null || true; find /tmp -maxdepth 1 -type f -name 'isuscope-{run_id}.*' -delete"
     );
     args.push(
         ["sh", "-c", &script]
@@ -436,6 +436,9 @@ fn validate_profile_artifact(name: &str, path: &Path) -> Result<()> {
             anyhow::bail!("perf-flamegraph output is not a complete SVG document");
         }
     } else {
+        if value.lines().all(|line| line.trim().is_empty()) {
+            anyhow::bail!("offcpu output has no samples");
+        }
         for line in value.lines().filter(|line| !line.trim().is_empty()) {
             let Some((stack, count)) = line.rsplit_once(' ') else {
                 anyhow::bail!("offcpu output is not folded stack format");
@@ -1683,7 +1686,10 @@ mod tests {
         assert!(
             validate_profile_artifact(
                 "perf-flamegraph",
-                &write("valid-svg.zst", "<svg><g/></svg>")
+                &write(
+                    "valid-svg.zst",
+                    include_str!("../tests/fixtures/perf-flamegraph-isucon13-normalized.svg")
+                )
             )
             .is_ok()
         );
@@ -1692,12 +1698,30 @@ mod tests {
                 .is_err()
         );
         assert!(
-            validate_profile_artifact("offcpu", &write("valid-folded.zst", "app;lock 12\n"))
-                .is_ok()
+            validate_profile_artifact(
+                "offcpu",
+                &write(
+                    "valid-folded.zst",
+                    include_str!("../tests/fixtures/offcpu-isucon13.folded")
+                )
+            )
+            .is_ok()
         );
+        assert!(validate_profile_artifact("offcpu", &write("empty-folded.zst", "")).is_err());
         assert!(
             validate_profile_artifact("offcpu", &write("invalid-folded.zst", "not-folded"))
                 .is_err()
+        );
+
+        let acceptance: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/profile-acceptance-isucon13.json"
+        ))
+        .unwrap();
+        assert_eq!(acceptance["normal"]["nodes"], 3);
+        assert_eq!(acceptance["empty_sample"]["offcpu"], "unavailable");
+        assert_eq!(
+            acceptance["missing_dependency"]["stackcollapse_perf"],
+            "unavailable"
         );
     }
 
@@ -1757,18 +1781,13 @@ mod tests {
         .unwrap();
         assert!(alp.iter().any(|metric| {
             metric.name == "http.requests"
-                && metric.value == 1.0
-                && metric.labels.get("route").map(String::as_str) == Some("/api/users/1")
+                && metric.value == 2.0
+                && metric.labels.get("route").map(String::as_str) == Some("/api/items/1")
         }));
         assert!(
             alp.iter()
-                .any(|metric| { metric.name == "http.request_duration" && metric.value == 200.0 })
+                .any(|metric| { metric.name == "http.request_duration" && metric.value == 20.0 })
         );
-        assert!(alp.iter().any(|metric| {
-            metric.name == "http.errors"
-                && metric.value == 1.0
-                && metric.labels.get("route").map(String::as_str) == Some("/api/users/2")
-        }));
         assert!(
             parse_alp_json(
                 include_str!("../tests/fixtures/alp-json-v1.0.21-empty.json"),
@@ -1777,6 +1796,40 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+
+        let statuses = parse_alp_json(
+            include_str!("../tests/fixtures/alp-json-v1.0.21-statuses.json"),
+            None,
+        )
+        .unwrap();
+        assert!(statuses.iter().any(|metric| {
+            metric.name == "http.errors"
+                && metric.value == 2.0
+                && metric.labels.get("route").map(String::as_str) == Some("/api/items/1")
+        }));
+        for (status, count) in [("2xx", 1.0), ("3xx", 1.0), ("4xx", 1.0), ("5xx", 1.0)] {
+            assert!(statuses.iter().any(|metric| {
+                metric.name == "http.requests"
+                    && metric.value == count
+                    && metric.labels.get("status_class").map(String::as_str) == Some(status)
+            }));
+        }
+
+        let missing = parse_alp_json(
+            include_str!("../tests/fixtures/alp-json-v1.0.21-missing-fields.json"),
+            None,
+        )
+        .unwrap();
+        assert!(missing.iter().any(|metric| {
+            metric.name == "http.requests"
+                && metric.value == 1.0
+                && metric.labels.get("method").map(String::as_str) == Some("")
+        }));
+        assert!(missing.iter().any(|metric| {
+            metric.name == "http.requests"
+                && metric.value == 2.0
+                && metric.labels.get("method").map(String::as_str) == Some("GET")
+        }));
         assert!(parse_alp_json(r#"[["count","uri"],[1]]"#, None).is_err());
 
         let slp = parse_slp_tsv(include_str!("../tests/fixtures/slp-tsv-v0.2.1.tsv")).unwrap();

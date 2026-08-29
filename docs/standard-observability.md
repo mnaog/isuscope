@@ -2,7 +2,7 @@
 
 ## 結論
 
-perf、alp、slp、sysstatは「必要になってから有効化する追加機能」ではなく、`run`と`discovery-run`の全runで起動を試みる標準collectorとして設定します。一方、ツール、ログ、service、DB engineが存在することは前提にしません。各collectorは開始時に観測可能性を判定し、存在しなければ終了コード75で終了します。`discovery-run`だけが追加するのは、cookieなどの匿名識別子を利用したリクエスト間の行動遷移分析と、最初の走行で必要な場合だけ有効化する通常HTTPのrequest/response body captureです。
+perf、alp、slp、sysstatは「必要になってから有効化する追加機能」ではなく、`run`と`survey-run`の全runで起動を試みる標準collectorとして設定します。一方、ツール、ログ、service、DB engineが存在することは前提にしません。各collectorは開始時に観測可能性を判定し、存在しなければ終了コード75で終了します。`survey-run`だけが追加するのは、cookieなどの匿名識別子を利用したリクエスト間の行動遷移分析と、最初の走行で必要な場合だけ有効化する通常HTTPのrequest/response body captureです。
 
 `edge`、`app`、`db`はマシンを固定的に分類する型ではなく、collectorの配置先を選ぶための任意のtagです。1台が複数tagを持ってよく、構成変更後のrunではtagを変更して構いません。実際に使用した設定はrunのtooling snapshotへ残るため、過去runの意味は変わりません。標準設定は複数roleの兼務を前提にし、DBの有無もcollector自身が実行時に判定します。
 
@@ -28,7 +28,7 @@ name = "mysql-slow-query"
 phase = "after"
 transport = "ssh"
 roles = ["db"]
-modes = ["run", "discovery-run"]
+modes = ["run", "survey-run"]
 command = ["slp", "my", "--file", "/tmp/isuscope-{run_id}.mysql.log", "--format", "tsv", "--noheaders", "--output", "count,query,sum-query-time,p95-query-time", "--percentiles", "95"]
 parser = "slp-tsv"
 unavailable_exit_codes = [75]
@@ -48,7 +48,7 @@ required = false
 | perf | `cpu.sample_percent`, `cpu.sample_count` | `node`, `process`, `symbol`, `binary` |
 | sysstat | `host.cpu_percent`, `host.disk_util_percent`, `host.disk_await` | `node`; diskは`device` |
 
-`isuscope init`が生成するconfigにはsysstat、perf、alp、slp、optionalなFlame Graph/off-CPU collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`discovery-run`の両方で実行します。sysstat、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfは`perf record -g`でcall graphを採取し、`stackcollapse-perf.pl`と`flamegraph.pl`があればSVGを生成して完全なSVG documentか検証します。`offcputime-bpfcc`と権限があればduring phaseでfolded off-CPU stackを生成し、各非空行のstack/count形式を検証します。ツールやkernel capabilityがなければ終了コード75の`unavailable`であり、runをdegradedにしません。各ツールの生出力も圧縮保存され、直近runのSVG/folded stackは`latest/logs`へ直接展開されます。
+`isuscope init`が生成するconfigにはsysstat、perf、alp、slp、optionalなFlame Graph/off-CPU collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`survey-run`の両方で実行します。sysstat、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfは`perf record -g`でcall graphを採取し、`stackcollapse-perf.pl`と`flamegraph.pl`があればSVGを生成して完全なSVG documentか検証します。`offcputime-bpfcc`と権限があればbeforeでSSHからdetachし、afterでprocess groupへSIGINTを送り、終了と非空出力を確認してからfolded off-CPU stackを回収します。各非空行はstack/count形式か検証します。ツールやkernel capabilityがない場合とsampleが0件の場合は終了コード75の`unavailable`であり、runをdegradedにしません。各ツールの生出力も圧縮保存され、直近runのSVG/folded stackは`latest/logs`へ直接展開されます。
 
 ALP adapterと行動遷移helperは同じ`routes.toml`を使います。標準設定は各正規表現をALP 1.0.21の`--matching-groups`へ解析前に渡すため、正規化route単位のcount、status class、min/max/sum/avg、p50/p95/p99をALP自身が集計します。adapterはこれらを単位付きmetricへ変換し、`report`はrouteごとのHTTP表としてtotal時間順に返します。ALPの区切り文字と衝突するcommaをpatternへ含められず、置換後routeを一意に戻すため`replace`の`$1`などのcaptureも使用できません。該当routeは1規則ずつに分割し、固定のcanonical routeへ置換します。制約違反はcollector実行前に設定エラーとして拒否します。
 

@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn score_run_is_not_a_public_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["score-run", "--help"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
+}
+
+#[test]
+fn discovery_run_is_not_a_public_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["discovery-run", "--help"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
+}
+
+#[test]
+fn mutating_commands_require_an_explicit_run() {
+    for command in ["enrich", "analyze"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .arg(command)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{command} accepted an implicit run"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("<RUN>"));
+    }
+}
+
+#[test]
+fn diff_requires_both_runs() {
+    let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["diff", "base-only"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<CANDIDATE>"));
+}
+
+#[test]
+fn analyze_rejects_the_removed_flag_style_verdict() {
+    let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["analyze", "run-id", "--verdict", "supported"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--verdict'"));
+}
+
+#[test]
 fn adapter_can_emit_metrics_without_an_external_parser() {
     let project = tempdir().unwrap();
     let config_dir = project.path().join(".isuscope");
@@ -45,7 +100,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
         }
     }
     let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "latest"])
+        .arg("list")
         .current_dir(project.path())
         .output()
         .unwrap();
@@ -60,81 +115,5 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
             )
             .unwrap(),
         77.0
-    );
-}
-
-#[test]
-fn score_run_skips_collectors_and_benchmark_parsers() {
-    let project = tempdir().unwrap();
-    let config_dir = project.path().join(".isuscope");
-    fs::create_dir_all(&config_dir).unwrap();
-    fs::write(
-        config_dir.join("config.toml"),
-        r#"
-[benchmark]
-mode = "command"
-command = ["sh", "-c", "printf '%s\n' 'webappの初期化を行います' 'ベンチマーク走行前のデータ整合性チェック' '{\"type\":\"isuscope.result\",\"score\":321,\"pass\":true}'"]
-
-[[benchmark.parsers]]
-name = "must-not-run"
-command = ["sh", "-c", "touch parser-ran"]
-
-[[collectors]]
-name = "must-not-run"
-phase = "after"
-command = ["sh", "-c", "touch collector-ran"]
-"#,
-    )
-    .unwrap();
-    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args([
-            "score-run",
-            "--hypothesis",
-            "score mode omits observation overhead",
-            "--tag",
-            "final",
-        ])
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-    assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert!(!project.path().join("parser-ran").exists());
-    assert!(!project.path().join("collector-ran").exists());
-    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
-    let (mode, score, collectors, metrics): (String, i64, i64, i64) = database
-        .query_row(
-            "SELECT mode, score, (SELECT COUNT(*) FROM collector_runs), (SELECT COUNT(*) FROM metrics) FROM runs",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(mode, "score-run");
-    assert_eq!(score, 321);
-    assert_eq!(collectors, 0);
-    assert_eq!(metrics, 0);
-    drop(database);
-    for suffix in ["", "-wal", "-shm"] {
-        let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
-        if path.exists() {
-            fs::remove_file(path).unwrap();
-        }
-    }
-    let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "final"])
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-    assert!(restored.status.success());
-    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
-    assert_eq!(
-        database
-            .query_row("SELECT COUNT(*) FROM metrics", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        0
     );
 }

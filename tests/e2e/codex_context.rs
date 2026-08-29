@@ -101,14 +101,17 @@ run this benchmark
             "turn-current".into()
         )
     );
-    let show = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "latest"])
+    let report = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["report", "latest"])
         .current_dir(project.path())
         .output()
         .unwrap();
-    let output = String::from_utf8_lossy(&show.stdout);
-    assert!(output.contains("codex file  docs/codex-history/20260827-200000.md"));
-    assert!(output.contains("codex input turn-current"));
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(
+        report["run"]["codex_context"]["history_path"],
+        "docs/codex-history/20260827-200000.md"
+    );
+    assert_eq!(report["run"]["codex_context"]["input_id"], "turn-current");
     drop(database);
     for suffix in ["", "-wal", "-shm"] {
         let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
@@ -117,7 +120,7 @@ run this benchmark
         }
     }
     let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["show", "latest"])
+        .arg("list")
         .current_dir(project.path())
         .output()
         .unwrap();
