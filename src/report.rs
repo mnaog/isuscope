@@ -559,6 +559,7 @@ pub fn host_metrics(summary: &[Metric], series: &[Metric]) -> Vec<HostSummary> {
         let target = metric
             .labels
             .get("device")
+            .or_else(|| metric.labels.get("service"))
             .cloned()
             .unwrap_or_else(|| "host".into());
         let entry = values
@@ -695,7 +696,7 @@ fn collector_section(name: &str) -> Option<&'static str> {
         "alp" | "nginx-series" | "user-transition" => Some("http"),
         "slp" | "mysql-log-delta" | "pg-stat-statements" => Some("database"),
         "perf-report" | "perf-series" => Some("cpu"),
-        "host-sampler" | "sysstat" => Some("host"),
+        "host-sampler" | "sysstat" | "service-sampler" => Some("host"),
         "perf-flamegraph" | "offcpu" => Some("profiles"),
         _ => None,
     }
@@ -720,6 +721,7 @@ fn expected_collector_metrics(collector: &str) -> &'static [&'static str] {
         "perf-report" | "perf-series" => &["cpu.sample_percent"],
         "host-sampler" => &["host.cpu_percent", "host.memory_used_bytes"],
         "sysstat" => &["host.cpu_percent"],
+        "service-sampler" => &["service.cpu_cores", "service.memory_bytes"],
         _ => &[],
     }
 }
@@ -741,6 +743,7 @@ fn host_key(metric: &Metric) -> (String, String, String) {
         metric
             .labels
             .get("device")
+            .or_else(|| metric.labels.get("service"))
             .cloned()
             .unwrap_or_else(|| "host".into()),
     )
@@ -757,7 +760,7 @@ fn divide(numerator: f64, denominator: f64) -> Option<f64> {
     (denominator > 0.0).then(|| numerator / denominator)
 }
 fn is_host_metric(metric: &Metric) -> bool {
-    metric.name.starts_with("host.")
+    metric.name.starts_with("host.") || metric.name.starts_with("service.")
 }
 
 #[cfg(test)]

@@ -9,6 +9,11 @@ flowchart TD
     B --> D["RunDiff 全件JOIN後に上位20件"]
     C --> E["report CLI JSON・UI /・/api/report"]
     D --> F["diff CLI JSON・UI /diff・/api/diff"]
+    A --> H["query selector"]
+    H --> I["metric semantics・database view"]
+    I --> G
+    B --> J["Brief 主要項目だけ"]
+    J --> G
     E --> G["人間・AIエージェント"]
     F --> G
 ```
@@ -21,6 +26,10 @@ flowchart TD
 - CLI JSON、UI HTML、HTTP APIは`RunReport`または`RunDiff`のrendererです。renderer内でSQLite queryや性能診断を行いません。
 - `list`はrun選択だけを担当するschema付きJSONで、性能metricを解釈しません。
 - raw logは根拠データとして残し、Reportには要約とpathを入れます。UIから根拠へ辿れることを優先します。
+- `query`はSQLiteでrun、metric名、run/series scopeを先に絞り、label filterと集約を共有semantic layerで処理します。任意SQLやrenderer固有の集約規則は公開しません。
+- collectorとparserのprovenance labelはgroup化しても保持します。異なるsourceを暗黙に加算しません。scalar quantileは再集約せず、値を`null`にして理由を返します。
+- `query --base`は両runへ同じselectorとsemantic viewを適用し、安定keyでfull outer joinしてからdelta順にcompact化します。片側だけの行もadded/removedとして保持します。
+- `brief`は重複するdatabase sourceからnative collectorを優先し、coverage問題をseverityと同一collectorのnode群でまとめます。optional artifactのunavailableは件数だけを返します。
 
 この境界により、CLIとUIで数値や順位が食い違うことを防ぎます。CLIはJSONだけを返し、人間向けHTMLはlocalhost限定UIだけが提供します。UIは`/`と`/api/report`でlatestのReport、`/diff`と`/api/diff`で指定した2 runのDiffを返します。
 
@@ -28,7 +37,9 @@ flowchart TD
 
 ```console
 isuscope report latest
+isuscope brief latest
 isuscope diff BASE_RUN CANDIDATE_RUN
+isuscope query latest --base previous --metric-prefix benchmark.scenario. --group-by scenario
 isuscope list
 isuscope ui
 ```

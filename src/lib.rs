@@ -1,4 +1,5 @@
 pub mod benchmark;
+pub mod brief;
 pub mod codex_context;
 pub mod collector;
 pub mod config;
@@ -8,8 +9,10 @@ pub mod doctor;
 pub mod enrichment;
 pub mod git_snapshot;
 pub mod init;
+pub mod metric_semantics;
 pub mod model;
 pub mod process;
+pub mod query;
 pub mod report;
 pub mod runner;
 pub mod shutdown;

@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -376,6 +376,61 @@ impl Store {
             "SELECT name, value, unit, observed_at, labels_json FROM metrics WHERE run_id=?1 ORDER BY COALESCE(observed_at, ''), id",
         )?;
         let rows = statement.query_map([id], |row| {
+            let labels: String = row.get(4)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get::<_, Option<String>>(3)?,
+                labels,
+            ))
+        })?;
+        rows.map(|row| {
+            let (name, value, unit, timestamp, labels_json) = row?;
+            Ok(Metric {
+                name,
+                value,
+                unit,
+                timestamp: timestamp
+                    .map(|value| value.parse())
+                    .transpose()
+                    .context("invalid metric timestamp")?,
+                labels: serde_json::from_str(&labels_json).context("invalid metric labels")?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn query_metrics(
+        &self,
+        id: &str,
+        names: &[String],
+        prefix: Option<&str>,
+        timestamped: Option<bool>,
+    ) -> Result<Vec<Metric>> {
+        let mut sql = String::from(
+            "SELECT name, value, unit, observed_at, labels_json FROM metrics WHERE run_id=?",
+        );
+        let mut values = vec![Value::Text(id.to_owned())];
+        if !names.is_empty() {
+            sql.push_str(" AND name IN (");
+            sql.push_str(&vec!["?"; names.len()].join(","));
+            sql.push(')');
+            values.extend(names.iter().cloned().map(Value::Text));
+        }
+        if let Some(prefix) = prefix {
+            sql.push_str(" AND name LIKE ? ESCAPE '\\'");
+            values.push(Value::Text(format!("{}%", escape_like(prefix))));
+        }
+        match timestamped {
+            Some(true) => sql.push_str(" AND observed_at IS NOT NULL"),
+            Some(false) => sql.push_str(" AND observed_at IS NULL"),
+            None => {}
+        }
+        sql.push_str(" ORDER BY COALESCE(observed_at, ''), id");
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values.iter()), |row| {
             let labels: String = row.get(4)?;
             Ok((
                 row.get(0)?,
@@ -811,6 +866,13 @@ impl Store {
     }
 }
 
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn structured_snapshot_path(run_dir: &Path) -> PathBuf {
     run_dir.join("structured.json.zst")
 }
@@ -1207,5 +1269,43 @@ mod tests {
                 .unwrap(),
             7
         );
+    }
+
+    #[test]
+    fn query_metrics_filters_in_sql_by_name_prefix_and_scope() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO runs (id, started_at, mode, state, dirty, hypothesis, analysis_status) VALUES ('query-run', ?1, 'run', 'complete', 0, '', 'not_required')",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        for (name, observed_at) in [
+            ("benchmark.scenario.success", None),
+            ("benchmark.tip.total", None),
+            ("benchmark.scenario.success", Some(Utc::now().to_rfc3339())),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES ('query-run', ?1, 1, 'runs', ?2, '{}')",
+                    params![name, observed_at],
+                )
+                .unwrap();
+        }
+
+        let run_rows = store
+            .query_metrics("query-run", &[], Some("benchmark.scenario."), Some(false))
+            .unwrap();
+        assert_eq!(run_rows.len(), 1);
+        assert!(run_rows[0].timestamp.is_none());
+        let names = vec!["benchmark.scenario.success".to_owned()];
+        let series_rows = store
+            .query_metrics("query-run", &names, None, Some(true))
+            .unwrap();
+        assert_eq!(series_rows.len(), 1);
+        assert!(series_rows[0].timestamp.is_some());
     }
 }

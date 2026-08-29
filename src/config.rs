@@ -17,6 +17,8 @@ pub struct Config {
     pub tooling: ToolingConfig,
     #[serde(default)]
     pub context: ContextConfig,
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
     pub benchmark: BenchmarkConfig,
     #[serde(default)]
     pub ssh: SshConfig,
@@ -24,6 +26,13 @@ pub struct Config {
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub collectors: Vec<CollectorConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ObservabilityConfig {
+    /// systemd units sampled directly from their cgroup v2 files.
+    #[serde(default)]
+    pub service_units: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -167,6 +176,7 @@ pub enum CollectorParser {
     SlpJson,
     SlpTsv,
     Sysstat,
+    ServiceCgroup,
     PerfScript,
 }
 
@@ -353,6 +363,17 @@ fn validate(config: &Config) -> Result<()> {
                 "collector `{}` is duplicated in phase `{}`",
                 collector.name,
                 collector.phase.as_str()
+            );
+        }
+    }
+    for unit in &config.observability.service_units {
+        if unit.is_empty()
+            || !unit.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '@' | '-')
+            })
+        {
+            bail!(
+                "observability service unit `{unit}` may contain only ASCII letters, digits, `.`, `_`, `@`, and `-`"
             );
         }
     }

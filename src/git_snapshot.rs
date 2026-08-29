@@ -28,9 +28,10 @@ fn capture_git(
         .ok()
         .map(trimmed)
         .filter(|value| !value.is_empty());
-    let status = git_output_bytes(repo, &["status", "--porcelain=v1", "-z"])?;
+    let status = git_scoped_output(repo, &["status", "--porcelain=v1", "-z"], excludes)?;
     let dirty = !status.is_empty();
-    let patch = git_output_bytes(repo, &["diff", "--binary", "HEAD"]).unwrap_or_default();
+    let patch =
+        git_scoped_output(repo, &["diff", "--binary", "HEAD"], excludes).unwrap_or_default();
     fs::write(output_dir.join("working-tree.patch"), &patch)?;
 
     let untracked_raw =
@@ -166,6 +167,29 @@ fn git_output_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn git_scoped_output(repo: &Path, args: &[&str], excludes: &[PathBuf]) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.args(args).arg("--").arg(".");
+    for exclude in excludes {
+        command.arg(format!(
+            ":(exclude){}",
+            exclude.to_string_lossy().replace('\\', "/")
+        ));
+    }
+    let output = command
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("cannot execute git in {}", repo.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -219,5 +243,49 @@ mod tests {
                 .unwrap()
                 .contains("after")
         );
+    }
+
+    #[test]
+    fn configured_excludes_do_not_mark_a_git_snapshot_dirty() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        fs::create_dir_all(dir.path().join("docs/history")).unwrap();
+        fs::write(dir.path().join("app.txt"), "app\n").unwrap();
+        fs::write(dir.path().join("docs/history/session.md"), "before\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial",
+            ])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        fs::write(dir.path().join("docs/history/session.md"), "after\n").unwrap();
+        fs::write(dir.path().join("docs/history/untracked.md"), "new\n").unwrap();
+
+        let out = dir.path().join("snapshot");
+        let snapshot = capture(
+            dir.path(),
+            &out,
+            &[PathBuf::from("docs/history"), PathBuf::from("snapshot")],
+        )
+        .unwrap();
+        assert!(!snapshot.dirty);
+        assert!(snapshot.untracked.is_empty());
+        assert!(fs::read(out.join("working-tree.patch")).unwrap().is_empty());
     }
 }

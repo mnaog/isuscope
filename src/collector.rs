@@ -607,6 +607,7 @@ pub(crate) fn parse_standard_output(
         CollectorParser::SlpJson => parse_slp_json(&raw),
         CollectorParser::SlpTsv => parse_slp_tsv(&raw),
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
+        CollectorParser::ServiceCgroup => Ok(parse_service_cgroup(&raw, interval)),
         CollectorParser::PerfScript => parse_perf_script(&raw),
     }
 }
@@ -1345,8 +1346,7 @@ fn parse_sysstat(
 ) -> Vec<Metric> {
     let mut cpu_header: Option<Vec<String>> = None;
     let mut disk_header: Option<Vec<String>> = None;
-    let mut cpu = (0.0_f64, 0_u64);
-    let mut disks = BTreeMap::<String, (f64, u64, f64, u64)>::new();
+    let mut summaries = BTreeMap::<MetricKey, (f64, u64)>::new();
     let date = regex::Regex::new(r"\b(\d{2}/\d{2}/\d{2})\b")
         .ok()
         .and_then(|pattern| pattern.captures(raw))
@@ -1360,27 +1360,58 @@ fn parse_sysstat(
         }
         if let Some(header) = &cpu_header {
             let cpu_index = header.iter().position(|field| field == "CPU");
-            let idle_index = header.iter().position(|field| field == "%idle");
-            if fields.len() == header.len()
-                && cpu_index.is_some_and(|index| fields[index] == "all")
-                && let Some(idle) =
-                    idle_index.and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
+            if fields.len() == header.len() && cpu_index.is_some_and(|index| fields[index] == "all")
             {
-                let value = 100.0 - idle;
                 let timestamp = sysstat_timestamp(date, &fields);
+                if timestamp.is_none() {
+                    continue;
+                }
                 if !within_interval(timestamp, interval) {
                     continue;
                 }
-                cpu.0 += value;
-                cpu.1 += 1;
-                if let Some(timestamp) = timestamp {
-                    metrics.push(Metric {
-                        name: "host.cpu_percent".into(),
-                        value,
-                        unit: "percent".into(),
-                        timestamp: Some(timestamp),
-                        labels: BTreeMap::new(),
-                    });
+                let mut values = BTreeMap::new();
+                for (field, name) in [
+                    ("%user", "host.cpu_user_percent"),
+                    ("%nice", "host.cpu_nice_percent"),
+                    ("%system", "host.cpu_system_percent"),
+                    ("%iowait", "host.cpu_iowait_percent"),
+                    ("%steal", "host.cpu_steal_percent"),
+                    ("%idle", "host.cpu_idle_percent"),
+                ] {
+                    if let Some(value) = sysstat_value(header, &fields, &[field]) {
+                        values.insert(name, value);
+                        record_metric(
+                            &mut metrics,
+                            &mut summaries,
+                            name,
+                            value,
+                            "percent",
+                            timestamp,
+                            BTreeMap::new(),
+                        );
+                    }
+                }
+                if let Some(idle) = values.get("host.cpu_idle_percent") {
+                    // Busy intentionally excludes iowait. This matches /proc/stat's
+                    // host-sampler and keeps CPU saturation separate from storage wait.
+                    let busy = (100.0
+                        - idle
+                        - values
+                            .get("host.cpu_iowait_percent")
+                            .copied()
+                            .unwrap_or_default())
+                    .clamp(0.0, 100.0);
+                    for name in ["host.cpu_busy_percent", "host.cpu_percent"] {
+                        record_metric(
+                            &mut metrics,
+                            &mut summaries,
+                            name,
+                            busy,
+                            "percent",
+                            timestamp,
+                            BTreeMap::new(),
+                        );
+                    }
                 }
             }
         }
@@ -1396,80 +1427,208 @@ fn parse_sysstat(
             continue;
         }
         let device = fields[dev_index].to_string();
-        let values = disks.entry(device.clone()).or_default();
-        if let Some(value) = header
-            .iter()
-            .position(|field| field == "await")
-            .and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
-        {
-            let timestamp = sysstat_timestamp(date, &fields);
-            if !within_interval(timestamp, interval) {
-                continue;
-            }
-            values.0 += value;
-            values.1 += 1;
-            if let Some(timestamp) = timestamp {
-                metrics.push(Metric {
-                    name: "host.disk_await".into(),
-                    value,
-                    unit: "ms".into(),
-                    timestamp: Some(timestamp),
-                    labels: BTreeMap::from([("device".into(), device.clone())]),
-                });
-            }
+        let timestamp = sysstat_timestamp(date, &fields);
+        if timestamp.is_none() {
+            continue;
         }
-        if let Some(value) = header
-            .iter()
-            .position(|field| field == "%util")
-            .and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
-        {
-            let timestamp = sysstat_timestamp(date, &fields);
-            if !within_interval(timestamp, interval) {
-                continue;
-            }
-            values.2 += value;
-            values.3 += 1;
-            if let Some(timestamp) = timestamp {
-                metrics.push(Metric {
-                    name: "host.disk_util_percent".into(),
-                    value,
-                    unit: "percent".into(),
-                    timestamp: Some(timestamp),
-                    labels: BTreeMap::from([("device".into(), device.clone())]),
-                });
+        if !within_interval(timestamp, interval) {
+            continue;
+        }
+        let labels = BTreeMap::from([("device".into(), device)]);
+        for (headers, name, unit, multiplier) in [
+            (&["tps"][..], "host.disk_iops", "operations_per_second", 1.0),
+            (
+                &["rkB/s"][..],
+                "host.disk_read_bytes_per_second",
+                "bytes_per_second",
+                1024.0,
+            ),
+            (
+                &["wkB/s"][..],
+                "host.disk_write_bytes_per_second",
+                "bytes_per_second",
+                1024.0,
+            ),
+            (
+                &["aqu-sz", "avgqu-sz"][..],
+                "host.disk_queue_depth",
+                "requests",
+                1.0,
+            ),
+            (&["await"][..], "host.disk_await", "ms", 1.0),
+            (&["%util"][..], "host.disk_util_percent", "percent", 1.0),
+        ] {
+            if let Some(value) = sysstat_value(header, &fields, headers) {
+                record_metric(
+                    &mut metrics,
+                    &mut summaries,
+                    name,
+                    value * multiplier,
+                    unit,
+                    timestamp,
+                    labels.clone(),
+                );
             }
         }
     }
-    if cpu.1 > 0 {
+    append_metric_summaries(&mut metrics, summaries);
+    metrics
+}
+
+type MetricKey = (String, String, BTreeMap<String, String>);
+
+fn sysstat_value(header: &[String], fields: &[&str], candidates: &[&str]) -> Option<f64> {
+    candidates.iter().find_map(|candidate| {
+        header
+            .iter()
+            .position(|field| field == candidate)
+            .and_then(|index| fields[index].replace(',', ".").parse::<f64>().ok())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_metric(
+    metrics: &mut Vec<Metric>,
+    summaries: &mut BTreeMap<MetricKey, (f64, u64)>,
+    name: &str,
+    value: f64,
+    unit: &str,
+    timestamp: Option<chrono::DateTime<Utc>>,
+    labels: BTreeMap<String, String>,
+) {
+    let summary = summaries
+        .entry((name.into(), unit.into(), labels.clone()))
+        .or_default();
+    summary.0 += value;
+    summary.1 += 1;
+    if let Some(timestamp) = timestamp {
         metrics.push(Metric {
-            name: "host.cpu_percent".into(),
-            value: cpu.0 / cpu.1 as f64,
-            unit: "percent".into(),
-            timestamp: None,
-            labels: BTreeMap::new(),
+            name: name.into(),
+            value,
+            unit: unit.into(),
+            timestamp: Some(timestamp),
+            labels,
         });
     }
-    for (device, (await_sum, await_count, util_sum, util_count)) in disks {
-        let labels = BTreeMap::from([("device".into(), device)]);
-        if await_count > 0 {
-            metrics.push(Metric {
-                name: "host.disk_await".into(),
-                value: await_sum / await_count as f64,
-                unit: "ms".into(),
-                timestamp: None,
-                labels: labels.clone(),
-            });
+}
+
+fn append_metric_summaries(metrics: &mut Vec<Metric>, summaries: BTreeMap<MetricKey, (f64, u64)>) {
+    metrics.extend(
+        summaries
+            .into_iter()
+            .filter_map(|((name, unit, labels), (sum, count))| {
+                (count > 0).then_some(Metric {
+                    name,
+                    value: sum / count as f64,
+                    unit,
+                    timestamp: None,
+                    labels,
+                })
+            }),
+    );
+}
+
+fn parse_service_cgroup(
+    raw: &str,
+    interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+) -> Vec<Metric> {
+    type Counters = (chrono::DateTime<Utc>, u64, u64, u64);
+    let mut previous = BTreeMap::<String, Counters>::new();
+    let mut summaries = BTreeMap::<MetricKey, (f64, u64)>::new();
+    let mut metrics = Vec::new();
+    for line in raw.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 7 {
+            continue;
         }
-        if util_count > 0 {
-            metrics.push(Metric {
-                name: "host.disk_util_percent".into(),
-                value: util_sum / util_count as f64,
-                unit: "percent".into(),
-                timestamp: None,
-                labels,
-            });
+        let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(fields[0]) else {
+            continue;
+        };
+        let timestamp = timestamp.with_timezone(&Utc);
+        let service = fields[1].to_string();
+        let Ok(cpu_usec) = fields[2].parse::<u64>() else {
+            continue;
+        };
+        let Ok(memory) = fields[3].parse::<u64>() else {
+            continue;
+        };
+        let Ok(read_bytes) = fields[4].parse::<u64>() else {
+            continue;
+        };
+        let Ok(write_bytes) = fields[5].parse::<u64>() else {
+            continue;
+        };
+        let Ok(pids) = fields[6].parse::<u64>() else {
+            continue;
+        };
+        let prior = previous.insert(
+            service.clone(),
+            (timestamp, cpu_usec, read_bytes, write_bytes),
+        );
+        if !within_interval(Some(timestamp), interval) {
+            continue;
+        }
+        let labels = BTreeMap::from([("service".into(), service)]);
+        record_metric(
+            &mut metrics,
+            &mut summaries,
+            "service.memory_bytes",
+            memory as f64,
+            "bytes",
+            Some(timestamp),
+            labels.clone(),
+        );
+        record_metric(
+            &mut metrics,
+            &mut summaries,
+            "service.pids",
+            pids as f64,
+            "processes",
+            Some(timestamp),
+            labels.clone(),
+        );
+        let Some((prior_at, prior_cpu, prior_read, prior_write)) = prior else {
+            continue;
+        };
+        let elapsed = (timestamp - prior_at)
+            .num_microseconds()
+            .unwrap_or_default();
+        if elapsed <= 0
+            || cpu_usec < prior_cpu
+            || read_bytes < prior_read
+            || write_bytes < prior_write
+        {
+            continue;
+        }
+        for (name, value, unit) in [
+            (
+                "service.cpu_cores",
+                (cpu_usec - prior_cpu) as f64 / elapsed as f64,
+                "cores",
+            ),
+            (
+                "service.io_read_bytes_per_second",
+                (read_bytes - prior_read) as f64 * 1_000_000.0 / elapsed as f64,
+                "bytes_per_second",
+            ),
+            (
+                "service.io_write_bytes_per_second",
+                (write_bytes - prior_write) as f64 * 1_000_000.0 / elapsed as f64,
+                "bytes_per_second",
+            ),
+        ] {
+            record_metric(
+                &mut metrics,
+                &mut summaries,
+                name,
+                value,
+                unit,
+                Some(timestamp),
+                labels.clone(),
+            );
         }
     }
+    append_metric_summaries(&mut metrics, summaries);
     metrics
 }
 
@@ -1541,6 +1700,7 @@ fn make_spec(
                 run_dir,
                 node,
                 route_matching_groups.as_deref(),
+                &config.config.observability.service_units,
             )
         })
         .collect::<Vec<_>>();
@@ -1604,6 +1764,7 @@ fn replace_placeholders(
     run_dir: &Path,
     node: Option<&NodeConfig>,
     route_matching_groups: Option<&str>,
+    service_units: &[String],
 ) -> String {
     value
         .replace("{run_id}", run_id)
@@ -1620,6 +1781,7 @@ fn replace_placeholders(
             "{route_matching_groups}",
             route_matching_groups.unwrap_or_default(),
         )
+        .replace("{service_units}", &service_units.join(" "))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1919,6 +2081,24 @@ mod tests {
                 .iter()
                 .any(|metric| metric.name == "host.disk_util_percent" && metric.value == 80.0)
         );
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "host.cpu_busy_percent"
+                && metric.timestamp.is_none()
+                && metric.value == 4.5
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "host.disk_iops" && metric.timestamp.is_none() && metric.value == 10.0
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "host.disk_write_bytes_per_second"
+                && metric.timestamp.is_none()
+                && metric.value == 2048.0
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "host.disk_queue_depth"
+                && metric.timestamp.is_none()
+                && metric.value == 0.1
+        }));
     }
 
     #[test]
@@ -1974,6 +2154,52 @@ mod tests {
             }));
             assert!(metrics.iter().all(|metric| metric.value.is_finite()));
         }
+    }
+
+    #[test]
+    fn sysstat_busy_cpu_excludes_iowait() {
+        let metrics = parse_sysstat(
+            include_str!("../tests/fixtures/sysstat-ubuntu-22.04-sysstat-12.5.2.txt"),
+            None,
+        );
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "host.cpu_iowait_percent"
+                && metric.timestamp.is_some()
+                && (metric.value - 18.66).abs() < 0.000_001
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "host.cpu_busy_percent"
+                && metric.timestamp.is_some()
+                && (metric.value - 2.73).abs() < 0.000_001
+        }));
+    }
+
+    #[test]
+    fn service_cgroup_adapter_calculates_rates_and_keeps_gauges() {
+        let metrics = parse_service_cgroup(
+            "2026-08-27T12:00:00.000000000Z\tisu.service\t1000000\t1048576\t100\t200\t3\n\
+             2026-08-27T12:00:01.000000000Z\tisu.service\t2500000\t2097152\t1124\t2248\t4\n",
+            None,
+        );
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "service.cpu_cores"
+                && metric.timestamp.is_some()
+                && metric.value == 1.5
+                && metric.labels.get("service").map(String::as_str) == Some("isu.service")
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "service.io_read_bytes_per_second"
+                && metric.timestamp.is_some()
+                && metric.value == 1024.0
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "service.memory_bytes"
+                && metric.timestamp.is_none()
+                && metric.value == 1_572_864.0
+        }));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "service.pids" && metric.timestamp.is_none() && metric.value == 3.5
+        }));
     }
 
     #[test]

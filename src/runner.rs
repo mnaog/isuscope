@@ -72,10 +72,14 @@ pub async fn execute(
         context.write_snapshot(&staging)?;
     }
 
+    let mut source_excludes = config.config.source.exclude.clone();
+    if let Some(codex) = &config.config.context.codex {
+        source_excludes.push(codex.history_dir.clone());
+    }
     let source = git_snapshot::capture(
         &config.source_repo(),
         &staging.join("source"),
-        &config.config.source.exclude,
+        &source_excludes,
     )
     .unwrap_or_else(|error| SourceSnapshot {
         repository: config.source_repo().display().to_string(),

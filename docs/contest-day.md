@@ -2,7 +2,7 @@
 
 この文書は、競技開始後に初めて分かるベンチ起動方法、サーバー構成、ログ形式をisuscopeへ接続し、計測可能な状態にするためのランブックです。
 
-普段使うコマンドは`run`、`analyze`、`enrich`、`list`、`report`、`diff`です。`init`、環境設定、`survey-run`は開始直後の調査で一度だけ使います。
+普段使うコマンドは`run`、`analyze`、`enrich`、`list`、`brief`、`report`、`query`、`diff`です。`init`、環境設定、`survey-run`は開始直後の調査で一度だけ使います。
 
 ## 最短チェックリスト
 
@@ -232,6 +232,7 @@ perfはhost kernel、`perf_event_paranoid`、sudoers、kernel symbol公開範囲
 
 ```console
 isuscope metrics latest
+isuscope query latest --metric-prefix benchmark.scenario. --group-by scenario
 isuscope series latest --metric cpu.sample_count --bucket 5
 isuscope series latest --metric cpu.sample_percent --node app1 --bucket 5
 ```

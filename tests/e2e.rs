@@ -24,3 +24,5 @@ mod init;
 mod lifecycle;
 #[path = "e2e/log_rotation.rs"]
 mod log_rotation;
+#[path = "e2e/query.rs"]
+mod query;

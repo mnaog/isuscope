@@ -10,7 +10,8 @@ perf、alp、slp、sysstatは「必要になってから有効化する追加機
 
 | collector | phase | 常時取得するもの | unavailableの条件 |
 |---|---|---|---|
-| sysstat | during | CPU、diskのベンチ区間sample | `sar`がない |
+| sysstat | during | CPU内訳、disk IOPS・帯域・queue・latency・utilのベンチ区間sample | `sar`がない |
+| service-sampler | during | 指定systemd unitのCPU、memory、disk I/O、PID数 | unit未指定、cgroup v2でない、unitが停止中 |
 | perf | before/after | detachしたsystem-wide sampleとhot symbol | `perf`がない、権限不足、kernelが非対応 |
 | alp | after | route別request数、p50/p95/p99、error、bytes | access logがない、alpがない |
 | slp | after | digest別query数、合計時間、p95、rows | MySQL slow logがない、slpがない、MySQLが退役済み |
@@ -46,17 +47,25 @@ required = false
 | alp | `http.requests`, `http.errors`, `http.request_duration_sum`, `http.request_duration_mean`, `http.request_duration_min`, `http.request_duration`, `http.request_duration_max`, `http.response_bytes` | `node`, `method`, `route`; status別requestsは`status_class`、percentileは`quantile` |
 | slp/pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration`, `db.query.lock_duration`, `db.query.rows_sent`, `db.query.rows_examined` | `node`, `engine`, `digest` |
 | perf | `cpu.sample_percent`, `cpu.sample_count` | `node`, `process`, `symbol`, `binary` |
-| sysstat | `host.cpu_percent`, `host.disk_util_percent`, `host.disk_await` | `node`; diskは`device` |
+| sysstat | `host.cpu_busy_percent`, `host.cpu_{user,system,iowait,steal,idle}_percent`, `host.disk_{iops,read_bytes_per_second,write_bytes_per_second,queue_depth,await,util_percent}` | `node`; diskは`device` |
+| service-sampler | `service.cpu_cores`, `service.memory_bytes`, `service.io_{read,write}_bytes_per_second`, `service.pids` | `node`, `service` |
 
-`isuscope init`が生成するconfigにはsysstat、perf、alp、slp、optionalなFlame Graph/off-CPU collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`survey-run`の両方で実行します。sysstat、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfは`perf record -g`でcall graphを採取し、`stackcollapse-perf.pl`と`flamegraph.pl`があればSVGを生成して完全なSVG documentか検証します。`offcputime-bpfcc`と権限があればbeforeでSSHからdetachし、afterでprocess groupへSIGINTを送り、終了と非空出力を確認してからfolded off-CPU stackを回収します。各非空行はstack/count形式か検証します。ツールやkernel capabilityがない場合とsampleが0件の場合は終了コード75の`unavailable`であり、runをdegradedにしません。各ツールの生出力も圧縮保存され、直近runのSVG/folded stackは`latest/logs`へ直接展開されます。
+`isuscope init`が生成するconfigにはhost-sampler、sysstat、service-sampler、perf、alp、slp、optionalなFlame Graph/off-CPU collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`survey-run`の両方で実行します。service-samplerは`[observability].service_units`に列挙した少数のunitだけを対象にし、cgroupの累積counterをparserでrateへ変換します。sysstat、service-sampler、alp、slpのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfは`perf record -g`でcall graphを採取し、`stackcollapse-perf.pl`と`flamegraph.pl`があればSVGを生成して完全なSVG documentか検証します。`offcputime-bpfcc`と権限があればbeforeでSSHからdetachし、afterでprocess groupへSIGINTを送り、終了と非空出力を確認してからfolded off-CPU stackを回収します。各非空行はstack/count形式か検証します。ツールやkernel capabilityがない場合とsampleが0件の場合は終了コード75の`unavailable`であり、runをdegradedにしません。各ツールの生出力も圧縮保存され、直近runのSVG/folded stackは`latest/logs`へ直接展開されます。
 
 ALP adapterと行動遷移helperは同じ`routes.toml`を使います。標準設定は各正規表現をALP 1.0.21の`--matching-groups`へ解析前に渡すため、正規化route単位のcount、status class、min/max/sum/avg、p50/p95/p99をALP自身が集計します。adapterはこれらを単位付きmetricへ変換し、`report`はrouteごとのHTTP表としてtotal時間順に返します。ALPの区切り文字と衝突するcommaをpatternへ含められず、置換後routeを一意に戻すため`replace`の`$1`などのcaptureも使用できません。該当routeは1規則ずつに分割し、固定のcanonical routeへ置換します。制約違反はcollector実行前に設定エラーとして拒否します。
 
-実環境では最初にlog path・formatを確定し、`isuscope report`の統合JSONでrun全体を確認してから、`isuscope metrics`と`isuscope series`で対象とするmetricと時間帯を絞り込みます。
+実環境では最初にlog path・formatを確定し、`isuscope report`の統合JSONでrun全体を確認してから、`isuscope metrics`で名前、`isuscope query`でrun集約値、`isuscope series`で時間帯を絞り込みます。
 
 ## 時系列
 
-`host-sampler`は追加packageなしで`/proc`からCPU使用率、使用memory、load averageを1秒間隔で記録します。sysstatが利用できる環境では、CPUとdiskの各`sar` sampleもUTCの観測時刻付きで保存し、run全体平均も比較用に残します。
+`host-sampler`は追加packageなしで`/proc`からCPU内訳、使用memory、load averageを1秒間隔で記録します。busyは`100 - idle - iowait`と定義し、互換名`host.cpu_percent`も同じ値です。sysstatが利用できる環境では、CPUとdiskの各`sar` sampleもUTCの観測時刻付きで保存し、run全体平均も比較用に残します。既に`sar -d`が出力している値をparserで保持するため、disk詳細の追加によるremote側のsampling処理は増えません。
+
+初期化と負荷走行を混ぜずに見る場合は`whole`、`initialize`、`load`の名前付きwindowを使います。`query --scope series`はwindow内のgauge/rateを平均し、counterを合計します。`series`は同じwindow内をさらにbucket化します。
+
+```bash
+isuscope query latest --scope series --window load --metric-prefix service. --group-by node --group-by service
+isuscope series latest --window initialize --metric host.cpu_iowait_percent --bucket 1
+```
 
 行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logはSQL literalを`?`へ正規化したdigestごとに、run集約のquery数・合計時間・p95と5秒bucketのquery数・合計時間を出します。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、`isuscope metrics`、filter可能な`isuscope series`またはSQLiteから参照できます。
 

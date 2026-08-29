@@ -275,6 +275,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     let series: serde_json::Value = serde_json::from_slice(&series.stdout).unwrap();
     assert_eq!(series["schema_version"], 1);
     assert_eq!(series["mode"], "overview");
+    assert_eq!(series["window"]["name"], "whole");
     assert_eq!(series["window"]["bucket_seconds"], 5);
     assert_eq!(series["rows"][0]["from_seconds"], 0);
     assert!(series["rows"][0]["cpu_percent_average"].is_null());
@@ -321,6 +322,31 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert_eq!(filtered["rows"][0]["value"], 12.5);
     assert_eq!(filtered["rows"][0]["aggregation"], "average");
     assert_eq!(filtered["rows"][0]["labels"]["collector"], "calculated");
+
+    database
+        .execute(
+            "UPDATE metrics SET observed_at=?1 WHERE name='cpu'",
+            [manifest["benchmark"]["initialize_finished_at"]
+                .as_str()
+                .unwrap()],
+        )
+        .unwrap();
+    let load_query = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "query", "latest", "--scope", "series", "--window", "load", "--metric", "cpu",
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        load_query.status.success(),
+        "{}",
+        String::from_utf8_lossy(&load_query.stderr)
+    );
+    let load_query: serde_json::Value = serde_json::from_slice(&load_query.stdout).unwrap();
+    assert_eq!(load_query["selection"]["window"], "load");
+    assert_eq!(load_query["rows"][0]["value"], 12.5);
+    assert_eq!(load_query["rows"][0]["aggregation"], "average");
     assert!(run_dir.join("tooling/config.toml").is_file());
     assert!(run_dir.join("tooling/isuscope-version.txt").is_file());
     assert_eq!(manifest["schema_version"], 6);

@@ -82,14 +82,25 @@ isuscope doctor
 | `run` | 標準collectorでベンチを実行する |
 | `list` | 保存済みrunを新しい順にJSONで一覧表示する |
 | `report` | 1 runのcompactな診断JSONを出力する |
+| `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
 | `diff` | 2 runを全件比較してからcompactな差分JSONを出力する |
 | `metrics` | metric名、時刻範囲、label cardinalityをJSONで調べる |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
+| `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `ui` | 人間向けHTML UIをlocalhostで起動する |
 
-`list`、`report`、`diff`、`metrics`、`series`は機械処理しやすいJSONを返します。人が横断的に見る場合は`isuscope ui`を使います。詳しい引数は`isuscope COMMAND --help`で確認できます。
+`list`、`brief`、`report`、`diff`、`metrics`、`series`、`query`は機械処理しやすいJSONを返します。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+
+```console
+isuscope brief latest
+isuscope query latest --metric-prefix benchmark.scenario. --group-by scenario
+isuscope query latest --base previous --view database --source mysql-log-delta --label-contains digest=reservation_slots --group-by sql-shape
+isuscope query latest --base previous --view http --label-contains route=reservation
+```
+
+`query --base`は同じselectorを両runへ適用し、全件をfull outer joinしてから`--limit`を適用します。base/candidate/delta/delta percentとadded/removed/bothを返すため、対象を絞った比較で上位項目の入れ替わりを失いません。SQL shapeは可変長`IN`と複数行`VALUES`をまとめ、長いdigest exampleは短縮します。SQLiteとstructured snapshotの値は変更せず、query/briefの表示値だけを単位に応じて丸めます。
 
 ## 保存されるデータ
 
@@ -110,10 +121,11 @@ isuscope doctor
 各runにはスコアと成否、仮説と分析、Git commit・dirty patch・未追跡file hash、実行時のisuscope設定、collector出力と構造化metricを保存します。SQLiteは検索用の索引で、run directoryが記録の正本です。索引を失っても`isuscope list`の起動時に再構築されます。
 
 `[context.codex]`を設定すると、run開始時のCodex sessionと最後のUser inputを厳密に紐付けられます。別sessionや通常ターミナルへ推測でfallbackせず、解決できない場合はベンチ開始前に停止します。
+Codex会話履歴はcontextとして別途snapshotされるため、設定した`history_dir`は性能sourceのdirty判定とpatchから自動的に除外されます。
 
 ## 観測の考え方
 
-標準雛形はhost sampler、sysstat、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。
+標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。
 
 ALPはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。設計と検証の詳細は次を参照してください。
 

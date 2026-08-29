@@ -1,9 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use isuscope::{
+    brief,
     config::LoadedConfig,
     diff, doctor, enrichment, init,
-    model::{AnalysisVerdict, RunMode},
+    metric_semantics::{self, MetricAggregation},
+    model::{AnalysisVerdict, RunManifest, RunMode},
+    query::{self, DatabaseQueryOptions, HttpQueryOptions, MetricQueryOptions, QueryScope},
     report::{self, RunDiagnostics, RunReport},
     runner::{self, RunAnnotations},
     shutdown::Shutdown,
@@ -48,6 +51,15 @@ enum Commands {
         #[arg(default_value = "latest")]
         run: String,
     },
+    /// runの判断材料だけを小さい機械向けJSONで出力します。
+    Brief {
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+        /// 各性能sectionの上限。
+        #[arg(long, default_value_t = 5, value_parser = parse_list_limit)]
+        limit: usize,
+    },
     /// 2回のrunを全件比較後にcompact化したDiff JSONとして出力します。
     Diff {
         /// 比較基準のrun ID、一意な短縮ID、または一意なtagを指定します。
@@ -81,11 +93,56 @@ enum Commands {
         /// benchmark開始からの取得終了秒。省略時は終了までです。
         #[arg(long)]
         to: Option<u64>,
+        /// benchmark全体、初期化、負荷走行の名前付き区間。
+        #[arg(long, value_enum, default_value_t = SeriesWindowArg::Whole)]
+        window: SeriesWindowArg,
         /// bucket幅（秒）。
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
         bucket: u64,
         /// 出力行数の上限。高cardinalityなperf seriesのJSON肥大化を防ぎます。
         #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
+    /// 保存済みmetricをSQLiteから絞り込み、意味に沿って構造化JSONで返します。
+    Query {
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+        /// 同じselectorを適用して比較する基準run。
+        #[arg(long)]
+        base: Option<String>,
+        /// 汎用metric行またはdatabase集約を選びます。
+        #[arg(long, value_enum, default_value_t = QueryViewArg::Metrics)]
+        view: QueryViewArg,
+        /// run集約値またはtimestamp付きseries値を選びます。
+        #[arg(long, value_enum, default_value_t = QueryScopeArg::Run)]
+        scope: QueryScopeArg,
+        /// series集約に使うbenchmark全体、初期化、負荷走行の区間。
+        #[arg(long, value_enum, default_value_t = SeriesWindowArg::Whole)]
+        window: SeriesWindowArg,
+        /// 返すmetric名。複数回指定できます。
+        #[arg(long = "metric")]
+        metrics: Vec<String>,
+        /// metric名の前方一致。
+        #[arg(long)]
+        metric_prefix: Option<String>,
+        /// node labelで絞り込みます。
+        #[arg(long)]
+        node: Option<String>,
+        /// collectorまたはparser sourceで絞り込みます。
+        #[arg(long)]
+        source: Option<String>,
+        /// `key=value`形式のlabel完全一致。複数回指定できます。
+        #[arg(long = "label", value_parser = parse_label_filter)]
+        labels: Vec<(String, String)>,
+        /// `key=value`形式のlabel部分一致。複数回指定できます。
+        #[arg(long = "label-contains", value_parser = parse_label_filter)]
+        label_contains: Vec<(String, String)>,
+        /// 出力で保持するlabel。provenance labelは常に保持します。
+        #[arg(long = "group-by")]
+        group_by: Vec<String>,
+        /// 出力行数の上限。
+        #[arg(long, default_value_t = 100, value_parser = parse_list_limit)]
         limit: usize,
     },
     /// 保存済みbenchmark logへ現在のparserを適用します。
@@ -186,6 +243,45 @@ enum VerdictArg {
     Rejected,
     Inconclusive,
     Skipped,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum QueryViewArg {
+    Metrics,
+    Database,
+    Http,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum QueryScopeArg {
+    Run,
+    Series,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SeriesWindowArg {
+    Whole,
+    Initialize,
+    Load,
+}
+
+impl SeriesWindowArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::Initialize => "initialize",
+            Self::Load => "load",
+        }
+    }
+}
+
+impl From<QueryScopeArg> for QueryScope {
+    fn from(value: QueryScopeArg) -> Self {
+        match value {
+            QueryScopeArg::Run => Self::Run,
+            QueryScopeArg::Series => Self::Series,
+        }
+    }
 }
 
 impl From<VerdictArg> for AnalysisVerdict {
@@ -302,6 +398,10 @@ async fn real_main() -> Result<bool> {
             show_report(&config, &run)?;
             Ok(true)
         }
+        Commands::Brief { run, limit } => {
+            show_brief(&config, &run, limit)?;
+            Ok(true)
+        }
         Commands::Diff { base, candidate } => {
             show_diff(&config, &base, &candidate)?;
             Ok(true)
@@ -317,6 +417,7 @@ async fn real_main() -> Result<bool> {
             labels,
             from,
             to,
+            window,
             bucket,
             limit,
         } => {
@@ -329,9 +430,43 @@ async fn real_main() -> Result<bool> {
                     labels,
                     from,
                     to,
+                    window,
                     bucket,
                     limit,
                 },
+            )?;
+            Ok(true)
+        }
+        Commands::Query {
+            run,
+            base,
+            view,
+            scope,
+            window,
+            metrics,
+            metric_prefix,
+            node,
+            source,
+            labels,
+            label_contains,
+            group_by,
+            limit,
+        } => {
+            show_query(
+                &config,
+                &run,
+                base.as_deref(),
+                view,
+                scope,
+                window,
+                metrics,
+                metric_prefix,
+                node,
+                source,
+                labels,
+                label_contains,
+                group_by,
+                limit,
             )?;
             Ok(true)
         }
@@ -433,6 +568,7 @@ struct SeriesOptions {
     labels: Vec<(String, String)>,
     from: u64,
     to: Option<u64>,
+    window: SeriesWindowArg,
     bucket: u64,
     limit: usize,
 }
@@ -457,6 +593,7 @@ struct SeriesInterval {
 
 #[derive(serde::Serialize)]
 struct SeriesWindow {
+    name: String,
     started_at: String,
     finished_at: String,
     from_seconds: i64,
@@ -528,7 +665,7 @@ struct MetricSeriesRow {
     metric: String,
     value: f64,
     unit: String,
-    aggregation: SeriesAggregation,
+    aggregation: MetricAggregation,
     labels: BTreeMap<String, String>,
 }
 
@@ -634,6 +771,152 @@ fn show_metrics(config: &LoadedConfig, requested: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn show_query(
+    config: &LoadedConfig,
+    requested: &str,
+    base_requested: Option<&str>,
+    view: QueryViewArg,
+    scope: QueryScopeArg,
+    window: SeriesWindowArg,
+    metrics: Vec<String>,
+    metric_prefix: Option<String>,
+    node: Option<String>,
+    source: Option<String>,
+    labels: Vec<(String, String)>,
+    label_contains: Vec<(String, String)>,
+    group_by: Vec<String>,
+    limit: usize,
+) -> Result<()> {
+    let store = Store::open(&config.data_dir)?;
+    let id = store
+        .resolve_id(requested)?
+        .with_context(|| format!("run `{requested}` was not found"))?;
+    let base_id = base_requested
+        .map(|requested| {
+            store
+                .resolve_id(requested)?
+                .with_context(|| format!("base run `{requested}` was not found"))
+        })
+        .transpose()?;
+    let query_limit = base_id.as_ref().map_or(limit, |_| usize::MAX);
+    if !matches!(scope, QueryScopeArg::Series) && window != SeriesWindowArg::Whole {
+        bail!("--window initialize/load requires `--scope series`");
+    }
+    match view {
+        QueryViewArg::Metrics => {
+            let mut candidate_metrics = store.query_metrics(
+                &id,
+                &metrics,
+                metric_prefix.as_deref(),
+                Some(matches!(scope, QueryScopeArg::Series)),
+            )?;
+            if matches!(scope, QueryScopeArg::Series) {
+                let manifest = store.load(&id)?;
+                let (start, end) = named_window(&manifest, window)?;
+                candidate_metrics.retain(|metric| {
+                    metric
+                        .timestamp
+                        .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+                });
+            }
+            let options = MetricQueryOptions {
+                scope: scope.into(),
+                window: matches!(scope, QueryScopeArg::Series).then(|| window.as_str().to_string()),
+                metrics,
+                metric_prefix,
+                node,
+                source,
+                labels,
+                label_contains,
+                group_by,
+                limit: query_limit,
+            };
+            let candidate = query::metric_query(id, candidate_metrics, options.clone());
+            if let Some(base_id) = base_id {
+                let mut base_metrics = store.query_metrics(
+                    &base_id,
+                    &options.metrics,
+                    options.metric_prefix.as_deref(),
+                    Some(options.scope == QueryScope::Series),
+                )?;
+                if options.scope == QueryScope::Series {
+                    let manifest = store.load(&base_id)?;
+                    let (start, end) = named_window(&manifest, window)?;
+                    base_metrics.retain(|metric| {
+                        metric
+                            .timestamp
+                            .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+                    });
+                }
+                let base = query::metric_query(base_id, base_metrics, options);
+                write_stdout_json(&query::metric_query_diff(base, candidate, limit))?;
+            } else {
+                write_stdout_json(&candidate)?;
+            }
+        }
+        QueryViewArg::Database => {
+            if !matches!(scope, QueryScopeArg::Run) {
+                bail!("database view currently supports only --scope run");
+            }
+            if !metrics.is_empty() || metric_prefix.is_some() {
+                bail!("database view selects its metric set; remove --metric/--metric-prefix");
+            }
+            if group_by.iter().any(|value| value != "sql-shape") || group_by.len() > 1 {
+                bail!("database view supports only `--group-by sql-shape`");
+            }
+            let candidate_metrics =
+                store.query_metrics(&id, &[], Some("db.query."), Some(false))?;
+            let options = DatabaseQueryOptions {
+                node,
+                source,
+                labels,
+                label_contains,
+                sql_shape: group_by.first().is_some_and(|value| value == "sql-shape"),
+                limit: query_limit,
+            };
+            let candidate = query::database_query(id, candidate_metrics, options.clone());
+            if let Some(base_id) = base_id {
+                let base_metrics =
+                    store.query_metrics(&base_id, &[], Some("db.query."), Some(false))?;
+                let base = query::database_query(base_id, base_metrics, options);
+                write_stdout_json(&query::database_query_diff(base, candidate, limit))?;
+            } else {
+                write_stdout_json(&candidate)?;
+            }
+        }
+        QueryViewArg::Http => {
+            if !matches!(scope, QueryScopeArg::Run) {
+                bail!("http view currently supports only --scope run");
+            }
+            if !metrics.is_empty() || metric_prefix.is_some() {
+                bail!("http view selects its metric set; remove --metric/--metric-prefix");
+            }
+            if !group_by.is_empty() {
+                bail!("http view already groups by node, method and route; remove --group-by");
+            }
+            let candidate_metrics = store.query_metrics(&id, &[], Some("http."), Some(false))?;
+            let options = HttpQueryOptions {
+                node,
+                source,
+                labels,
+                label_contains,
+                limit: query_limit,
+            };
+            let candidate = query::http_query(id, candidate_metrics, options.clone());
+            if let Some(base_id) = base_id {
+                let base_metrics =
+                    store.query_metrics(&base_id, &[], Some("http."), Some(false))?;
+                let base = query::http_query(base_id, base_metrics, options);
+                write_stdout_json(&query::http_query_diff(base, candidate, limit))?;
+            } else {
+                write_stdout_json(&candidate)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     let id = store
@@ -646,23 +929,48 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         .finished_at
         .or(manifest.finished_at)
         .unwrap_or(start);
-    let requested_end = options
-        .to
-        .map(|seconds| start + chrono::Duration::seconds(seconds as i64))
-        .unwrap_or(end)
-        .min(end);
-    let requested_start =
-        (start + chrono::Duration::seconds(options.from as i64)).min(requested_end);
+    if options.window != SeriesWindowArg::Whole && (options.from != 0 || options.to.is_some()) {
+        bail!("--from/--to can be used only with `--window whole`");
+    }
+    let (requested_start, requested_end) = match options.window {
+        SeriesWindowArg::Whole => {
+            let requested_end = options
+                .to
+                .map(|seconds| start + chrono::Duration::seconds(seconds as i64))
+                .unwrap_or(end)
+                .min(end);
+            (
+                (start + chrono::Duration::seconds(options.from as i64)).min(requested_end),
+                requested_end,
+            )
+        }
+        SeriesWindowArg::Initialize => (
+            manifest
+                .benchmark
+                .initialize_started_at
+                .context("run has no initialize-started checkpoint")?,
+            manifest
+                .benchmark
+                .initialize_finished_at
+                .context("run has no initialize-finished checkpoint")?,
+        ),
+        SeriesWindowArg::Load => (
+            manifest
+                .benchmark
+                .initialize_finished_at
+                .context("run has no initialize-finished checkpoint")?,
+            end,
+        ),
+    };
     let bucket_seconds = options.bucket as i64;
-    let first_bucket = requested_start.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
     let duration = (end - start).num_seconds().max(0);
     let metrics = store
         .metrics(&id)?
         .into_iter()
-        .filter(|metric| metric_matches(metric, &options, first_bucket, requested_end))
+        .filter(|metric| metric_matches(metric, &options, requested_start, requested_end))
         .collect::<Vec<_>>();
     if !options.metrics.is_empty() {
-        let data = generic_series_data(start, requested_end, &options, metrics);
+        let data = generic_series_data(start, requested_start, requested_end, &options, metrics);
         write_stdout_json(&series_output(
             id,
             start,
@@ -679,7 +987,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
     let mut nodes = BTreeSet::new();
     for metric in metrics {
         let Some(at) = metric.timestamp else { continue };
-        let bucket = at.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
+        let bucket = (at.timestamp() - requested_start.timestamp()).div_euclid(bucket_seconds);
         let node = metric
             .labels
             .get("node")
@@ -688,11 +996,13 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         nodes.insert(node.clone());
         let row = rows.entry((node, bucket)).or_default();
         match metric.name.as_str() {
-            "host.cpu_percent" => match metric.labels.get("collector").map(String::as_str) {
-                Some("host-sampler") => row.cpu_host_sampler.push(metric.value),
-                Some("sysstat") => row.cpu_sysstat.push(metric.value),
-                _ => row.cpu_other.push(metric.value),
-            },
+            "host.cpu_busy_percent" | "host.cpu_percent" => {
+                match metric.labels.get("collector").map(String::as_str) {
+                    Some("host-sampler") => row.cpu_host_sampler.push(metric.value),
+                    Some("sysstat") => row.cpu_sysstat.push(metric.value),
+                    _ => row.cpu_other.push(metric.value),
+                }
+            }
             "host.memory_used_bytes" => row.memory.push(metric.value / 1_048_576.0),
             "host.load1" => row.load.push(metric.value),
             "host.disk_util_percent" => row.disk_util.push(metric.value),
@@ -709,15 +1019,16 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             _ => {}
         }
     }
+    let window_duration = (requested_end - requested_start).num_seconds().max(0);
     for node in nodes {
-        for bucket in (first_bucket..=requested_end.timestamp()).step_by(options.bucket as usize) {
+        for bucket in 0..=window_duration.div_euclid(bucket_seconds) {
             rows.entry((node.clone(), bucket)).or_default();
         }
     }
     let rows = rows
         .into_iter()
         .map(|((node, bucket), row)| {
-            let bucket_offset = bucket - start.timestamp();
+            let bucket_offset = (requested_start - start).num_seconds() + bucket * bucket_seconds;
             let from = bucket_offset.max(0);
             let to = (bucket_offset + bucket_seconds).min(duration.max(1));
             OverviewSeriesRow {
@@ -759,6 +1070,42 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
     Ok(())
 }
 
+fn named_window(
+    manifest: &RunManifest,
+    window: SeriesWindowArg,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    let benchmark_start = manifest.benchmark.started_at.unwrap_or(manifest.started_at);
+    let benchmark_end = manifest
+        .benchmark
+        .finished_at
+        .or(manifest.finished_at)
+        .unwrap_or(benchmark_start);
+    let bounds = match window {
+        SeriesWindowArg::Whole => (benchmark_start, benchmark_end),
+        SeriesWindowArg::Initialize => (
+            manifest
+                .benchmark
+                .initialize_started_at
+                .context("run has no initialize-started checkpoint")?,
+            manifest
+                .benchmark
+                .initialize_finished_at
+                .context("run has no initialize-finished checkpoint")?,
+        ),
+        SeriesWindowArg::Load => (
+            manifest
+                .benchmark
+                .initialize_finished_at
+                .context("run has no initialize-finished checkpoint")?,
+            benchmark_end,
+        ),
+    };
+    if bounds.0 > bounds.1 {
+        bail!("run has an invalid {} window", window.as_str());
+    }
+    Ok(bounds)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn series_output(
     run_id: String,
@@ -778,6 +1125,7 @@ fn series_output(
             finished_at: benchmark_end.to_rfc3339(),
         },
         window: SeriesWindow {
+            name: options.window.as_str().into(),
             started_at: window_start.to_rfc3339(),
             finished_at: window_end.to_rfc3339(),
             from_seconds: (window_start - benchmark_start).num_seconds(),
@@ -804,7 +1152,7 @@ fn series_output(
 fn metric_matches(
     metric: &isuscope::model::Metric,
     options: &SeriesOptions,
-    first_bucket: i64,
+    start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     if !options.metrics.is_empty() && !options.metrics.contains(&metric.name) {
@@ -822,47 +1170,18 @@ fn metric_matches(
     {
         return false;
     }
-    metric
-        .timestamp
-        .is_some_and(|at| at.timestamp() >= first_bucket && at <= end)
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum SeriesAggregation {
-    Sum,
-    Average,
-    MaxOfQuantile,
-}
-
-fn aggregation_for(metric: &isuscope::model::Metric) -> SeriesAggregation {
-    if metric.labels.contains_key("quantile") {
-        return SeriesAggregation::MaxOfQuantile;
-    }
-    if matches!(
-        metric.name.as_str(),
-        "http.requests"
-            | "http.errors"
-            | "http.response_bytes"
-            | "http.connection_reused_requests"
-            | "db.query.calls"
-            | "db.query.total_duration"
-            | "cpu.sample_count"
-    ) {
-        SeriesAggregation::Sum
-    } else {
-        SeriesAggregation::Average
-    }
+    metric.timestamp.is_some_and(|at| at >= start && at <= end)
 }
 
 fn generic_series_data(
-    start: chrono::DateTime<chrono::Utc>,
+    benchmark_start: chrono::DateTime<chrono::Utc>,
+    window_start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
     options: &SeriesOptions,
     metrics: Vec<isuscope::model::Metric>,
 ) -> SeriesData {
     type SeriesKey = (String, i64, String, String, BTreeMap<String, String>);
-    let mut rows = BTreeMap::<SeriesKey, (SeriesAggregation, Vec<f64>)>::new();
+    let mut rows = BTreeMap::<SeriesKey, (MetricAggregation, Vec<f64>)>::new();
     let bucket_seconds = options.bucket as i64;
     for metric in metrics {
         let Some(at) = metric.timestamp else { continue };
@@ -871,14 +1190,14 @@ fn generic_series_data(
             .get("node")
             .cloned()
             .unwrap_or_else(|| "local".into());
-        let bucket = at.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
+        let bucket = (at.timestamp() - window_start.timestamp()).div_euclid(bucket_seconds);
         let labels = metric
             .labels
             .iter()
             .filter(|(key, _)| key.as_str() != "node")
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>();
-        let aggregation = aggregation_for(&metric);
+        let aggregation = metric_semantics::time_series_aggregation(&metric);
         rows.entry((node, bucket, metric.name, metric.unit, labels))
             .or_insert_with(|| (aggregation, Vec::new()))
             .1
@@ -890,16 +1209,12 @@ fn generic_series_data(
         .take(options.limit)
         .map(
             |((node, bucket, metric, unit, labels), (aggregation, values))| {
-                let value = match aggregation {
-                    SeriesAggregation::Sum => values.iter().sum(),
-                    SeriesAggregation::Average => values.iter().sum::<f64>() / values.len() as f64,
-                    SeriesAggregation::MaxOfQuantile => {
-                        values.iter().copied().reduce(f64::max).unwrap_or_default()
-                    }
-                };
-                let from_seconds = (bucket - start.timestamp()).max(0);
-                let to_seconds = (bucket - start.timestamp() + bucket_seconds)
-                    .min((end - start).num_seconds().max(1));
+                let value = metric_semantics::aggregate(&values, aggregation).unwrap_or_default();
+                let from_seconds = ((window_start - benchmark_start).num_seconds()
+                    + bucket * bucket_seconds)
+                    .max(0);
+                let to_seconds = (from_seconds + bucket_seconds)
+                    .min((end - benchmark_start).num_seconds().max(1));
                 MetricSeriesRow {
                     node,
                     from_seconds,
@@ -931,9 +1246,10 @@ fn preferred_cpu(row: &BucketRow) -> &[f64] {
 }
 
 fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<SeriesCoverage> {
-    const SERIES_COLLECTORS: [&str; 6] = [
+    const SERIES_COLLECTORS: [&str; 7] = [
         "host-sampler",
         "sysstat",
+        "service-sampler",
         "nginx-log-delta",
         "nginx-series",
         "mysql-log-delta",
@@ -993,6 +1309,31 @@ fn show_report(config: &LoadedConfig, requested: &str) -> Result<()> {
     Ok(())
 }
 
+fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()> {
+    let store = Store::open(&config.data_dir)?;
+    let diagnostics = load_diagnostics(config, &store, requested)?;
+    let id = diagnostics.run.id.clone();
+    let benchmark_metrics = store.query_metrics(&id, &[], Some("benchmark."), Some(false))?;
+    let benchmark = query::metric_query(
+        id,
+        benchmark_metrics,
+        MetricQueryOptions {
+            scope: QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: Some("benchmark.".into()),
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        },
+    );
+    write_stdout_json(&brief::build(diagnostics, benchmark, limit))?;
+    Ok(())
+}
+
 fn load_report(config: &LoadedConfig, store: &Store, requested: &str) -> Result<RunReport> {
     Ok(load_diagnostics(config, store, requested)?.into_report())
 }
@@ -1037,5 +1378,43 @@ mod series_tests {
             ..Default::default()
         };
         assert_eq!(preferred_cpu(&row), &[80.0]);
+    }
+
+    #[test]
+    fn database_rows_are_summed_when_rebucketed() {
+        let start = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let metrics = [10.0, 20.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| isuscope::model::Metric {
+                name: "db.query.rows_examined".into(),
+                value,
+                unit: "rows".into(),
+                timestamp: Some(start + chrono::Duration::seconds(index as i64 * 5)),
+                labels: BTreeMap::from([("digest".into(), "select ?".into())]),
+            })
+            .collect();
+        let data = generic_series_data(
+            start,
+            start,
+            start + chrono::Duration::seconds(60),
+            &SeriesOptions {
+                metrics: vec!["db.query.rows_examined".into()],
+                node: None,
+                labels: Vec::new(),
+                from: 0,
+                to: None,
+                window: SeriesWindowArg::Whole,
+                bucket: 3600,
+                limit: 100,
+            },
+            metrics,
+        );
+        let SeriesData::Metrics { rows, .. } = data else {
+            panic!("expected metric rows")
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, 30.0);
+        assert_eq!(rows[0].aggregation, MetricAggregation::Sum);
     }
 }
