@@ -1,5 +1,5 @@
 use crate::{
-    benchmark, codex_context,
+    agent_context, benchmark,
     collector::{self, CollectorOutput},
     config::{CollectorPhase, LoadedConfig},
     enrichment::{self, EnrichmentOutput},
@@ -62,19 +62,19 @@ pub async fn execute(
             short_id(&run.id),
         );
     }
-    let codex_context = codex_context::resolve(&config)?;
+    let agent_context = agent_context::resolve(&config)?;
     let id = Uuid::now_v7().to_string();
     let staging = store.staging_dir(&id);
     fs::create_dir_all(staging.join("source"))?;
     fs::create_dir_all(staging.join("logs"))?;
     fs::create_dir_all(staging.join("tmp"))?;
-    if let Some(context) = &codex_context {
+    if let Some(context) = &agent_context {
         context.write_snapshot(&staging)?;
     }
 
     let mut source_excludes = config.config.source.exclude.clone();
-    if let Some(codex) = &config.config.context.codex {
-        source_excludes.push(codex.history_dir.clone());
+    if let Some(history_dir) = config.config.context.history_dir() {
+        source_excludes.push(history_dir.to_path_buf());
     }
     let source = git_snapshot::capture(
         &config.source_repo(),
@@ -111,7 +111,7 @@ pub async fn execute(
         tags: annotations.tags,
         source,
         tooling,
-        codex_context: codex_context.map(|context| context.metadata),
+        agent_context: agent_context.map(|context| context.metadata),
         benchmark: BenchmarkResult::default(),
         collectors: Vec::new(),
         enrichments: Vec::new(),
@@ -359,9 +359,10 @@ fn print_header(manifest: &RunManifest, config: &LoadedConfig) {
             ""
         }
     );
-    if let Some(context) = &manifest.codex_context {
+    if let Some(context) = &manifest.agent_context {
         println!(
-            "context   {}#{}",
+            "context   {} {}#{}",
+            context.agent,
             context.history_path,
             short_id(&context.input_id)
         );

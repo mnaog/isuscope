@@ -22,8 +22,8 @@ fn init_is_non_interactive_and_preserves_existing_files() {
             .contains(".isuscope/benchmark.sh")
     );
     let generated = fs::read_to_string(&config).unwrap();
-    assert!(generated.contains("# [context.codex]"));
-    assert!(generated.contains("# history_dir = \"docs/codex-history\""));
+    assert!(generated.contains("# [context.agent]"));
+    assert!(generated.contains("# history_dir = \"docs/agent-history\""));
     assert!(generated.contains("$log.$1"));
     assert!(generated.contains("failed fingerprint validation"));
     assert!(generated.contains("gzip -t"));

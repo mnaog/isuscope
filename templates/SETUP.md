@@ -4,7 +4,7 @@
 
 1. ベンチ起動方法を調べ、`benchmark.sh`冒頭の契約に従って当日実装する
 2. 必要なら`parse-benchmark.sh`で問題固有のbenchmark出力をmetric JSONLへ変換する
-3. Codex会話履歴とrunを紐付ける場合は、新しいCodexセッションを開始する前に`UserPromptSubmit` hookを導入・信頼し、`[context.codex]`を有効化する
+3. Codex・Claude Codeの会話履歴とrunを紐付ける場合は、新しいセッションを開始する前に共通の会話履歴hookを導入・信頼し、`[context.agent]`を有効化する
 4. SSH可能なnode、role、identity fileを`[[nodes]]`と`[ssh]`へ設定する。roleは固定的な種類ではなく、複数指定・run間の変更が可能なcollector選択tag
 5. Nginxアクセスログに時刻、匿名化session、method、URIがあるか確認する
 6. 生成済みのsysstat、perf、host-sampler、service-sampler、alp、slp、optionalなperf-flamegraph/offcpu collectorを確認する。`[observability].service_units`には実際に負荷を担う少数のsystemd unitだけを指定し、不要なら空のままにする。アクセスログ・slow logのpathとformat（時系列用field名を含む）を実環境へ合わせる。Flame Graph scriptsや`offcputime-bpfcc`がなければcollectorは`unavailable`になる。既定commandはalp 1.0.21とslp 0.2.1で検証済み。ALPの正確なcount、status、sum/avg、p50/p95/p99集約のため、`routes.toml`はpatternにcomma、replaceに`$1`などのcaptureを使わず、1規則から固定canonical routeへ置換する
@@ -22,4 +22,4 @@ remote変更を行う場合は、既存ファイルのbackup、設定検証、at
 
 改善前後の対象を絞った比較には`isuscope query CANDIDATE --base BASE ...`を使います。両runへ同じfilterを適用し、全件比較後にlimitされます。
 
-`[context.codex]`を有効にした場合、runは`CODEX_SESSION_ID`または`CODEX_THREAD_ID`と一致するhistory fileだけを採用し、最後のUser `turn_id`をinput IDとして保存します。通常ターミナル、別セッション、hook未起動ではfallbackせず、benchmarkを開始しません。
+`[context.agent]`を有効にした場合、runはCodexの`CODEX_SESSION_ID`／`CODEX_THREAD_ID`、またはClaude Codeの`CLAUDE_CODE_SESSION_ID`と一致するhistory fileだけを採用し、最後のUser入力のID（Codexは`turn_id`、Claude Codeは`prompt_id`）をinput IDとして保存します。旧名の`[context.codex]`も読み込めます。通常ターミナル、別セッション、hook未起動ではfallbackせず、benchmarkを開始しません。

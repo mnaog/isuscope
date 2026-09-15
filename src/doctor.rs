@@ -1,5 +1,5 @@
 use crate::{
-    codex_context,
+    agent_context,
     config::{BenchmarkMode, CollectorConfig, LoadedConfig, NodeConfig, Transport, resolve},
 };
 use anyhow::{Context, Result};
@@ -47,7 +47,7 @@ pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
     report.pass(format!("config {}", config.config_path.display()));
     check_data_dir(config, &mut report);
-    check_codex_context(config, &mut report);
+    check_agent_context(config, &mut report);
     check_tooling(config, &mut report).await;
     check_commands(config, &mut report);
     check_identity(config, &mut report);
@@ -56,32 +56,41 @@ pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
     Ok(report)
 }
 
-fn check_codex_context(config: &LoadedConfig, report: &mut DoctorReport) {
-    let Some(history_dir) = config.codex_history_dir() else {
+fn check_agent_context(config: &LoadedConfig, report: &mut DoctorReport) {
+    let Some(history_dir) = config.agent_history_dir() else {
         return;
     };
-    match codex_context::valid_history_files(&history_dir) {
+    match agent_context::valid_history_files(&history_dir) {
         Ok(0) => report.fail(format!(
-            "Codex history directory has no valid session Markdown: {}",
+            "agent history directory has no valid session Markdown: {}",
             history_dir.display()
         )),
         Ok(count) => report.pass(format!(
-            "Codex history directory: {} ({count} session file(s))",
+            "agent history directory: {} ({count} session file(s))",
             history_dir.display()
         )),
-        Err(error) => report.fail(format!("Codex history is not readable: {error:#}")),
+        Err(error) => report.fail(format!("agent history is not readable: {error:#}")),
     }
-    if env::var_os("CODEX_SESSION_ID").is_none() && env::var_os("CODEX_THREAD_ID").is_none() {
-        report.warn("Codex session linkage cannot be verified outside a Codex-launched process");
+    if [
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CLAUDE_CODE_SESSION_ID",
+    ]
+    .iter()
+    .all(|name| env::var_os(name).is_none())
+    {
+        report.warn(
+            "agent session linkage cannot be verified outside a Codex or Claude Code process",
+        );
         return;
     }
-    match codex_context::resolve(config) {
+    match agent_context::resolve(config) {
         Ok(Some(context)) => report.pass(format!(
-            "Codex context resolved: {}#{}",
-            context.metadata.history_path, context.metadata.input_id
+            "agent context resolved: {} {}#{}",
+            context.metadata.agent, context.metadata.history_path, context.metadata.input_id
         )),
         Ok(None) => {}
-        Err(error) => report.fail(format!("Codex context cannot be resolved: {error:#}")),
+        Err(error) => report.fail(format!("agent context cannot be resolved: {error:#}")),
     }
 }
 

@@ -37,11 +37,22 @@ pub struct ObservabilityConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ContextConfig {
-    pub codex: Option<CodexContextConfig>,
+    pub agent: Option<AgentContextConfig>,
+    /// Legacy spelling kept so existing projects load; `agent` is preferred.
+    pub codex: Option<AgentContextConfig>,
+}
+
+impl ContextConfig {
+    pub fn history_dir(&self) -> Option<&Path> {
+        self.agent
+            .as_ref()
+            .or(self.codex.as_ref())
+            .map(|context| context.history_dir.as_path())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct CodexContextConfig {
+pub struct AgentContextConfig {
     pub history_dir: PathBuf,
 }
 
@@ -296,25 +307,26 @@ impl LoadedConfig {
             .unwrap_or_else(|| self.project_root.clone())
     }
 
-    pub fn codex_history_dir(&self) -> Option<PathBuf> {
+    pub fn agent_history_dir(&self) -> Option<PathBuf> {
         self.config
             .context
-            .codex
-            .as_ref()
-            .map(|codex| resolve(&self.source_repo(), &codex.history_dir))
+            .history_dir()
+            .map(|history_dir| resolve(&self.source_repo(), history_dir))
     }
 }
 
 fn validate(config: &Config) -> Result<()> {
-    if let Some(codex) = &config.context.codex
-        && (codex.history_dir.as_os_str().is_empty()
-            || codex.history_dir.is_absolute()
-            || codex
-                .history_dir
+    if config.context.agent.is_some() && config.context.codex.is_some() {
+        bail!("use only context.agent; context.codex is its legacy name");
+    }
+    if let Some(history_dir) = config.context.history_dir()
+        && (history_dir.as_os_str().is_empty()
+            || history_dir.is_absolute()
+            || history_dir
                 .components()
                 .any(|component| !matches!(component, std::path::Component::Normal(_))))
     {
-        bail!("context.codex.history_dir must be a non-empty relative path without `..`");
+        bail!("context.agent.history_dir must be a non-empty relative path without `..`");
     }
     if matches!(config.benchmark.mode, BenchmarkMode::Command)
         && config.benchmark.command.is_empty()

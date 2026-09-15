@@ -123,7 +123,7 @@ impl Store {
                     manifest.analysis_status.as_str(),
                 ],
             )?;
-            persist_codex_context(&self.connection, &manifest)?;
+            persist_agent_context(&self.connection, &manifest)?;
             self.connection.execute(
                 "UPDATE runs SET finished_at=?2, state=?3, score=?4, passed=0, exit_code=?5, analysis_status=?6 WHERE id=?1",
                 params![
@@ -172,7 +172,7 @@ impl Store {
                 manifest.analysis_status.as_str(),
             ],
         )?;
-        persist_codex_context(&self.connection, manifest)?;
+        persist_agent_context(&self.connection, manifest)?;
         for tag in &manifest.tags {
             self.connection.execute(
                 "INSERT INTO run_tags (run_id, tag) VALUES (?1, ?2)",
@@ -218,7 +218,7 @@ impl Store {
                 manifest.analysis_status.as_str(),
             ],
         )?;
-        persist_codex_context(&transaction, manifest)?;
+        persist_agent_context(&transaction, manifest)?;
         for log in &manifest.logs {
             transaction.execute(
                 "INSERT INTO logs (id, run_id, kind, node) VALUES (?1, ?2, ?3, ?4)",
@@ -898,7 +898,7 @@ impl Store {
                 ],
             )?;
         }
-        persist_codex_context(&transaction, manifest)?;
+        persist_agent_context(&transaction, manifest)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1216,8 +1216,9 @@ fn migrate(connection: &Connection) -> Result<()> {
             body TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS run_analyses_run_created ON run_analyses(run_id, created_at);
-        CREATE TABLE IF NOT EXISTS run_codex_context (
+        CREATE TABLE IF NOT EXISTS run_agent_context (
             run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+            agent TEXT NOT NULL,
             history_path TEXT NOT NULL,
             session_id TEXT NOT NULL,
             input_id TEXT NOT NULL,
@@ -1227,6 +1228,20 @@ fn migrate(connection: &Connection) -> Result<()> {
         UPDATE runs SET mode = 'survey-run' WHERE mode = 'discovery-run';
         ",
     )?;
+    let legacy_context: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_codex_context')",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy_context {
+        connection.execute_batch(
+            "
+            INSERT OR IGNORE INTO run_agent_context (run_id, agent, history_path, session_id, input_id, snapshot_path, sha256)
+                SELECT run_id, 'codex', history_path, session_id, input_id, snapshot_path, sha256 FROM run_codex_context;
+            DROP TABLE run_codex_context;
+            ",
+        )?;
+    }
     ensure_column(connection, "run_analyses", "base_run_id", "TEXT")?;
     connection.execute_batch("
         CREATE TABLE IF NOT EXISTS changes (id TEXT PRIMARY KEY, description TEXT NOT NULL, created_at TEXT NOT NULL, target TEXT);
@@ -1247,14 +1262,15 @@ fn migrate(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn persist_codex_context(connection: &Connection, manifest: &RunManifest) -> Result<()> {
-    let Some(context) = &manifest.codex_context else {
+fn persist_agent_context(connection: &Connection, manifest: &RunManifest) -> Result<()> {
+    let Some(context) = &manifest.agent_context else {
         return Ok(());
     };
     connection.execute(
-        "INSERT OR REPLACE INTO run_codex_context (run_id, history_path, session_id, input_id, snapshot_path, sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR REPLACE INTO run_agent_context (run_id, agent, history_path, session_id, input_id, snapshot_path, sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             manifest.id,
+            context.agent,
             context.history_path,
             context.session_id,
             context.input_id,
@@ -1300,7 +1316,7 @@ mod tests {
             tags: Vec::new(),
             source: SourceSnapshot::default(),
             tooling: ToolingSnapshot::default(),
-            codex_context: None,
+            agent_context: None,
             benchmark: BenchmarkResult::default(),
             collectors: Vec::new(),
             enrichments: Vec::new(),

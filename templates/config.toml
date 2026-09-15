@@ -13,10 +13,10 @@ include = ["benchmark.sh", "parse-benchmark.sh", "fingerprint.sh"]
 # cgroup v2から軽量に追うsystemd unit。例: ["nginx.service", "mysql.service", "isu.service"]
 service_units = []
 
-# Codex hookが生成する会話履歴と各ベンチを厳密に紐付ける場合だけ有効化します。
-# 設定するとCodex session/inputを解決できないrunはベンチ開始前に拒否されます。
-# [context.codex]
-# history_dir = "docs/codex-history"
+# Codex・Claude Codeの共通hookが生成する会話履歴と各ベンチを厳密に紐付ける場合だけ有効化します。
+# 設定するとagent session/inputを解決できないrunはベンチ開始前に拒否されます。
+# [context.agent]
+# history_dir = "docs/agent-history"
 
 [benchmark]
 mode = "command"

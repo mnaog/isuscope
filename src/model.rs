@@ -125,8 +125,15 @@ pub struct ToolingSnapshot {
     pub error: Option<String>,
 }
 
+fn default_agent() -> String {
+    "codex".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CodexContext {
+pub struct AgentContext {
+    /// Runs recorded before Claude Code support only linked Codex sessions.
+    #[serde(default = "default_agent")]
+    pub agent: String,
     pub history_path: String,
     pub session_id: String,
     pub input_id: String,
@@ -235,7 +242,8 @@ pub struct RunManifest {
     #[serde(default)]
     pub tooling: ToolingSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_context: Option<CodexContext>,
+    #[serde(alias = "codex_context")]
+    pub agent_context: Option<AgentContext>,
     pub benchmark: BenchmarkResult,
     pub collectors: Vec<CollectorResult>,
     #[serde(default)]

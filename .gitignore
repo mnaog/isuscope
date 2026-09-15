@@ -1,5 +1,6 @@
 /target/
 /dist/
+/docs/agent-history/
 /docs/codex-history/
 /.isuscope/runs/
 /.isuscope/isuscope.sqlite3
