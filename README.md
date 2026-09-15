@@ -105,7 +105,7 @@ isuscope doctor
 | `doctor` | ベンチを起動せず、設定・command・SSH・時刻・diskを検査する |
 | `survey-run` | 序盤の全体調査を1回行い、行動遷移も収集する |
 | `run` | 標準collectorでベンチを実行する |
-| `list` | 保存済みrunを新しい順にJSONで一覧表示する |
+| `list` | 保存済みrunを新しい順にJSONで一覧表示する。`--since 4h`などで開始時刻を絞る |
 | `report` | 1 runのcompactな診断JSONを出力する |
 | `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
 | `diff` | 2 runを全件比較してからcompactな差分JSONを出力する |

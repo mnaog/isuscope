@@ -47,6 +47,9 @@ enum Commands {
         /// 返すrun数の上限。
         #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
         limit: usize,
+        /// この時点以降に開始したrunだけを返します。`4h`、`30m`、`2d`などの経過時間かRFC 3339時刻。
+        #[arg(long, value_parser = parse_since)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// 最新runの人間向けUIをlocalhostで起動します。
     Ui,
@@ -426,8 +429,8 @@ async fn real_main() -> Result<bool> {
         )
         .await?
         .passed),
-        Commands::List { limit } => {
-            list_runs(&config, limit)?;
+        Commands::List { limit, since } => {
+            list_runs(&config, limit, since)?;
             Ok(true)
         }
         Commands::Ui => {
@@ -737,6 +740,25 @@ struct MetricSeriesRow {
     unit: String,
     aggregation: MetricAggregation,
     labels: BTreeMap<String, String>,
+}
+
+fn parse_since(value: &str) -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(at.with_timezone(&chrono::Utc));
+    }
+    let invalid = || "since must be a duration such as 30m, 4h, 2d or an RFC 3339 time".to_string();
+    let (amount, unit) = value.split_at(value.len().saturating_sub(1));
+    let amount = amount.parse::<i64>().map_err(|_| invalid())?;
+    let duration = match unit {
+        "m" => chrono::Duration::minutes(amount),
+        "h" => chrono::Duration::hours(amount),
+        "d" => chrono::Duration::days(amount),
+        _ => return Err(invalid()),
+    };
+    if amount <= 0 {
+        return Err(invalid());
+    }
+    Ok(chrono::Utc::now() - duration)
 }
 
 fn parse_list_limit(value: &str) -> std::result::Result<usize, String> {
@@ -1357,11 +1379,15 @@ struct RunListOutput {
     runs: Vec<RunSummary>,
 }
 
-fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
+fn list_runs(
+    config: &LoadedConfig,
+    limit: usize,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     write_stdout_json(&RunListOutput {
         schema_version: 1,
-        runs: store.list(limit)?,
+        runs: store.list_since(limit, since)?,
     })?;
     Ok(())
 }

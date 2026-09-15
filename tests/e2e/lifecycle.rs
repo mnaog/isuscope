@@ -66,3 +66,46 @@ command = ["sh", "-c", "printf cleaned > cleanup-ran"]
         0
     );
 }
+
+#[test]
+fn list_since_filters_runs_by_start_time() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":0,\"pass\":false}'"]
+"#,
+    )
+    .unwrap();
+    Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "a run to count"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let count = |since: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(["list", "--since", since])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        listed["runs"].as_array().unwrap().len()
+    };
+    assert_eq!(count("4h"), 1);
+    assert_eq!(count("2099-01-01T00:00:00+09:00"), 0);
+    let invalid = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["list", "--since", "yesterday"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+}

@@ -287,13 +287,24 @@ impl Store {
     }
 
     pub fn list(&self, limit: usize) -> Result<Vec<RunSummary>> {
+        self.list_since(limit, None)
+    }
+
+    /// Newest runs first; `since` keeps only runs started at or after that instant.
+    pub fn list_since(
+        &self,
+        limit: usize,
+        since: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Vec<RunSummary>> {
+        // started_at is stored with to_rfc3339() in UTC, so the same encoding orders correctly.
+        let since = since.map(|value| value.to_rfc3339()).unwrap_or_default();
         let mut statement = self.connection.prepare(
             "SELECT r.id, r.started_at, r.commit_hash, r.dirty, r.mode, r.state, r.score, r.passed, r.note, r.hypothesis, r.analysis_status,
                     (SELECT a.verdict FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1),
                     (SELECT a.body FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1)
-             FROM runs r ORDER BY r.started_at DESC LIMIT ?1",
+             FROM runs r WHERE r.started_at >= ?2 ORDER BY r.started_at DESC LIMIT ?1",
         )?;
-        let rows = statement.query_map([limit as i64], |row| {
+        let rows = statement.query_map(params![limit as i64, since], |row| {
             Ok(RunSummary {
                 id: row.get(0)?,
                 started_at: row.get(1)?,
