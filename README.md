@@ -148,6 +148,8 @@ isuscope query latest --base previous --view http --label-contains route=reserva
 
 各runにはスコアと成否、仮説と分析、Git commit・dirty patch・未追跡file hash、実行時のisuscope設定、collector出力と構造化metricを保存します。SQLiteは検索用の索引で、run directoryが記録の正本です。索引を失っても`isuscope list`の起動時に再構築されます。
 
+`doctor`はベンチを起動せずに、collectorの`preflight`（例: `preflight = ["sh", "-c", "sudo -n test -r /var/log/mysql/mysql-slow.log"]`）を対象nodeで実行し、`[benchmark] sample_output`に保存した実際のベンチ出力へ全parserを適用します。parserが不正な行を出せば失敗、0件なら警告です。最新runのHTTP routeに動的IDが残っていれば、`routes suggest`の確認を促します。
+
 `[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockは`mkdir`で作るdirectoryで、`owner`のpidが既に存在しなければ回収し、生きた所有者がいれば終了code 75で止まります。
 
 `[ssh] known_hosts_file`を指定すると、全SSH呼び出しがprojectのknown_hostsを`StrictHostKeyChecking=accept-new`で使います。ベンチ前のSSH collectorがあるnodeで、そのすべてがSSH接続自体の失敗（exit 255）になった場合は、計測のないrunを残さないようベンチを開始せずに失敗させます。

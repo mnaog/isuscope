@@ -122,6 +122,8 @@ pub struct BenchmarkConfig {
     pub initialize_finish_marker: String,
     #[serde(default)]
     pub parsers: Vec<BenchmarkParserConfig>,
+    /// Saved real benchmark stdout; `doctor` runs every parser against it.
+    pub sample_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -224,6 +226,9 @@ pub struct CollectorConfig {
     pub required: bool,
     #[serde(default = "default_unavailable_exit_codes")]
     pub unavailable_exit_codes: Vec<i32>,
+    /// Side-effect-free command that `doctor` runs on each target to prove the collector's
+    /// inputs exist (for example a readable log). Exit 0 passes, an unavailable code warns.
+    pub preflight: Option<Vec<String>>,
 }
 
 impl CollectorConfig {

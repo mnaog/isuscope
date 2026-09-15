@@ -53,6 +53,8 @@ pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
     check_identity(config, &mut report);
     check_nodes(config, &mut report).await;
     check_profile_collectors(config, &mut report).await;
+    check_parser_sample(config, &mut report).await;
+    check_latest_routes(config, &mut report);
     Ok(report)
 }
 
@@ -362,21 +364,40 @@ fn ssh_args(config: &LoadedConfig) -> Vec<String> {
 
 async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorReport) {
     for collector in &config.config.collectors {
-        let Some(script) = profile_preflight_script(&collector.name) else {
-            continue;
+        // A configured preflight wins; otherwise built-in profile collectors have their own.
+        let (label, argv, unavailable): (&str, Vec<String>, Vec<i32>) = match &collector.preflight {
+            Some(argv) if !argv.is_empty() => (
+                "collector",
+                argv.clone(),
+                collector.unavailable_exit_codes.clone(),
+            ),
+            _ => match profile_preflight_script(&collector.name) {
+                Some(script) => (
+                    "profile",
+                    vec!["sh".into(), "-c".into(), script.into()],
+                    vec![75],
+                ),
+                None => continue,
+            },
         };
         match collector.transport {
             Transport::Local => {
                 let result = tokio::time::timeout(
                     Duration::from_secs(15),
-                    Command::new("sh")
-                        .arg("-c")
-                        .arg(script)
+                    Command::new(&argv[0])
+                        .args(&argv[1..])
                         .current_dir(&config.project_root)
                         .output(),
                 )
                 .await;
-                record_profile_preflight(&collector.name, "local", result, report);
+                record_profile_preflight(
+                    label,
+                    &collector.name,
+                    "local",
+                    &unavailable,
+                    result,
+                    report,
+                );
             }
             Transport::Ssh => {
                 let nodes = config
@@ -387,7 +408,7 @@ async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorRepo
                     .collect::<Vec<_>>();
                 if nodes.is_empty() {
                     report.warn(format!(
-                        "profile `{}` unavailable: no SSH node matched roles",
+                        "{label} `{}` unavailable: no SSH node matched roles",
                         collector.name
                     ));
                     continue;
@@ -395,7 +416,7 @@ async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorRepo
                 for node in nodes {
                     let user = node.user.as_deref().unwrap_or(&config.config.ssh.user);
                     let target = format!("{user}@{}", node.host);
-                    let remote = ["sh", "-c", script]
+                    let remote = argv
                         .iter()
                         .map(|part| shell_quote(part))
                         .collect::<Vec<_>>()
@@ -408,8 +429,10 @@ async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorRepo
                     )
                     .await;
                     record_profile_preflight(
+                        label,
                         &collector.name,
                         &format!("{} ({target})", node.name),
+                        &unavailable,
                         result,
                         report,
                     );
@@ -424,31 +447,185 @@ fn collector_matches_node(collector: &CollectorConfig, node: &NodeConfig) -> boo
 }
 
 fn record_profile_preflight(
+    label: &str,
     collector: &str,
     target: &str,
+    unavailable: &[i32],
     result: std::result::Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
     report: &mut DoctorReport,
 ) {
     match result {
         Ok(Ok(output)) if output.status.success() => report.pass(format!(
-            "profile `{collector}` {target}: {}",
+            "{label} `{collector}` {target}: {}",
             output_detail(&output)
         )),
-        Ok(Ok(output)) if output.status.code() == Some(75) => report.warn(format!(
-            "profile `{collector}` {target}: unavailable ({})",
-            output_detail(&output)
-        )),
+        Ok(Ok(output))
+            if output
+                .status
+                .code()
+                .is_some_and(|code| unavailable.contains(&code)) =>
+        {
+            report.warn(format!(
+                "{label} `{collector}` {target}: unavailable ({})",
+                output_detail(&output)
+            ))
+        }
         Ok(Ok(output)) => report.fail(format!(
-            "profile `{collector}` {target}: preflight failed with {} ({})",
+            "{label} `{collector}` {target}: preflight failed with {} ({})",
             output.status,
             output_detail(&output)
         )),
         Ok(Err(error)) => report.fail(format!(
-            "profile `{collector}` {target}: cannot run preflight: {error}"
+            "{label} `{collector}` {target}: cannot run preflight: {error}"
         )),
         Err(_) => report.fail(format!(
-            "profile `{collector}` {target}: preflight timed out"
+            "{label} `{collector}` {target}: preflight timed out"
         )),
+    }
+}
+
+/// Runs every benchmark parser against a saved real benchmark output before any benchmark.
+async fn check_parser_sample(config: &LoadedConfig, report: &mut DoctorReport) {
+    let benchmark = &config.config.benchmark;
+    let Some(sample) = &benchmark.sample_output else {
+        return;
+    };
+    if benchmark.parsers.is_empty() {
+        return;
+    }
+    let sample = resolve(&config.project_root, sample);
+    if !sample.is_file() {
+        report.fail(format!(
+            "benchmark sample output is missing: {}",
+            sample.display()
+        ));
+        return;
+    }
+    struct Workspace(PathBuf);
+    impl Workspace {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let workspace = Workspace(env::temp_dir().join(format!("isuscope-doctor-{}", Uuid::now_v7())));
+    if let Err(error) = fs::create_dir_all(workspace.path()) {
+        report.fail(format!("cannot create parser workspace: {error}"));
+        return;
+    }
+    let stdout_log = workspace.path().join("benchmark-stdout.zst");
+    let stderr_log = workspace.path().join("benchmark-stderr.zst");
+    let empty = workspace.path().join("empty");
+    let prepared = fs::write(&empty, b"")
+        .map_err(anyhow::Error::from)
+        .and_then(|_| crate::benchmark::compress_log(&sample, &stdout_log))
+        .and_then(|_| crate::benchmark::compress_log(&empty, &stderr_log));
+    if let Err(error) = prepared {
+        report.fail(format!("cannot prepare benchmark sample: {error:#}"));
+        return;
+    }
+    for parser in &benchmark.parsers {
+        let expanded = parser
+            .command
+            .iter()
+            .map(|argument| {
+                argument
+                    .replace("{run_id}", "doctor")
+                    .replace("{run_dir}", &workspace.path().display().to_string())
+                    .replace("{benchmark_stdout}", &stdout_log.display().to_string())
+                    .replace("{benchmark_stderr}", &stderr_log.display().to_string())
+            })
+            .collect::<Vec<_>>();
+        let Some((program, args)) = expanded.split_first() else {
+            report.fail(format!("parser `{}` has an empty command", parser.name));
+            continue;
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(parser.timeout_seconds),
+            Command::new(program)
+                .args(args)
+                .current_dir(&config.project_root)
+                .env("ISUSCOPE_BENCHMARK_PROTOCOL", "v1")
+                .env("ISUSCOPE_PROJECT_ROOT", &config.project_root)
+                .env("ISUSCOPE_RUN_DIR", workspace.path())
+                .env("ISUSCOPE_BENCHMARK_STDOUT", &stdout_log)
+                .env("ISUSCOPE_BENCHMARK_STDERR", &stderr_log)
+                .output(),
+        )
+        .await;
+        let output = match result {
+            Ok(Ok(output)) if output.status.success() => output,
+            Ok(Ok(output)) => {
+                report.fail(format!(
+                    "parser `{}` failed on the benchmark sample with {} ({})",
+                    parser.name,
+                    output.status,
+                    output_detail(&output)
+                ));
+                continue;
+            }
+            Ok(Err(error)) => {
+                report.fail(format!("parser `{}` cannot start: {error}", parser.name));
+                continue;
+            }
+            Err(_) => {
+                report.fail(format!(
+                    "parser `{}` timed out on the benchmark sample",
+                    parser.name
+                ));
+                continue;
+            }
+        };
+        let mut records = 0;
+        let mut invalid = None;
+        for (index, line) in String::from_utf8_lossy(&output.stdout).lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) if value.get("type").is_some_and(|kind| kind.is_string()) => records += 1,
+                _ => {
+                    invalid = Some(index + 1);
+                    break;
+                }
+            }
+        }
+        match (invalid, records) {
+            (Some(line), _) => report.fail(format!(
+                "parser `{}` emitted a non-record line {line} for the benchmark sample",
+                parser.name
+            )),
+            (None, 0) => report.warn(format!(
+                "parser `{}` produced no records from {}; check it against a complete benchmark output",
+                parser.name,
+                sample.display()
+            )),
+            (None, count) => report.pass(format!(
+                "parser `{}`: {count} records from the benchmark sample",
+                parser.name
+            )),
+        }
+    }
+}
+
+/// Dynamic IDs left in route labels split HTTP metrics; point at the suggestion command.
+fn check_latest_routes(config: &LoadedConfig, report: &mut DoctorReport) {
+    let Ok(store) = crate::storage::Store::open(&config.data_dir) else {
+        return;
+    };
+    let Ok(Some(id)) = store.resolve_id("latest") else {
+        return;
+    };
+    match crate::project_tools::suggest_routes(config, &id) {
+        Ok((_, 0)) => report.pass(format!("routes: no dynamic segments left in run {id}")),
+        Ok((_, rules)) => report.warn(format!(
+            "routes: run {id} still has {rules} route pattern(s) with dynamic segments; review `isuscope routes suggest latest`"
+        )),
+        Err(error) => report.warn(format!("routes: cannot inspect run {id}: {error:#}")),
     }
 }
 
