@@ -91,6 +91,8 @@ pub struct RunAnalysis {
     pub created_at: DateTime<Utc>,
     pub verdict: AnalysisVerdict,
     pub body: String,
+    #[serde(default)]
+    pub base_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -25,6 +25,11 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // hidden transition helper keeps its field names explicit
 enum Commands {
+    /// 変更単位の採否を記録・検索します（deployやmergeは行いません）。
+    Change {
+        #[command(subcommand)]
+        command: ChangeCommand,
+    },
     /// プロジェクトへ一度だけ使う設定雛形を生成します。
     Init,
     /// 標準collectorでベンチを実行します。
@@ -159,6 +164,9 @@ enum Commands {
         /// 仮説の判定。
         #[arg(value_enum)]
         verdict: VerdictArg,
+        /// 比較元run。解決した完全なIDを分析に保存します。
+        #[arg(long)]
+        base: Option<String>,
         /// 結果の分析本文。
         #[arg(long, conflicts_with = "analysis_file")]
         analysis: Option<String>,
@@ -211,6 +219,38 @@ enum Commands {
         session_cookie: Option<String>,
         #[arg(long, env = "ISUSCOPE_DISCOVERY_SESSION_KEY", hide_env_values = true)]
         session_key: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChangeCommand {
+    Create {
+        id: String,
+        #[arg(long)]
+        description: String,
+        /// commitや変更範囲の説明。
+        #[arg(long)]
+        target: Option<String>,
+    },
+    Decide {
+        id: String,
+        #[arg(value_enum)]
+        status: isuscope::changes::DecisionStatus,
+        #[arg(long = "run", required = true)]
+        runs: Vec<String>,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        revisit: Option<String>,
+    },
+    List {
+        #[arg(long, value_enum)]
+        status: Option<isuscope::changes::DecisionStatus>,
+        #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
+        limit: usize,
+    },
+    Show {
+        id: String,
     },
 }
 
@@ -496,6 +536,7 @@ async fn real_main() -> Result<bool> {
         Commands::Analyze {
             run,
             verdict,
+            base,
             analysis,
             analysis_file,
             reason,
@@ -531,7 +572,14 @@ async fn real_main() -> Result<bool> {
             let id = store
                 .resolve_id(&run)?
                 .with_context(|| format!("run `{run}` was not found"))?;
-            let manifest = store.append_analysis(&id, verdict.into(), body)?;
+            let base = base
+                .map(|requested| {
+                    store
+                        .resolve_id(&requested)?
+                        .with_context(|| format!("base run '{requested}' was not found"))
+                })
+                .transpose()?;
+            let manifest = store.append_analysis_with_base(&id, verdict.into(), body, base)?;
             let latest = manifest
                 .analyses
                 .last()
@@ -540,6 +588,28 @@ async fn real_main() -> Result<bool> {
             println!("verdict   {}", latest.verdict.as_str());
             println!("analysis  {}", manifest.analysis_status.as_str());
             println!("revisions {}", manifest.analyses.len());
+            Ok(true)
+        }
+        Commands::Change { command } => {
+            let mut store = Store::open(&config.data_dir)?;
+            match command {
+                ChangeCommand::Create {
+                    id,
+                    description,
+                    target,
+                } => write_stdout_json(&store.create_change(&id, description, target)?)?,
+                ChangeCommand::Decide {
+                    id,
+                    status,
+                    runs,
+                    reason,
+                    revisit,
+                } => write_stdout_json(&store.decide_change(&id, status, reason, revisit, runs)?)?,
+                ChangeCommand::List { status, limit } => write_stdout_json(
+                    &serde_json::json!({"schema_version": 1, "changes": store.list_changes(status, None, limit)?}),
+                )?,
+                ChangeCommand::Show { id } => write_stdout_json(&store.change_history(&id)?)?,
+            }
             Ok(true)
         }
     }
@@ -1312,6 +1382,7 @@ fn show_report(config: &LoadedConfig, requested: &str) -> Result<()> {
 fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     let diagnostics = load_diagnostics(config, &store, requested)?;
+    let review = store.run_review(&diagnostics.run)?;
     let id = diagnostics.run.id.clone();
     let benchmark_metrics = store.query_metrics(&id, &[], Some("benchmark."), Some(false))?;
     let benchmark = query::metric_query(
@@ -1330,12 +1401,16 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
             limit: usize::MAX,
         },
     );
-    write_stdout_json(&brief::build(diagnostics, benchmark, limit))?;
+    let mut brief = brief::build(diagnostics, benchmark, limit);
+    brief.review = Some(review);
+    write_stdout_json(&brief)?;
     Ok(())
 }
 
 fn load_report(config: &LoadedConfig, store: &Store, requested: &str) -> Result<RunReport> {
-    Ok(load_diagnostics(config, store, requested)?.into_report())
+    let mut report = load_diagnostics(config, store, requested)?.into_report();
+    report.review = Some(store.run_review(&report.run)?);
+    Ok(report)
 }
 
 fn show_diff(config: &LoadedConfig, base: &str, candidate: &str) -> Result<()> {

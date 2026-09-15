@@ -30,6 +30,8 @@ flowchart TD
 - collectorとparserのprovenance labelはgroup化しても保持します。異なるsourceを暗黙に加算しません。scalar quantileは再集約せず、値を`null`にして理由を返します。
 - `query --base`は両runへ同じselectorとsemantic viewを適用し、安定keyでfull outer joinしてからdelta順にcompact化します。片側だけの行もadded/removedとして保持します。
 - `brief`は重複するdatabase sourceからnative collectorを優先し、coverage問題をseverityと同一collectorのnode群でまとめます。optional artifactのunavailableは件数だけを返します。
+- `brief`と`report`の`review`は、最新の仮説判定・明示されたbaseとのスコア比較・関連変更の現在の採否を返します。最大20変更で`changes_truncated`を明示します。CLIとUIはStoreの共通review modelを使用し、rendererでDB検索や採否推論を行いません。
+- 変更と採否はrunと独立したJSON正本を持ちます。採否改訂は一意なファイルとして完成後に上書きなしで公開し、SQLiteは起動時に再索引化します。過去の根拠runを含む変更には現在の採否が表示され、全改訂は`change show`で参照します。
 
 この境界により、CLIとUIで数値や順位が食い違うことを防ぎます。CLIはJSONだけを返し、人間向けHTMLはlocalhost限定UIだけが提供します。UIは`/`と`/api/report`でlatestのReport、`/diff`と`/api/diff`で指定した2 runのDiffを返します。
 

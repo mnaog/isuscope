@@ -26,6 +26,31 @@ isuscope analyze RUN_ID supported --analysis "p95とDB時間が低下し、ス�
 
 run IDは実行結果か`isuscope list`で確認します。`analyze`は更新対象を曖昧にしないため、run ID、一意な短縮ID、または一意なtagを明示します。判定は`supported`、`rejected`、`inconclusive`、`skipped`です。
 
+### 仮説の判定と変更の採否
+
+仮説判定、スコア差、変更を残す判断は独立しています。スコアが下がっても局所改善や単純化を理由に採用できます。採用したことを理由に過去の仮説判定を書き換える必要はありません。
+
+```bash
+isuscope analyze RUN_ID inconclusive --base BASE_RUN \
+  --analysis "対象の長時間SQLは減ったが、新規登録が遅くなりスコアは低下"
+isuscope change create user-items-update \
+  --description "既存user_itemsをUPDATEし、不足行のみINSERT" \
+  --target "変更commitまたは変更範囲"
+isuscope change decide user-items-update accepted --run RUN_ID \
+  --reason "長時間SQL抑制を評価して残す。新規登録の追加SELECTは別途改善"
+isuscope brief RUN_ID
+isuscope change list --status provisional
+isuscope change show user-items-update
+```
+
+- `analyze --base`は比較元の完全なrun IDを保存します。brief/report/UIは同じ比較処理で各1走のスコア差を表示し、誤差や性能採否は自動判定しません。
+- `change decide`の状態は`accepted`（採用）、`provisional`（暫定採用）、`rejected`（不採用）、`deferred`（保留）です。未記録と保留は別です。
+- `provisional`には`--revisit "再評価条件"`が必須です。理由と1件以上の根拠runは全状態で必須です。`--run`は繰り返せます。FAIL runも根拠にできます。
+- 変更とrunは多対多です。複数変更を一度に試した場合も、一部だけ採用できます。根拠runのsource（commit、dirty、state digestなど）を採否記録に保存します。
+- 同じ変更への再判断は追記され、`show`で全履歴を確認できます。`list --status`は現在の採否で絞り込みます。brief/reportの採否も「関連変更の現在の判断」であり、当時の判断はshowで確認します。
+- 採否はdeploy・merge・rollbackを行わず、実環境に反映済みであることも意味しません。採否未記録や暫定採用は次のベンチを阻止せず、従来の分析gateだけを適用します。
+- `data_dir/changes/<id>/change.json`と`decisions/*.json`が正本です。この軽量な履歴もGitへ含めてください。SQLiteの変更・採否・根拠run索引はファイルから復元できます。古いrunから採否を自動推定しません。
+
 終了前は観測用設定や重いログを環境から外したうえで、同じ`run`を使って採点用構成を確認します。専用の最終計測コマンドはありません。
 
 ## インストール

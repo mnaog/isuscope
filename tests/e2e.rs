@@ -6,6 +6,8 @@ use tempfile::tempdir;
 mod adapters;
 #[path = "e2e/analysis.rs"]
 mod analysis;
+#[path = "e2e/changes.rs"]
+mod changes;
 #[path = "e2e/codex_context.rs"]
 mod codex_context;
 #[path = "e2e/diff.rs"]

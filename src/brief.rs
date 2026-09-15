@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Serialize)]
 pub struct BriefOutput {
     pub schema_version: u32,
+    pub review: Option<crate::changes::RunReview>,
     pub run: BriefRun,
     pub coverage_issues: BriefSection<CoverageIssueGroup>,
     pub coverage_info_count: usize,
@@ -85,6 +86,7 @@ pub fn build(
         .count();
     BriefOutput {
         schema_version: 1,
+        review: None,
         run: BriefRun {
             id: run.id,
             started_at: run.started_at.to_rfc3339(),

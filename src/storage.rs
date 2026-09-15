@@ -17,8 +17,8 @@ use std::{
 use uuid::Uuid;
 
 pub struct Store {
-    data_dir: PathBuf,
-    connection: Connection,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) connection: Connection,
 }
 
 const STRUCTURED_SNAPSHOT_SCHEMA: u32 = 1;
@@ -69,6 +69,7 @@ impl Store {
             connection,
         };
         store.restore_missing_finalized_runs()?;
+        store.restore_changes()?;
         Ok(store)
     }
 
@@ -265,13 +266,14 @@ impl Store {
         }
         for analysis in &manifest.analyses {
             transaction.execute(
-                "INSERT INTO run_analyses (id, run_id, created_at, verdict, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO run_analyses (id, run_id, created_at, verdict, body, base_run_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     analysis.id,
                     manifest.id,
                     analysis.created_at.to_rfc3339(),
                     analysis.verdict.as_str(),
                     analysis.body,
+                    analysis.base_run_id,
                 ],
             )?;
         }
@@ -507,6 +509,24 @@ impl Store {
         verdict: AnalysisVerdict,
         body: String,
     ) -> Result<RunManifest> {
+        self.append_analysis_with_base(id, verdict, body, None)
+    }
+
+    pub fn append_analysis_with_base(
+        &mut self,
+        id: &str,
+        verdict: AnalysisVerdict,
+        body: String,
+        base_run_id: Option<String>,
+    ) -> Result<RunManifest> {
+        let final_dir = self.final_dir(id);
+        let _lock = AnalysisLock::acquire(&final_dir)?;
+        if let Some(base) = &base_run_id {
+            if base == id {
+                bail!("base and candidate must differ");
+            }
+            self.load(base)?;
+        }
         if !self.final_dir(id).is_dir() {
             bail!("run `{id}` is not finalized");
         }
@@ -527,6 +547,7 @@ impl Store {
             created_at: Utc::now(),
             verdict,
             body,
+            base_run_id,
         };
         manifest.analysis_status = if verdict == AnalysisVerdict::Skipped {
             AnalysisStatus::Skipped
@@ -549,8 +570,12 @@ impl Store {
             "UPDATE runs SET analysis_status=?2 WHERE id=?1",
             params![manifest.id, manifest.analysis_status.as_str()],
         )?;
+        transaction.execute(
+            "UPDATE run_analyses SET base_run_id=?2 WHERE id=?1",
+            params![analysis.id, analysis.base_run_id],
+        )?;
+        write_manifest(&final_dir, &manifest)?;
         transaction.commit()?;
-        write_manifest(&self.final_dir(id), &manifest)?;
         Ok(manifest)
     }
 
@@ -715,6 +740,7 @@ impl Store {
             if !manifest_path.is_file() {
                 continue;
             }
+            let _lock = AnalysisLock::acquire(&run_dir)?;
             let manifest: RunManifest = match fs::read(&manifest_path)
                 .with_context(|| format!("cannot read {}", manifest_path.display()))
                 .and_then(|raw| {
@@ -733,6 +759,17 @@ impl Store {
                 .optional()?
                 .is_some();
             if indexed {
+                // A durable manifest may be newer than SQLite after interruption.
+                let tx = self.connection.transaction()?;
+                for a in &manifest.analyses {
+                    tx.execute("INSERT OR IGNORE INTO run_analyses (id,run_id,created_at,verdict,body,base_run_id) VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![a.id,manifest.id,a.created_at.to_rfc3339(),a.verdict.as_str(),a.body,a.base_run_id])?;
+                }
+                tx.execute(
+                    "UPDATE runs SET analysis_status=?2 WHERE id=?1",
+                    params![manifest.id, manifest.analysis_status.as_str()],
+                )?;
+                tx.commit()?;
                 continue;
             }
 
@@ -850,13 +887,14 @@ impl Store {
         }
         for analysis in &manifest.analyses {
             transaction.execute(
-                "INSERT INTO run_analyses (id, run_id, created_at, verdict, body) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO run_analyses (id, run_id, created_at, verdict, body, base_run_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     analysis.id,
                     manifest.id,
                     analysis.created_at.to_rfc3339(),
                     analysis.verdict.as_str(),
                     analysis.body,
+                    analysis.base_run_id,
                 ],
             )?;
         }
@@ -1052,11 +1090,43 @@ fn structured_records_from_logs(
 }
 
 pub(crate) fn write_manifest(run_dir: &Path, manifest: &RunManifest) -> Result<()> {
+    use std::io::Write;
     let path = run_dir.join("run.json");
     let temporary = run_dir.join("run.json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(manifest)?)?;
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(manifest)?)?;
+    file.sync_all()?;
     fs::rename(temporary, path)?;
+    fs::File::open(run_dir)?.sync_all()?;
     Ok(())
+}
+
+struct AnalysisLock(fs::File);
+
+impl AnalysisLock {
+    fn acquire(dir: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".analysis.lock"))?;
+        // The descriptor owns the lock; closing it also releases it after errors.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for AnalysisLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
@@ -1157,6 +1227,13 @@ fn migrate(connection: &Connection) -> Result<()> {
         UPDATE runs SET mode = 'survey-run' WHERE mode = 'discovery-run';
         ",
     )?;
+    ensure_column(connection, "run_analyses", "base_run_id", "TEXT")?;
+    connection.execute_batch("
+        CREATE TABLE IF NOT EXISTS changes (id TEXT PRIMARY KEY, description TEXT NOT NULL, created_at TEXT NOT NULL, target TEXT);
+        CREATE TABLE IF NOT EXISTS change_decisions (id TEXT PRIMARY KEY, change_id TEXT NOT NULL REFERENCES changes(id), created_at TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, revisit TEXT);
+        CREATE TABLE IF NOT EXISTS change_decision_runs (decision_id TEXT NOT NULL REFERENCES change_decisions(id), run_id TEXT NOT NULL, PRIMARY KEY(decision_id, run_id));
+        CREATE INDEX IF NOT EXISTS change_runs_run ON change_decision_runs(run_id);
+    ")?;
     ensure_column(connection, "runs", "note", "TEXT")?;
     ensure_column(connection, "runs", "hypothesis", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(

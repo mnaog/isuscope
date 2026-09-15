@@ -252,13 +252,15 @@ fn latest_report(config: &LoadedConfig) -> Result<report::RunReport> {
     let id = store
         .resolve_id("latest")?
         .context("no finalized runs; execute `isuscope run` first")?;
-    Ok(report::build(
+    let mut report = report::build(
         store.load(&id)?,
         store.metrics(&id)?,
         store.transitions(&id)?,
         store.final_dir(&id).join("logs"),
         Some(config.data_dir.join("latest/logs")),
-    ))
+    );
+    report.review = Some(store.run_review(&report.run)?);
+    Ok(report)
 }
 
 fn response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<()> {

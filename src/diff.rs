@@ -223,7 +223,7 @@ fn diff_run(run: &RunManifest) -> DiffRun {
     }
 }
 
-fn score_diff(base: Option<i64>, candidate: Option<i64>) -> ScoreDiff {
+pub fn score_diff(base: Option<i64>, candidate: Option<i64>) -> ScoreDiff {
     ScoreDiff {
         base,
         candidate,

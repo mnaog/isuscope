@@ -26,6 +26,7 @@ pub struct RunDiagnostics {
 #[derive(Debug, Serialize)]
 pub struct RunReport {
     pub schema_version: u32,
+    pub review: Option<crate::changes::RunReview>,
     pub run: RunManifest,
     pub coverage: Vec<CoverageSummary>,
     pub http: ReportSection<HttpRouteSummary>,
@@ -147,6 +148,7 @@ pub fn diagnose(
 impl RunDiagnostics {
     pub fn into_report(self) -> RunReport {
         RunReport {
+            review: None,
             schema_version: 6,
             run: self.run,
             coverage: self.coverage,
@@ -301,11 +303,12 @@ pub fn write_html(report: &RunReport, mut writer: impl Write) -> Result<()> {
         })
         .collect::<String>();
     let embedded = serde_json::to_string(report)?.replace('<', "\\u003c");
+    let review = review_html(report.review.as_ref());
     write!(
         writer,
         r#"<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>
 :root{{--bg:#0b1020;--panel:#131b2e;--text:#edf2ff;--muted:#9cabc7;--line:#293653;--ok:#65d69e;--bad:#ff7d8b;--accent:#7bb4ff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif}}main{{max-width:1280px;margin:auto;padding:28px}}h1{{font-size:24px;margin:0 0 20px}}h2{{font-size:16px;margin:0 0 12px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:20px}}.card,section{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}}.label{{color:var(--muted);font-size:12px}}.value{{font-size:22px;font-weight:700}}section{{margin:12px 0;overflow:auto}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th,td{{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line)}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){{text-align:left}}th{{color:var(--muted);font-size:12px}}code{{color:var(--accent)}}
-</style></head><body><main><h1>{title}</h1><div class="grid"><div class="card"><div class="label">STATE</div><div class="value">{state}</div></div><div class="card"><div class="label">SCORE</div><div class="value">{score}</div></div><div class="card"><div class="label">HTTP ROUTES</div><div class="value">{route_count}</div></div><div class="card"><div class="label">METRICS</div><div class="value">{metric_count}</div></div></div><section><h2>Coverage</h2><table><thead><tr><th>STATUS</th><th>SECTION</th><th>NODE</th><th>COLLECTOR</th><th>PHASE</th><th>MISSING METRICS</th></tr></thead><tbody>{coverage}</tbody></table></section><section><h2>HTTP routes · total time</h2><table><thead><tr><th>METHOD</th><th>ROUTE</th><th>COUNT</th><th>TOTAL ms</th><th>AVG ms</th><th>P95 ms</th><th>P99 ms</th><th>ERROR %</th></tr></thead><tbody>{routes}</tbody></table></section><section><h2>Database queries · total time</h2><table><thead><tr><th>NODE</th><th>ENGINE</th><th>DIGEST</th><th>CALLS</th><th>TOTAL ms</th><th>AVG ms</th><th>P95 ms</th><th>ROWS/CALL</th></tr></thead><tbody>{database}</tbody></table></section><section><h2>CPU symbols · sample share</h2><table><thead><tr><th>NODE</th><th>PROCESS</th><th>BINARY</th><th>SYMBOL</th><th>SAMPLE %</th></tr></thead><tbody>{cpu}</tbody></table></section><section><h2>Host metrics</h2><table><thead><tr><th>NODE</th><th>METRIC</th><th>TARGET</th><th>AVERAGE</th><th>PEAK</th><th>UNIT</th><th>PEAK AT</th></tr></thead><tbody>{host}</tbody></table></section><section><h2>Profile artifacts</h2><table><thead><tr><th>STATUS</th><th>KIND</th><th>NODE</th><th>PATH</th><th>ERROR</th></tr></thead><tbody>{artifacts}</tbody></table></section><section><h2>Transitions</h2><table><thead><tr><th>FROM</th><th>TO</th><th>COUNT</th><th>P50 ms</th><th>P95 ms</th></tr></thead><tbody>{transitions}</tbody></table></section><section><h2>Collectors</h2><table><thead><tr><th>STATUS</th><th>NAME</th><th>NODE</th><th>ERROR</th></tr></thead><tbody>{collectors}</tbody></table></section><p class="label">Raw evidence: <code>{logs}</code></p><script type="application/json" id="isuscope-report">{embedded}</script></main></body></html>"#,
+</style></head><body><main><h1>{title}</h1>{review}<div class="grid"><div class="card"><div class="label">STATE</div><div class="value">{state}</div></div><div class="card"><div class="label">SCORE</div><div class="value">{score}</div></div><div class="card"><div class="label">HTTP ROUTES</div><div class="value">{route_count}</div></div><div class="card"><div class="label">METRICS</div><div class="value">{metric_count}</div></div></div><section><h2>Coverage</h2><table><thead><tr><th>STATUS</th><th>SECTION</th><th>NODE</th><th>COLLECTOR</th><th>PHASE</th><th>MISSING METRICS</th></tr></thead><tbody>{coverage}</tbody></table></section><section><h2>HTTP routes · total time</h2><table><thead><tr><th>METHOD</th><th>ROUTE</th><th>COUNT</th><th>TOTAL ms</th><th>AVG ms</th><th>P95 ms</th><th>P99 ms</th><th>ERROR %</th></tr></thead><tbody>{routes}</tbody></table></section><section><h2>Database queries · total time</h2><table><thead><tr><th>NODE</th><th>ENGINE</th><th>DIGEST</th><th>CALLS</th><th>TOTAL ms</th><th>AVG ms</th><th>P95 ms</th><th>ROWS/CALL</th></tr></thead><tbody>{database}</tbody></table></section><section><h2>CPU symbols · sample share</h2><table><thead><tr><th>NODE</th><th>PROCESS</th><th>BINARY</th><th>SYMBOL</th><th>SAMPLE %</th></tr></thead><tbody>{cpu}</tbody></table></section><section><h2>Host metrics</h2><table><thead><tr><th>NODE</th><th>METRIC</th><th>TARGET</th><th>AVERAGE</th><th>PEAK</th><th>UNIT</th><th>PEAK AT</th></tr></thead><tbody>{host}</tbody></table></section><section><h2>Profile artifacts</h2><table><thead><tr><th>STATUS</th><th>KIND</th><th>NODE</th><th>PATH</th><th>ERROR</th></tr></thead><tbody>{artifacts}</tbody></table></section><section><h2>Transitions</h2><table><thead><tr><th>FROM</th><th>TO</th><th>COUNT</th><th>P50 ms</th><th>P95 ms</th></tr></thead><tbody>{transitions}</tbody></table></section><section><h2>Collectors</h2><table><thead><tr><th>STATUS</th><th>NAME</th><th>NODE</th><th>ERROR</th></tr></thead><tbody>{collectors}</tbody></table></section><p class="label">Raw evidence: <code>{logs}</code></p><script type="application/json" id="isuscope-report">{embedded}</script></main></body></html>"#,
         title = escape(&title),
         state = escape(report.run.state.as_str()),
         score = score,
@@ -330,6 +333,55 @@ pub fn write_html(report: &RunReport, mut writer: impl Write) -> Result<()> {
         embedded = embedded,
     )?;
     Ok(())
+}
+
+fn review_html(review: Option<&crate::changes::RunReview>) -> String {
+    let Some(review) = review else {
+        return String::new();
+    };
+    let mut html = String::from("<section><h2>仮説・比較・変更の採否</h2>");
+    if let Some(analysis) = &review.latest_analysis {
+        html.push_str(&format!(
+            "<p>仮説判定: {} — {}</p>",
+            analysis.verdict.as_str(),
+            escape(&analysis.body)
+        ));
+    } else {
+        html.push_str("<p>分析未記録</p>");
+    }
+    if let Some(c) = &review.comparison {
+        html.push_str(&format!(
+            "<p>比較元 {} → {}: {} → {}（{}%、各1走）</p>",
+            escape(&c.base_run_id),
+            escape(&c.candidate_run_id),
+            c.score.base.map_or("-".into(), |v| v.to_string()),
+            c.score.candidate.map_or("-".into(), |v| v.to_string()),
+            optional(c.score.delta_percent)
+        ));
+    }
+    html.push_str("<p>関連する変更の現在の採否（実環境への反映状態ではありません）</p>");
+    for summary in &review.changes {
+        html.push_str(&format!(
+            "<h3>{}</h3><p>{}</p>",
+            escape(&summary.change.id),
+            escape(&summary.change.description)
+        ));
+        if let Some(d) = &summary.latest_decision {
+            html.push_str(&format!(
+                "<p>{}: {}</p>",
+                d.status.as_str(),
+                escape(&d.reason)
+            ));
+            if let Some(revisit) = &d.revisit {
+                html.push_str(&format!("<p>再評価条件: {}</p>", escape(revisit)));
+            }
+        }
+    }
+    if review.changes_truncated {
+        html.push_str("<p>先頭20変更のみ表示。change list/showで全件を確認できます。</p>");
+    }
+    html.push_str("</section>");
+    html
 }
 
 fn short(id: &str) -> &str {
