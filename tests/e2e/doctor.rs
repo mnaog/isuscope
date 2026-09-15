@@ -223,4 +223,9 @@ preflight = ["sh", "-c", "echo permission denied; exit 1"]
         output.contains("! routes: run")
             && output.contains("1 route pattern(s) with dynamic segments")
     );
+    // The saved sample must survive doctor; parsers see a compressed copy.
+    assert_eq!(
+        fs::read_to_string(project.path().join("sample.log")).unwrap(),
+        "SCORE 10\n"
+    );
 }

@@ -520,9 +520,12 @@ async fn check_parser_sample(config: &LoadedConfig, report: &mut DoctorReport) {
     let stdout_log = workspace.path().join("benchmark-stdout.zst");
     let stderr_log = workspace.path().join("benchmark-stderr.zst");
     let empty = workspace.path().join("empty");
+    // compress_log removes its input, so compress a copy and never touch the saved sample.
+    let sample_copy = workspace.path().join("sample");
     let prepared = fs::write(&empty, b"")
+        .and_then(|_| fs::copy(&sample, &sample_copy).map(|_| ()))
         .map_err(anyhow::Error::from)
-        .and_then(|_| crate::benchmark::compress_log(&sample, &stdout_log))
+        .and_then(|_| crate::benchmark::compress_log(&sample_copy, &stdout_log))
         .and_then(|_| crate::benchmark::compress_log(&empty, &stderr_log));
     if let Err(error) = prepared {
         report.fail(format!("cannot prepare benchmark sample: {error:#}"));
