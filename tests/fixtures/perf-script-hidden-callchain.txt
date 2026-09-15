@@ -1,0 +1,4 @@
+# isuscope-perf-start 1789474762.459707601
+         swapper     0.000000000: cpu-clock:pppH:  ffffffff9652e9bb native_safe_halt ([kernel.kallsyms])
+ 98-reboot-requi     0.000072407: cpu-clock:pppH:      7f7e6eac127c [unknown] (/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2)
+actix-rt|system     1.010099290: cpu-clock:pppH:      31c23f <rustls::tls13::Tls13MessageEncrypter as rustls::cipher::MessageEncrypter>::encrypt (/home/isucon/webapp/rust/target/release/isuconquest)

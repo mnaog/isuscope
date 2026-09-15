@@ -606,8 +606,9 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
         .find_map(|line| line.strip_prefix("# isuscope-perf-start "))
         .and_then(|value| value.trim().parse::<f64>().ok())
         .context("perf script output has no valid isuscope start marker")?;
-    // A sample header starts at column 0: `comm [pid] [cpu] time: event: [ip sym (dso)]`.
-    // With `perf record -g`, the stack follows on indented lines and the first frame is the leaf.
+    // A sample header is `comm [pid] [cpu] time: event: [ip sym (dso)]`; perf may right-align
+    // comm with leading spaces. With `perf record -g` and no `-G`, the stack follows on
+    // tab-indented lines and the first frame is the leaf.
     let header_pattern =
         regex::Regex::new(r"^(?P<prefix>\S.*?)\s+(?P<time>[0-9]+[.][0-9]+):\s*(?P<rest>.*)$")?;
     let symbol_pattern = regex::Regex::new(r"(?P<symbol>.+?)\s+\((?P<dso>[^()]*)\)\s*$")?;
@@ -657,7 +658,7 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
             continue;
         }
         saw_sample_text = true;
-        if line.starts_with(char::is_whitespace) {
+        if line.starts_with('\t') {
             if let Some(sample) = pending.as_mut()
                 && sample.leaf.is_none()
             {
@@ -665,7 +666,7 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
             }
             continue;
         }
-        let Some(header) = header_pattern.captures(line) else {
+        let Some(header) = header_pattern.captures(line.trim_start()) else {
             continue;
         };
         if let Some(sample) = pending.take() {
@@ -2059,6 +2060,31 @@ mod tests {
             metric.name == "cpu.sample_count"
                 && metric.value == 1.0
                 && metric.labels.get("process").map(String::as_str) == Some("isupipe-rust")
+        }));
+    }
+
+    #[test]
+    fn perf_script_with_hidden_call_graph_reads_right_aligned_headers() {
+        let metrics = parse_perf_script(include_str!(
+            "../tests/fixtures/perf-script-hidden-callchain.txt"
+        ))
+        .unwrap();
+        let counts = metrics
+            .iter()
+            .filter(|metric| metric.name == "cpu.sample_count")
+            .collect::<Vec<_>>();
+        assert_eq!(counts.iter().map(|metric| metric.value).sum::<f64>(), 3.0);
+        assert!(counts.iter().any(|metric| {
+            metric.labels.get("process").map(String::as_str) == Some("98-reboot-requi")
+                && metric.labels.get("binary").map(String::as_str) == Some("ld-linux-x86-64.so.2")
+        }));
+        assert!(counts.iter().any(|metric| {
+            metric.labels.get("process").map(String::as_str) == Some("actix-rt|system")
+                && metric
+                    .labels
+                    .get("symbol")
+                    .map(String::as_str)
+                    .is_some_and(|symbol| symbol.ends_with("::encrypt"))
         }));
     }
 
