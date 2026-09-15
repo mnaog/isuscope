@@ -77,6 +77,11 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         .unwrap();
     assert!(revision.status.success());
     assert!(String::from_utf8_lossy(&revision.stdout).contains("revisions 2"));
+    // Analysis locking must not leave files inside version-controlled run directories.
+    for entry in fs::read_dir(config_dir.join("runs")).unwrap() {
+        let run_dir = entry.unwrap().path();
+        assert!(!run_dir.join(".analysis.lock").exists());
+    }
 
     let second = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["run", "--hypothesis", "the follow-up change raises score"])

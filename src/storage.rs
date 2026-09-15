@@ -1106,15 +1106,16 @@ struct AnalysisLock(fs::File);
 impl AnalysisLock {
     fn acquire(dir: &Path) -> Result<Self> {
         use std::os::fd::AsRawFd;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(".analysis.lock"))?;
+        // Lock the run directory itself so no lock file ends up in version-controlled runs.
+        let file = fs::File::open(dir)?;
         // The descriptor owns the lock; closing it also releases it after errors.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error().into());
+        }
+        // Earlier versions left this file behind in every run.
+        let legacy = dir.join(".analysis.lock");
+        if legacy.is_file() {
+            let _ = fs::remove_file(legacy);
         }
         Ok(Self(file))
     }
