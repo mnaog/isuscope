@@ -53,6 +53,7 @@ pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
     check_identity(config, &mut report);
     check_nodes(config, &mut report).await;
     check_profile_collectors(config, &mut report).await;
+    check_initialize_markers(config, &mut report);
     check_parser_sample(config, &mut report).await;
     check_latest_routes(config, &mut report);
     Ok(report)
@@ -481,6 +482,39 @@ fn record_profile_preflight(
         Err(_) => report.fail(format!(
             "{label} `{collector}` {target}: preflight timed out"
         )),
+    }
+}
+
+/// The initialize/load windows depend on marker text that differs between contests; a marker
+/// missing from a saved real output means every run silently loses the window split.
+fn check_initialize_markers(config: &LoadedConfig, report: &mut DoctorReport) {
+    let benchmark = &config.config.benchmark;
+    let Some(sample) = &benchmark.sample_output else {
+        return;
+    };
+    let sample = resolve(&config.project_root, sample);
+    let Ok(bytes) = fs::read(&sample) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    for (key, marker) in [
+        (
+            "initialize_start_marker",
+            &benchmark.initialize_start_marker,
+        ),
+        (
+            "initialize_finish_marker",
+            &benchmark.initialize_finish_marker,
+        ),
+    ] {
+        if text.contains(marker.as_str()) {
+            report.pass(format!("benchmark {key} appears in the sample: {marker}"));
+        } else {
+            report.warn(format!(
+                "benchmark {key} `{marker}` is not in {}; set [benchmark] {key} to this contest's text or initialize/load windows will be missing",
+                sample.display()
+            ));
+        }
     }
 }
 

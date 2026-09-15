@@ -223,9 +223,47 @@ preflight = ["sh", "-c", "echo permission denied; exit 1"]
         output.contains("! routes: run")
             && output.contains("1 route pattern(s) with dynamic segments")
     );
+    assert!(
+        output.contains("! benchmark initialize_start_marker `webappの初期化を行います` is not in")
+    );
+    assert!(output.contains("! benchmark initialize_finish_marker"));
     // The saved sample must survive doctor; parsers see a compressed copy.
     assert_eq!(
         fs::read_to_string(project.path().join("sample.log")).unwrap(),
         "SCORE 10\n"
     );
+}
+
+#[test]
+fn doctor_passes_initialize_markers_found_in_the_sample() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        project.path().join("sample.log"),
+        "benchmarker --target-host=app1\n初期化処理が成功しました！\nSCORE 10\n",
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "external"
+sample_output = "sample.log"
+initialize_start_marker = "benchmarker --target-host="
+initialize_finish_marker = "初期化処理が成功しました！"
+"#,
+    )
+    .unwrap();
+    let doctor = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .arg("doctor")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let output = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        output.contains("✓ benchmark initialize_start_marker appears in the sample"),
+        "{output}"
+    );
+    assert!(output.contains("✓ benchmark initialize_finish_marker appears in the sample"));
 }
