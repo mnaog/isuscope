@@ -1,0 +1,15 @@
+# isuscope-perf-start 1789307837.697346229
+swapper     0.000000000: cpu-clock:pppH: 
+	ffffffff9892e9bb native_safe_halt ([kernel.kallsyms])
+	ffffffff9892f160 acpi_idle_enter ([kernel.kallsyms])
+
+actix-rt|system    1.131123086: cpu-clock:pppH: 
+	          3565e7 <rustls::client::tls13::ExpectTraffic as rustls::conn::State<rustls::client::client_conn::ClientConnectionData>>::perhaps_write_key_update (/home/isucon/webapp/rust/target/release/isuconquest)
+	          31c23f <rustls::tls13::Tls13MessageEncrypter as rustls::cipher::MessageEncrypter>::encrypt (/home/isucon/webapp/rust/target/release/isuconquest)
+
+actix-rt|system    2.040162711: cpu-clock:pppH: 
+	          127aae __send (/usr/lib/x86_64-linux-gnu/libc.so.6)
+	               0 [unknown] ([unknown])
+
+nginx  2.500000000: cpu-clock:pppH: 
+

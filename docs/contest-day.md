@@ -236,6 +236,7 @@ isuscope metrics latest
 isuscope query latest --metric-prefix benchmark.scenario. --group-by scenario
 isuscope series latest --metric cpu.sample_count --bucket 5
 isuscope series latest --metric cpu.sample_percent --node app1 --bucket 5
+isuscope query latest --metric cpu.process_percent --group-by process --limit 20
 ```
 
 対象processのsampleが全bucketで0件なら、アプリが軽いと結論づける前にcollector logとprocess/binary labelを確認します。観測条件を変更した場合、その前後のrunは同条件のスコア比較に使いません。

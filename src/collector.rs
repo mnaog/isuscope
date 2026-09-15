@@ -606,29 +606,79 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
         .find_map(|line| line.strip_prefix("# isuscope-perf-start "))
         .and_then(|value| value.trim().parse::<f64>().ok())
         .context("perf script output has no valid isuscope start marker")?;
-    let time_pattern = regex::Regex::new(r"(?P<time>[0-9]+(?:[.][0-9]+)?):")?;
+    // A sample header starts at column 0: `comm [pid] [cpu] time: event: [ip sym (dso)]`.
+    // With `perf record -g`, the stack follows on indented lines and the first frame is the leaf.
+    let header_pattern =
+        regex::Regex::new(r"^(?P<prefix>\S.*?)\s+(?P<time>[0-9]+[.][0-9]+):\s*(?P<rest>.*)$")?;
     let symbol_pattern = regex::Regex::new(r"(?P<symbol>.+?)\s+\((?P<dso>[^()]*)\)\s*$")?;
+
+    struct Sample {
+        at: chrono::DateTime<Utc>,
+        process: String,
+        leaf: Option<(String, String)>,
+    }
+    fn symbol_and_binary(symbol_pattern: &regex::Regex, text: &str) -> Option<(String, String)> {
+        let capture = symbol_pattern.captures(text)?;
+        let binary = capture
+            .name("dso")
+            .map_or("-", |value| value.as_str().trim());
+        let raw_symbol = capture
+            .name("symbol")
+            .map_or("-", |value| value.as_str().trim());
+        let mut fields = raw_symbol.splitn(2, char::is_whitespace);
+        let first = fields.next().unwrap_or("-");
+        let symbol = if !first.is_empty() && first.chars().all(|c| c.is_ascii_hexdigit()) {
+            fields.next().unwrap_or("-").trim()
+        } else {
+            raw_symbol
+        };
+        Some((canonical_perf_binary(binary), canonical_perf_symbol(symbol)))
+    }
+
     let mut buckets = BTreeMap::<(chrono::DateTime<Utc>, String, String, String), u64>::new();
     let mut parsed_lines = 0_u64;
-    for line in raw.lines().filter(|line| !line.starts_with('#')) {
-        let Some(time_capture) = time_pattern.captures(line) else {
+    let mut record = |sample: Sample, buckets: &mut BTreeMap<_, u64>| {
+        let Some(bucket) = chrono::DateTime::from_timestamp(sample.at.timestamp() / 5 * 5, 0)
+        else {
+            return;
+        };
+        let (binary, symbol) = sample
+            .leaf
+            .unwrap_or_else(|| ("[unknown]".into(), "[unknown]".into()));
+        *buckets
+            .entry((bucket, sample.process, binary, symbol))
+            .or_default() += 1;
+        parsed_lines += 1;
+    };
+    let mut pending: Option<Sample> = None;
+    let mut saw_sample_text = false;
+    for line in raw.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        saw_sample_text = true;
+        if line.starts_with(char::is_whitespace) {
+            if let Some(sample) = pending.as_mut()
+                && sample.leaf.is_none()
+            {
+                sample.leaf = symbol_and_binary(&symbol_pattern, line.trim());
+            }
+            continue;
+        }
+        let Some(header) = header_pattern.captures(line) else {
             continue;
         };
-        let Some(time_match) = time_capture.name("time") else {
-            continue;
-        };
-        let Some(symbol_capture) = symbol_pattern.captures(line) else {
-            continue;
-        };
-        let relative = time_match.as_str().parse::<f64>()?;
+        if let Some(sample) = pending.take() {
+            record(sample, &mut buckets);
+        }
+        let relative = header["time"].parse::<f64>()?;
         let wall = start + relative;
         let seconds = wall.floor() as i64;
         let nanos = ((wall - wall.floor()) * 1_000_000_000.0).round() as u32;
         let Some(at) = chrono::DateTime::from_timestamp(seconds, nanos.min(999_999_999)) else {
             continue;
         };
-        let prefix = line[..time_match.start()].trim();
-        let process = prefix
+        let process = header["prefix"]
             .split_whitespace()
             .take_while(|part| {
                 !(part.chars().all(|character| character.is_ascii_digit())
@@ -636,50 +686,54 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let binary = symbol_capture
-            .name("dso")
-            .map(|value| value.as_str().trim())
-            .unwrap_or("-");
-        let raw_symbol = symbol_capture
-            .name("symbol")
-            .map(|value| value.as_str().trim())
-            .unwrap_or("-");
-        let after_event = raw_symbol
-            .rsplit_once(": ")
-            .map_or(raw_symbol, |(_, value)| value)
-            .trim();
-        let mut symbol_fields = after_event.splitn(2, char::is_whitespace);
-        let first = symbol_fields.next().unwrap_or("-");
-        let symbol =
-            if !first.is_empty() && first.chars().all(|character| character.is_ascii_hexdigit()) {
-                symbol_fields.next().unwrap_or("-").trim()
+        // Without a call graph the leaf is on the header itself, after `event: ip`.
+        let inline = header["rest"]
+            .split_once(": ")
+            .and_then(|(_, sample)| symbol_and_binary(&symbol_pattern, sample.trim()));
+        pending = Some(Sample {
+            at,
+            process: if process.is_empty() {
+                "-".into()
             } else {
-                after_event
-            };
-        let Some(bucket) = chrono::DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) else {
-            continue;
-        };
-        *buckets
-            .entry((
-                bucket,
-                if process.is_empty() { "-" } else { &process }.into(),
-                canonical_perf_binary(binary),
-                canonical_perf_symbol(symbol),
-            ))
-            .or_default() += 1;
-        parsed_lines += 1;
+                process
+            },
+            leaf: inline,
+        });
     }
-    if raw
-        .lines()
-        .any(|line| !line.starts_with('#') && !line.trim().is_empty())
-        && parsed_lines == 0
-    {
+    if let Some(sample) = pending.take() {
+        record(sample, &mut buckets);
+    }
+    if saw_sample_text && parsed_lines == 0 {
         anyhow::bail!("perf script output contained samples but none matched the supported format");
     }
     let mut totals = BTreeMap::<chrono::DateTime<Utc>, u64>::new();
-    for ((at, _, _, _), count) in &buckets {
+    let mut process_buckets = BTreeMap::<(chrono::DateTime<Utc>, String), u64>::new();
+    let mut process_totals = BTreeMap::<String, u64>::new();
+    for ((at, process, _, _), count) in &buckets {
         *totals.entry(*at).or_default() += count;
+        *process_buckets.entry((*at, process.clone())).or_default() += count;
+        *process_totals.entry(process.clone()).or_default() += count;
     }
+    let all_samples = process_totals.values().sum::<u64>();
+    // Per-symbol rows are too fine to show which process used the CPU, so also report the
+    // process share per bucket and for the whole capture (the latter has no timestamp).
+    let process_metrics = process_buckets
+        .into_iter()
+        .map(|((timestamp, process), count)| Metric {
+            name: "cpu.process_percent".into(),
+            value: count as f64 / totals[&timestamp] as f64 * 100.0,
+            unit: "percent".into(),
+            timestamp: Some(timestamp),
+            labels: BTreeMap::from([("process".into(), process)]),
+        })
+        .chain(process_totals.into_iter().map(|(process, count)| Metric {
+            name: "cpu.process_percent".into(),
+            value: count as f64 / all_samples as f64 * 100.0,
+            unit: "percent".into(),
+            timestamp: None,
+            labels: BTreeMap::from([("process".into(), process)]),
+        }))
+        .collect::<Vec<_>>();
     Ok(buckets
         .into_iter()
         .flat_map(|((timestamp, process, binary, symbol), count)| {
@@ -706,6 +760,7 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
                 },
             ]
         })
+        .chain(process_metrics)
         .collect())
 }
 
@@ -2005,6 +2060,63 @@ mod tests {
                 && metric.value == 1.0
                 && metric.labels.get("process").map(String::as_str) == Some("isupipe-rust")
         }));
+    }
+
+    #[test]
+    fn perf_script_with_call_graph_uses_the_leaf_frame() {
+        let metrics =
+            parse_perf_script(include_str!("../tests/fixtures/perf-script-callchain.txt")).unwrap();
+        let counts = metrics
+            .iter()
+            .filter(|metric| metric.name == "cpu.sample_count")
+            .collect::<Vec<_>>();
+        assert_eq!(counts.iter().map(|metric| metric.value).sum::<f64>(), 4.0);
+        let label =
+            |metric: &&Metric, key: &str| metric.labels.get(key).cloned().unwrap_or_default();
+        assert!(
+            counts
+                .iter()
+                .any(|metric| label(metric, "process") == "swapper"
+                    && label(metric, "symbol") == "native_safe_halt"
+                    && label(metric, "binary") == "[kernel.kallsyms]")
+        );
+        assert!(
+            counts
+                .iter()
+                .any(|metric| label(metric, "process") == "actix-rt|system"
+                    && label(metric, "binary") == "isuconquest"
+                    && label(metric, "symbol").ends_with("::perhaps_write_key_update"))
+        );
+        assert!(
+            counts
+                .iter()
+                .any(|metric| label(metric, "process") == "actix-rt|system"
+                    && label(metric, "symbol") == "__send")
+        );
+        // A header without frames still counts as CPU time of that process.
+        assert!(
+            counts
+                .iter()
+                .any(|metric| label(metric, "process") == "nginx"
+                    && label(metric, "symbol") == "[unknown]")
+        );
+        assert!(
+            counts
+                .iter()
+                .all(|metric| !label(metric, "process").contains('<'))
+        );
+        let whole_run = |process: &str| {
+            metrics
+                .iter()
+                .find(|metric| {
+                    metric.name == "cpu.process_percent"
+                        && metric.timestamp.is_none()
+                        && metric.labels.get("process").map(String::as_str) == Some(process)
+                })
+                .map(|metric| metric.value)
+        };
+        assert_eq!(whole_run("actix-rt|system"), Some(50.0));
+        assert_eq!(whole_run("swapper"), Some(25.0));
     }
 
     #[test]
