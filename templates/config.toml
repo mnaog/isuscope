@@ -35,6 +35,8 @@ stream_output = false
 [ssh]
 user = "ubuntu"
 connect_timeout_seconds = 5
+# projectのknown_hostsを使う場合に指定します。未登録hostは初回だけ受け入れて固定します。
+# known_hosts_file = ".local/known-hosts"
 
 # [[nodes]]はSETUP.mdの手順に従って追加します。roleを指定しない以下の
 # 標準collectorは、設定した全nodeでrun/survey-runの両方に対して動きます。

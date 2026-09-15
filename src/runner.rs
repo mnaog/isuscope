@@ -1,7 +1,7 @@
 use crate::{
     agent_context, benchmark,
     collector::{self, CollectorOutput},
-    config::{CollectorPhase, LoadedConfig},
+    config::{CollectorPhase, LoadedConfig, Transport},
     enrichment::{self, EnrichmentOutput},
     git_snapshot,
     model::{
@@ -145,6 +145,7 @@ pub async fn execute(
                     && collector.required
             })
     });
+    let unreachable = unreachable_ssh_nodes(&config, &before);
     absorb(
         before,
         &mut manifest,
@@ -160,6 +161,18 @@ pub async fn execute(
             mode: "not-started".into(),
             passed: Some(false),
             error: Some("a required before collector failed".into()),
+            ..Default::default()
+        };
+    } else if !unreachable.is_empty() {
+        let error = format!(
+            "SSH failed for every before collector on {}; fix SSH (host keys, identity, reachability) before benchmarking",
+            unreachable.join(", ")
+        );
+        eprintln!("! {error}");
+        manifest.benchmark = BenchmarkResult {
+            mode: "not-started".into(),
+            passed: Some(false),
+            error: Some(error),
             ..Default::default()
         };
     } else {
@@ -378,4 +391,40 @@ pub fn short_id(id: &str) -> &str {
 
 pub fn run_path(data_dir: &Path, id: &str) -> std::path::PathBuf {
     data_dir.join("runs").join(id)
+}
+
+/// SSH exits with 255 when the connection itself fails. A node whose every SSH before
+/// collector failed that way would produce a benchmark without any of its observations.
+fn unreachable_ssh_nodes(
+    config: &LoadedConfig,
+    outputs: &[collector::CollectorOutput],
+) -> Vec<String> {
+    let ssh_before = config
+        .config
+        .collectors
+        .iter()
+        .filter(|collector| {
+            matches!(collector.phase, CollectorPhase::Before)
+                && matches!(collector.transport, Transport::Ssh)
+        })
+        .map(|collector| collector.name.as_str())
+        .collect::<Vec<_>>();
+    let mut by_node = std::collections::BTreeMap::<&str, bool>::new();
+    for output in outputs {
+        let result = &output.result;
+        let Some(node) = result.node.as_deref() else {
+            continue;
+        };
+        if !ssh_before.contains(&result.name.as_str()) {
+            continue;
+        }
+        let transport_failed = result.status == "failed" && result.exit_code == Some(255);
+        let entry = by_node.entry(node).or_insert(true);
+        *entry &= transport_failed;
+    }
+    by_node
+        .into_iter()
+        .filter(|(_, failed)| *failed)
+        .map(|(node, _)| node.to_owned())
+        .collect()
 }

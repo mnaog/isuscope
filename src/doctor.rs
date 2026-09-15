@@ -357,24 +357,7 @@ async fn check_sudo(config: &LoadedConfig, target: &str, report: &mut DoctorRepo
 }
 
 fn ssh_args(config: &LoadedConfig) -> Vec<String> {
-    let mut args = vec![
-        "-o".to_owned(),
-        "BatchMode=yes".to_owned(),
-        "-o".to_owned(),
-        format!(
-            "ConnectTimeout={}",
-            config.config.ssh.connect_timeout_seconds
-        ),
-    ];
-    if let Some(identity) = &config.config.ssh.identity_file {
-        args.push("-i".into());
-        args.push(
-            resolve(&config.project_root, identity)
-                .display()
-                .to_string(),
-        );
-    }
-    args
+    config.ssh_options()
 }
 
 async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorReport) {

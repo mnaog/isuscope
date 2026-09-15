@@ -103,6 +103,7 @@ initialize境界を取得できる場合は次のeventも出力できます。
 [ssh]
 user = "ubuntu"
 identity_file = "/absolute/path/to/key"
+known_hosts_file = ".local/known-hosts"
 connect_timeout_seconds = 5
 
 [[nodes]]

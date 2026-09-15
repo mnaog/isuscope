@@ -130,6 +130,8 @@ pub struct SshConfig {
     #[serde(default = "default_ssh_user")]
     pub user: String,
     pub identity_file: Option<PathBuf>,
+    /// Project-local known_hosts; new hosts are accepted once and pinned afterwards.
+    pub known_hosts_file: Option<PathBuf>,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_seconds: u64,
 }
@@ -139,6 +141,7 @@ impl Default for SshConfig {
         Self {
             user: default_ssh_user(),
             identity_file: None,
+            known_hosts_file: None,
             connect_timeout_seconds: default_connect_timeout(),
         }
     }
@@ -261,6 +264,31 @@ fn default_parser_output_bytes() -> u64 {
 }
 
 impl LoadedConfig {
+    /// Options shared by every SSH invocation, before the destination argument.
+    pub fn ssh_options(&self) -> Vec<String> {
+        let ssh = &self.config.ssh;
+        let mut args = vec![
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            format!("ConnectTimeout={}", ssh.connect_timeout_seconds),
+        ];
+        if let Some(known_hosts) = &ssh.known_hosts_file {
+            args.push("-o".into());
+            args.push(format!(
+                "UserKnownHostsFile={}",
+                resolve(&self.project_root, known_hosts).display()
+            ));
+            args.push("-o".into());
+            args.push("StrictHostKeyChecking=accept-new".into());
+        }
+        if let Some(identity) = &ssh.identity_file {
+            args.push("-i".into());
+            args.push(resolve(&self.project_root, identity).display().to_string());
+        }
+        args
+    }
+
     pub fn discover(start: &Path) -> Result<Self> {
         let start = start
             .canonicalize()

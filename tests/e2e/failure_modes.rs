@@ -246,3 +246,91 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"isuscope.result\",\"score\":
     assert!(!passed);
     assert_eq!(state, "failed");
 }
+
+#[cfg(unix)]
+#[test]
+fn ssh_transport_failure_on_a_node_stops_before_the_benchmark() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    let tools = project.path().join("tools");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&tools).unwrap();
+    // Records every invocation; hosts named `unreachable` fail like a rejected host key.
+    let fake_ssh = tools.join("ssh");
+    fs::write(
+        &fake_ssh,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SSH_ARGS_LOG\"\nfor last; do :; done\ncase \"$*\" in *@unreachable*) echo 'Host key verification failed.' >&2; exit 255 ;; esac\nexec /bin/sh -c \"$last\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = |host: &str| {
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "touch benchmark-ran; printf '%s\n' '{{\"type\":\"isuscope.result\",\"pass\":true,\"score\":1}}'"]
+
+[ssh]
+known_hosts_file = ".local/known-hosts"
+
+[[nodes]]
+name = "app1"
+host = "{host}"
+
+[[collectors]]
+name = "remote-before"
+phase = "before"
+transport = "ssh"
+command = ["true"]
+"#
+        )
+    };
+    let path = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+    let args_log = project.path().join("ssh-args.log");
+
+    fs::write(config_dir.join("config.toml"), config("unreachable")).unwrap();
+    let blocked = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "run",
+            "--hypothesis",
+            "unreachable node must not be benchmarked",
+        ])
+        .env("PATH", &path)
+        .env("SSH_ARGS_LOG", &args_log)
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!project.path().join("benchmark-ran").exists());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr)
+            .contains("SSH failed for every before collector on app1"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    let logged = fs::read_to_string(&args_log).unwrap();
+    // The project root may be canonicalized (for example /var -> /private/var on macOS).
+    assert!(
+        logged
+            .split_whitespace()
+            .any(|arg| arg.starts_with("UserKnownHostsFile=/")
+                && arg.ends_with("/.local/known-hosts")),
+        "{logged}"
+    );
+    assert!(logged.contains("StrictHostKeyChecking=accept-new"));
+
+    fs::write(config_dir.join("config.toml"), config("reachable")).unwrap();
+    let allowed = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "reachable node is benchmarked"])
+        .env("PATH", &path)
+        .env("SSH_ARGS_LOG", &args_log)
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        project.path().join("benchmark-ran").is_file(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+}

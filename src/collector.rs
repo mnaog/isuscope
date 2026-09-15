@@ -58,19 +58,7 @@ pub async fn cleanup_abandoned(config: &LoadedConfig, run_ids: &[String]) {
 
 async fn cleanup_node(config: &LoadedConfig, node: &NodeConfig, run_id: &str) -> Result<()> {
     let user = node.user.as_deref().unwrap_or(&config.config.ssh.user);
-    let mut args = vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        format!(
-            "ConnectTimeout={}",
-            config.config.ssh.connect_timeout_seconds
-        ),
-    ];
-    if let Some(identity) = &config.config.ssh.identity_file {
-        args.push("-i".into());
-        args.push(identity.display().to_string());
-    }
+    let mut args = config.ssh_options();
     args.push(format!("{user}@{}", node.host));
     args.push("--".into());
     let script = format!(
@@ -1717,19 +1705,7 @@ fn make_spec(
     if matches!(collector.transport, Transport::Ssh) {
         let node = node.context("SSH collector has no target node")?;
         let user = node.user.as_deref().unwrap_or(&config.config.ssh.user);
-        let mut ssh_args = vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            format!(
-                "ConnectTimeout={}",
-                config.config.ssh.connect_timeout_seconds
-            ),
-        ];
-        if let Some(identity) = &config.config.ssh.identity_file {
-            ssh_args.push("-i".into());
-            ssh_args.push(identity.display().to_string());
-        }
+        let mut ssh_args = config.ssh_options();
         ssh_args.push(format!("{user}@{}", node.host));
         ssh_args.push("--".into());
         ssh_args.push(
