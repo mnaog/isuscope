@@ -429,6 +429,7 @@ mod tests {
             initialize_start_marker: "初期化を行います".into(),
             initialize_finish_marker: "整合性チェック".into(),
             parsers: Vec::new(),
+            sample_output: None,
         }
     }
 
