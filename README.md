@@ -106,6 +106,9 @@ isuscope doctor
 | `survey-run` | 序盤の全体調査を1回行い、行動遷移も収集する |
 | `run` | 標準collectorでベンチを実行する |
 | `list` | 保存済みrunを新しい順にJSONで一覧表示する。`--since 4h`などで開始時刻を絞る |
+| `lock -- <command>` | 変更系操作の共通lockを取ってcommandを実行する。取得済みの子processでは再取得せず、実行時間を`operation-timing.tsv`へ追記する |
+| `pin <run>` | runを生ログ（`logs/`）ごとGitへstageする |
+| `routes suggest [run]` | 動的IDの残るHTTP routeから`[[routes]]`候補を作る。`--output`で書き出し先を指定する |
 | `report` | 1 runのcompactな診断JSONを出力する |
 | `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
 | `diff` | 2 runを全件比較してからcompactな差分JSONを出力する |
@@ -144,6 +147,8 @@ isuscope query latest --base previous --view http --label-contains route=reserva
 ```
 
 各runにはスコアと成否、仮説と分析、Git commit・dirty patch・未追跡file hash、実行時のisuscope設定、collector出力と構造化metricを保存します。SQLiteは検索用の索引で、run directoryが記録の正本です。索引を失っても`isuscope list`の起動時に再構築されます。
+
+`[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockは`mkdir`で作るdirectoryで、`owner`のpidが既に存在しなければ回収し、生きた所有者がいれば終了code 75で止まります。
 
 `[ssh] known_hosts_file`を指定すると、全SSH呼び出しがprojectのknown_hostsを`StrictHostKeyChecking=accept-new`で使います。ベンチ前のSSH collectorがあるnodeで、そのすべてがSSH接続自体の失敗（exit 255）になった場合は、計測のないrunを残さないようベンチを開始せずに失敗させます。
 

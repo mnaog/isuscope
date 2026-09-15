@@ -32,6 +32,10 @@ stream_output = false
 # command = [".isuscope/parse-benchmark.sh", "{benchmark_stdout}"]
 # timeout_seconds = 30
 
+# deployなどと共有する変更系操作のlock。runとsurvey-runはベンチ中これを保持します。
+# [lock]
+# path = ".local/operation.lock"
+
 [ssh]
 user = "ubuntu"
 connect_timeout_seconds = 5

@@ -32,6 +32,25 @@ enum Commands {
     },
     /// プロジェクトへ一度だけ使う設定雛形を生成します。
     Init,
+    /// 変更系操作の共通lockを取ってcommandを実行します。取得済みの子processでは再取得しません。
+    Lock {
+        /// lock directory。省略時は`[lock] path`を使います。
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// 実行するcommandと引数（`--`の後に指定）。
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// runを生ログ（通常はGit管理外の`logs/`）ごとGitへstageします。
+    Pin {
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
+        run: String,
+    },
+    /// HTTP route正規化の規則候補を生成します。
+    Routes {
+        #[command(subcommand)]
+        command: RoutesCommand,
+    },
     /// 標準collectorでベンチを実行します。
     Run {
         #[command(flatten)]
@@ -257,6 +276,19 @@ enum ChangeCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum RoutesCommand {
+    /// 動的なIDやkeyが残るrouteから`[[routes]]`候補を作ります。`routes.toml`は変更しません。
+    Suggest {
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+        /// 候補の書き込み先。省略時は標準出力です。
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
 #[derive(Debug, Clone, Default, Args)]
 struct AnnotationArgs {
     /// 今回の変更がなぜ、どの観測値をどう改善すると考えるかを記録します。
@@ -338,20 +370,75 @@ impl From<VerdictArg> for AnalysisVerdict {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match real_main().await {
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if let Commands::Lock { path, command } = &cli.command {
+        return match run_lock_command(path.as_deref(), command) {
+            Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+            Err(error) => exit_for_error(error),
+        };
+    }
+    // The benchmark lock is taken before the async runtime starts so that marking it held in
+    // the environment happens while this process is still single-threaded.
+    let _run_lock = match acquire_run_lock(&cli) {
+        Ok(lock) => lock,
+        Err(error) => return exit_for_error(error),
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return exit_for_error(error.into()),
+    };
+    match runtime.block_on(real_main(cli)) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            ExitCode::from(2)
-        }
+        Err(error) => exit_for_error(error),
     }
 }
 
-async fn real_main() -> Result<bool> {
-    let cli = Cli::parse();
+fn exit_for_error(error: anyhow::Error) -> ExitCode {
+    eprintln!("error: {error:#}");
+    if error.downcast_ref::<isuscope::lock::LockBusy>().is_some() {
+        ExitCode::from(isuscope::lock::BUSY_EXIT_CODE)
+    } else {
+        ExitCode::from(2)
+    }
+}
+
+fn run_lock_command(path: Option<&std::path::Path>, command: &[String]) -> Result<i32> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let current = env::current_dir().context("cannot determine current directory")?;
+            LoadedConfig::discover(&current)?
+                .lock_path()
+                .context("isuscope lock needs --path or [lock] path in the config")?
+        }
+    };
+    isuscope::lock::run_locked(&path, command)
+}
+
+fn acquire_run_lock(cli: &Cli) -> Result<Option<isuscope::lock::OperationLock>> {
+    let operation = match cli.command {
+        Commands::Run { .. } => "isuscope run",
+        Commands::SurveyRun { .. } => "isuscope survey-run",
+        _ => return Ok(None),
+    };
+    let current = env::current_dir().context("cannot determine current directory")?;
+    let Some(path) = LoadedConfig::discover(&current)?.lock_path() else {
+        return Ok(None);
+    };
+    let lock = isuscope::lock::OperationLock::acquire(&path, operation)?;
+    if lock.is_some() {
+        // SAFETY: no other threads exist yet; the tokio runtime is built afterwards.
+        unsafe { env::set_var(isuscope::lock::HELD_ENV, "1") };
+    }
+    Ok(lock)
+}
+
+async fn real_main(cli: Cli) -> Result<bool> {
     if let Commands::InternalDiscoveryCapture {
         listen,
         upstream,
@@ -410,7 +497,26 @@ async fn real_main() -> Result<bool> {
     }
     let config = LoadedConfig::discover(&current)?;
     match cli.command {
-        Commands::Init => unreachable!(),
+        Commands::Init | Commands::Lock { .. } => unreachable!(),
+        Commands::Pin { run } => {
+            let id = isuscope::project_tools::pin(&config, &run)?;
+            println!("staged run including raw logs: {id}");
+            println!("review with: git diff --cached --stat");
+            Ok(true)
+        }
+        Commands::Routes {
+            command: RoutesCommand::Suggest { run, output },
+        } => {
+            let (content, rules) = isuscope::project_tools::suggest_routes(&config, &run)?;
+            match output {
+                Some(path) => {
+                    isuscope::project_tools::write_output(&path, &content)?;
+                    eprintln!("route suggestions: {} ({rules} rules)", path.display());
+                }
+                None => print!("{content}"),
+            }
+            Ok(true)
+        }
         Commands::InternalDiscoveryCapture { .. } | Commands::InternalTransition { .. } => {
             unreachable!()
         }

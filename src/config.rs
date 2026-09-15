@@ -23,9 +23,18 @@ pub struct Config {
     #[serde(default)]
     pub ssh: SshConfig,
     #[serde(default)]
+    pub lock: LockConfig,
+    #[serde(default)]
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub collectors: Vec<CollectorConfig>,
+}
+
+/// Operation lock shared with project scripts through `isuscope lock`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LockConfig {
+    /// When set, `run` and `survey-run` hold this lock for the whole benchmark.
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -333,6 +342,14 @@ impl LoadedConfig {
             .as_ref()
             .map(|path| resolve(&self.project_root, path))
             .unwrap_or_else(|| self.project_root.clone())
+    }
+
+    pub fn lock_path(&self) -> Option<PathBuf> {
+        self.config
+            .lock
+            .path
+            .as_ref()
+            .map(|path| resolve(&self.project_root, path))
     }
 
     pub fn agent_history_dir(&self) -> Option<PathBuf> {
