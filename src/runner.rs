@@ -288,6 +288,12 @@ pub async fn execute(
             println!("error     {}", message.text);
         }
     }
+    if manifest.benchmark.operator_lines_dropped > 0 {
+        println!(
+            "operator  {} organizer-only lines dropped",
+            manifest.benchmark.operator_lines_dropped
+        );
+    }
     println!("analysis  {}", manifest.analysis_status.as_str());
     println!("saved     {}", final_dir.display());
     if manifest.analysis_status == AnalysisStatus::Pending {

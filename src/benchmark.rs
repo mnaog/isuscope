@@ -29,6 +29,7 @@ pub struct BenchmarkExecution {
 
 #[derive(Default)]
 struct Observation {
+    operator_lines_dropped: usize,
     score: Option<i64>,
     passed: Option<bool>,
     messages: Vec<String>,
@@ -124,6 +125,12 @@ async fn execute_command(
         .context("benchmark stderr was not captured")?;
     let score_pattern = Regex::new(&benchmark.score_pattern)
         .context("benchmark.score_pattern is not a valid regular expression")?;
+    let operator_pattern = benchmark
+        .operator_line_pattern
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .context("benchmark.operator_line_pattern is not a valid regular expression")?;
     let observation = Arc::new(Mutex::new(Observation::default()));
     let stdout_raw = run_dir.join("tmp/benchmark-stdout.log");
     let stderr_raw = run_dir.join("tmp/benchmark-stderr.log");
@@ -133,6 +140,7 @@ async fn execute_command(
         false,
         observation.clone(),
         score_pattern.clone(),
+        operator_pattern.clone(),
         benchmark.clone(),
     ));
     let stderr_task = tokio::spawn(capture_lines(
@@ -141,6 +149,7 @@ async fn execute_command(
         true,
         observation.clone(),
         score_pattern,
+        operator_pattern,
         benchmark.clone(),
     ));
     let (status, interrupted) = tokio::select! {
@@ -208,6 +217,7 @@ async fn execute_command(
             finished_at: None,
             initialize_started_at: observation.initialize_started_at,
             initialize_finished_at: observation.initialize_finished_at,
+            operator_lines_dropped: observation.operator_lines_dropped,
             error: if interrupted {
                 Some("interrupted by signal".into())
             } else if duplicate_result {
@@ -226,12 +236,14 @@ async fn execute_command(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn capture_lines<R>(
     reader: R,
     path: PathBuf,
     stderr: bool,
     observation: Arc<Mutex<Observation>>,
     score_pattern: Regex,
+    operator_pattern: Option<Regex>,
     config: BenchmarkConfig,
 ) -> Result<()>
 where
@@ -250,11 +262,22 @@ where
         if buffer.last() != Some(&b'\n') {
             buffer.push(b'\n');
         }
-        file.write_all(&buffer).await?;
         let raw = &buffer[..buffer.len() - 1];
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         let line = String::from_utf8_lossy(raw);
         let line = line.as_ref();
+        // Organizer-only lines are part of the rules. Drop them before anything is written,
+        // so no saved log, metric or view can be read back from them.
+        if operator_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(line))
+        {
+            if let Ok(mut observation) = observation.lock() {
+                observation.operator_lines_dropped += 1;
+            }
+            continue;
+        }
+        file.write_all(&buffer).await?;
         if config.stream_output {
             if stderr {
                 eprintln!("{line}");
@@ -441,6 +464,7 @@ mod tests {
             score_pattern: r"スコア:\s*([0-9]+)".into(),
             initialize_start_marker: "初期化を行います".into(),
             initialize_finish_marker: "整合性チェック".into(),
+            operator_line_pattern: None,
             parsers: Vec::new(),
             sample_output: None,
         }

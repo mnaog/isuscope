@@ -158,6 +158,10 @@ pub struct BenchmarkConfig {
     pub initialize_start_marker: String,
     #[serde(default = "default_initialize_finish_marker")]
     pub initialize_finish_marker: String,
+    /// Lines only the organizers are meant to see (ISUCON12 prints `[ADMIN] ...`). Matching
+    /// lines are dropped before anything is saved, so no view or parser can use them.
+    #[serde(default)]
+    pub operator_line_pattern: Option<String>,
     #[serde(default)]
     pub parsers: Vec<BenchmarkParserConfig>,
     /// Saved real benchmark stdout; `doctor` runs every parser against it.
@@ -203,6 +207,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub roles: Vec<String>,
     pub user: Option<String>,
+    /// The benchmark's own machine. It is part of the rules, not of the system under test,
+    /// so isuscope never runs collectors or checks on it.
+    #[serde(default)]
+    pub rule_side: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

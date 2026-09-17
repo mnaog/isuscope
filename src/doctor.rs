@@ -281,6 +281,13 @@ async fn check_nodes(config: &LoadedConfig, report: &mut DoctorReport) {
         return;
     }
     for node in &config.config.nodes {
+        if node.rule_side {
+            report.pass(format!(
+                "node {}: rule side; collectors and checks skip it",
+                node.name
+            ));
+            continue;
+        }
         let user = node.user.as_deref().unwrap_or(&config.config.ssh.user);
         let target = format!("{user}@{}", node.host);
         let mut args = ssh_args(config);
@@ -476,7 +483,9 @@ async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorRepo
 }
 
 fn collector_matches_node(collector: &CollectorConfig, node: &NodeConfig) -> bool {
-    collector.roles.is_empty() || collector.roles.iter().any(|role| node.roles.contains(role))
+    !node.rule_side
+        && (collector.roles.is_empty()
+            || collector.roles.iter().any(|role| node.roles.contains(role)))
 }
 
 fn record_profile_preflight(
@@ -550,6 +559,25 @@ fn check_initialize_markers(config: &LoadedConfig, report: &mut DoctorReport) {
     }
 }
 
+/// Copies a saved benchmark output without the organizer-only lines.
+fn copy_contestant_lines(
+    sample: &Path,
+    destination: &Path,
+    operator_pattern: Option<&regex::Regex>,
+) -> std::io::Result<()> {
+    let Some(pattern) = operator_pattern else {
+        return fs::copy(sample, destination).map(|_| ());
+    };
+    let contents = fs::read(sample)?;
+    let mut kept = Vec::with_capacity(contents.len());
+    for line in contents.split_inclusive(|byte| *byte == b'\n') {
+        if !pattern.is_match(&String::from_utf8_lossy(line)) {
+            kept.extend_from_slice(line);
+        }
+    }
+    fs::write(destination, kept)
+}
+
 /// Runs every benchmark parser against a saved real benchmark output before any benchmark.
 async fn check_parser_sample(config: &LoadedConfig, report: &mut DoctorReport) {
     let benchmark = &config.config.benchmark;
@@ -587,9 +615,24 @@ async fn check_parser_sample(config: &LoadedConfig, report: &mut DoctorReport) {
     let stderr_log = workspace.path().join("benchmark-stderr.zst");
     let empty = workspace.path().join("empty");
     // compress_log removes its input, so compress a copy and never touch the saved sample.
+    // The copy drops organizer-only lines, exactly as a real benchmark would.
     let sample_copy = workspace.path().join("sample");
+    let operator_pattern = match benchmark
+        .operator_line_pattern
+        .as_deref()
+        .map(regex::Regex::new)
+        .transpose()
+    {
+        Ok(pattern) => pattern,
+        Err(error) => {
+            report.fail(format!(
+                "benchmark.operator_line_pattern is not a valid regular expression: {error}"
+            ));
+            return;
+        }
+    };
     let prepared = fs::write(&empty, b"")
-        .and_then(|_| fs::copy(&sample, &sample_copy).map(|_| ()))
+        .and_then(|_| copy_contestant_lines(&sample, &sample_copy, operator_pattern.as_ref()))
         .map_err(anyhow::Error::from)
         .and_then(|_| crate::benchmark::compress_log(&sample_copy, &stdout_log))
         .and_then(|_| crate::benchmark::compress_log(&empty, &stderr_log));

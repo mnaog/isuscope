@@ -1705,8 +1705,10 @@ fn expand(
         Transport::Local => Ok(vec![make_spec(config, collector, None, run_id, run_dir)?]),
         Transport::Ssh => {
             let nodes = config.config.nodes.iter().filter(|node| {
-                collector.roles.is_empty()
-                    || collector.roles.iter().any(|role| node.roles.contains(role))
+                // The benchmark's own machine is part of the rules; never measure it.
+                !node.rule_side
+                    && (collector.roles.is_empty()
+                        || collector.roles.iter().any(|role| node.roles.contains(role)))
             });
             nodes
                 .map(|node| make_spec(config, collector, Some(node), run_id, run_dir))

@@ -158,6 +158,9 @@ pub struct BenchmarkResult {
     pub initialize_started_at: Option<DateTime<Utc>>,
     pub initialize_finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Organizer-only lines dropped by `[benchmark] operator_line_pattern` before saving.
+    #[serde(default)]
+    pub operator_lines_dropped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

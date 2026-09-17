@@ -161,3 +161,99 @@ command = ["sh", "-c", "printf 'broken \\377\\376 line\\n'; printf '%s\\n' '{\"t
         "{list}"
     );
 }
+
+#[test]
+fn organizer_only_lines_never_reach_a_saved_run() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    // The benchmark prints organizer-only lines with scores and scenario counts.
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '[ADMIN] scenario login: 54101 runs' '[ADMIN] {\"type\":\"metric\",\"name\":\"benchmark.admin_leak\",\"value\":1}' 'contestant line' '{\"type\":\"isuscope.result\",\"pass\":true,\"score\":5}'"]
+operator_line_pattern = "^\\[ADMIN\\]"
+
+[[benchmark.parsers]]
+name = "contest-output"
+command = ["sh", "-c", "zstd -dc -- \"$1\" | grep -c ADMIN | sed 's/.*/{\"type\":\"metric\",\"name\":\"benchmark.admin_lines_seen_by_parser\",\"value\":&}/'", "parser", "{benchmark_stdout}"]
+
+[[nodes]]
+name = "bench"
+host = "bench.internal"
+rule_side = true
+
+[[collectors]]
+name = "never-on-the-bench-node"
+phase = "before"
+transport = "ssh"
+command = ["true"]
+"#,
+    )
+    .unwrap();
+
+    let run = isuscope(
+        project.path(),
+        &["run", "--hypothesis", "rules stay out of the data"],
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        stdout.contains("operator  2 organizer-only lines dropped"),
+        "{stdout}"
+    );
+
+    let list: Value = serde_json::from_slice(&isuscope(project.path(), &["list"]).stdout).unwrap();
+    let id = list["runs"][0]["id"].as_str().unwrap().to_owned();
+    let saved = Command::new("zstd")
+        .args(["-dc", "--"])
+        .arg(
+            config_dir
+                .join("runs")
+                .join(&id)
+                .join("logs/benchmark-stdout.zst"),
+        )
+        .output()
+        .unwrap();
+    let saved = String::from_utf8_lossy(&saved.stdout);
+    assert!(!saved.contains("ADMIN"), "{saved}");
+    assert!(saved.contains("contestant line"), "{saved}");
+
+    let metrics = isuscope(
+        project.path(),
+        &["query", "latest", "--metric-prefix", "benchmark."],
+    );
+    let metrics: Value = serde_json::from_slice(&metrics.stdout).unwrap();
+    let rows = metrics["rows"].as_array().unwrap();
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["metric"] == "benchmark.admin_leak"),
+        "{metrics}"
+    );
+    // The parser sees the saved log, so it counts no organizer lines either.
+    let seen = rows
+        .iter()
+        .find(|row| row["metric"] == "benchmark.admin_lines_seen_by_parser")
+        .unwrap();
+    assert_eq!(seen["value"], 0.0, "{metrics}");
+
+    // A rule-side node is never a collector target.
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(config_dir.join("runs").join(&id).join("run.json")).unwrap(),
+    )
+    .unwrap();
+    let collectors = manifest["collectors"].as_array().unwrap();
+    assert!(
+        collectors
+            .iter()
+            .all(|collector| collector["node"].is_null()),
+        "{collectors:?}"
+    );
+}

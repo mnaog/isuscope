@@ -63,7 +63,13 @@ pub async fn measure(config: &LoadedConfig) -> Vec<NodeDisk> {
     }
     let timeout = Duration::from_secs(config.config.ssh.connect_timeout_seconds + 5);
     let mut checks = tokio::task::JoinSet::new();
-    for (index, node) in config.config.nodes.iter().enumerate() {
+    for (index, node) in config
+        .config
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| !node.rule_side)
+    {
         let user = node.user.as_deref().unwrap_or(&config.config.ssh.user);
         let target = format!("{user}@{}", node.host);
         let mut args = config.ssh_options();

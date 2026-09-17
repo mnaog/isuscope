@@ -44,6 +44,8 @@ pub struct BriefRun {
     pub analysis_status: String,
     pub commit_hash: Option<String>,
     pub dirty: bool,
+    /// Organizer-only benchmark lines dropped before saving, per `operator_line_pattern`.
+    pub operator_lines_dropped: usize,
     pub metric_count: usize,
 }
 
@@ -140,6 +142,7 @@ pub fn build(
             passed: run.benchmark.passed,
             hypothesis: run.hypothesis,
             analysis_status: run.analysis_status.as_str().into(),
+            operator_lines_dropped: run.benchmark.operator_lines_dropped,
             commit_hash: run.source.commit_hash,
             dirty: run.source.dirty,
             metric_count: run.metric_count,
