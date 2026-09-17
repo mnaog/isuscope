@@ -2,17 +2,31 @@ use crate::{
     benchmark::compress_log,
     collector::{capture_capped, parse_protocol, sanitize},
     config::{BenchmarkParserConfig, LoadedConfig},
-    model::{EnrichmentResult, LogRef, Metric},
+    model::{BenchmarkMessage, BenchmarkMessageKind, EnrichmentResult, LogRef, Metric},
     process,
     storage::Store,
     tooling,
 };
 use anyhow::{Context, Result};
-use std::{path::Path, process::Stdio, time::Duration};
+use serde_json::Value;
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, BufReader},
+    path::Path,
+    process::Stdio,
+    time::Duration,
+};
 use tokio::process::Command;
 use uuid::Uuid;
 
 pub const PARSER_LABEL: &str = "isuscope.parser";
+
+/// Failure messages kept per parser. The first lines usually name the cause.
+const MAX_FAILURE_MESSAGES: usize = 10;
+/// Error samples kept per category, and categories kept per parser.
+const MAX_ERROR_SAMPLES_PER_CATEGORY: usize = 5;
+const MAX_ERROR_CATEGORIES: usize = 20;
+const MAX_MESSAGE_CHARS: usize = 1000;
 
 pub struct EnrichmentOutput {
     pub result: EnrichmentResult,
@@ -87,6 +101,8 @@ async fn run_one(
                 error: Some(format!("{error:#}")),
                 log_ids: Vec::new(),
                 tooling_path: None,
+                messages: Vec::new(),
+                omitted_message_count: 0,
             },
             logs: Vec::new(),
             metrics: Vec::new(),
@@ -229,7 +245,7 @@ async fn execute(
             Ok((metrics, fingerprints, transitions)) => {
                 if !fingerprints.is_empty() || !transitions.is_empty() {
                     errors.push(
-                        "benchmark parsers may emit metric records only; other records were ignored"
+                        "benchmark parsers may emit metric and message records only; fingerprint and transition records were ignored"
                             .into(),
                     );
                 }
@@ -248,6 +264,25 @@ async fn execute(
             .labels
             .insert(PARSER_LABEL.into(), parser.name.clone());
     }
+    let (messages, omitted_message_count) = if stdout_destination.is_file() {
+        match parse_messages(&stdout_destination) {
+            Ok(parsed) => {
+                if parsed.invalid > 0 {
+                    errors.push(format!(
+                        "{} message records were ignored; kind must be `failure` or `error` and text must not be empty",
+                        parsed.invalid
+                    ));
+                }
+                (parsed.messages, parsed.omitted)
+            }
+            Err(error) => {
+                errors.push(format!("cannot parse benchmark parser messages: {error:#}"));
+                (Vec::new(), 0)
+            }
+        }
+    } else {
+        (Vec::new(), 0)
+    };
     let success = errors.is_empty();
     Ok(EnrichmentOutput {
         result: EnrichmentResult {
@@ -258,8 +293,97 @@ async fn execute(
             error: (!errors.is_empty()).then(|| errors.join("; ")),
             log_ids: logs.iter().map(|log| log.id.clone()).collect(),
             tooling_path: None,
+            messages,
+            omitted_message_count,
         },
         logs,
         metrics,
     })
+}
+
+struct ParsedMessages {
+    messages: Vec<BenchmarkMessage>,
+    omitted: usize,
+    invalid: usize,
+}
+
+/// Reads `{"type":"message","kind":"failure"|"error","category":...,"text":...}` records.
+/// Failures keep the first lines; errors keep the first samples of each category.
+fn parse_messages(path: &Path) -> Result<ParsedMessages> {
+    let decoder = zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?;
+    let mut parsed = ParsedMessages {
+        messages: Vec::new(),
+        omitted: 0,
+        invalid: 0,
+    };
+    let mut failures = 0;
+    let mut error_samples = BTreeMap::<Option<String>, usize>::new();
+    for line in BufReader::new(decoder).split(b'\n').map_while(Result::ok) {
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let kind = match value.get("kind").and_then(Value::as_str) {
+            Some("failure") => BenchmarkMessageKind::Failure,
+            Some("error") => BenchmarkMessageKind::Error,
+            _ => {
+                parsed.invalid += 1;
+                continue;
+            }
+        };
+        let Some(text) = value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            parsed.invalid += 1;
+            continue;
+        };
+        let category = value
+            .get("category")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|category| !category.is_empty())
+            .map(|category| truncate_chars(category, 200));
+        let kept = match kind {
+            BenchmarkMessageKind::Failure => {
+                failures += 1;
+                failures <= MAX_FAILURE_MESSAGES
+            }
+            BenchmarkMessageKind::Error => {
+                let known = error_samples.len();
+                match error_samples.get_mut(&category) {
+                    Some(count) => {
+                        *count += 1;
+                        *count <= MAX_ERROR_SAMPLES_PER_CATEGORY
+                    }
+                    None if known < MAX_ERROR_CATEGORIES => {
+                        error_samples.insert(category.clone(), 1);
+                        true
+                    }
+                    None => false,
+                }
+            }
+        };
+        if kept {
+            parsed.messages.push(BenchmarkMessage {
+                kind,
+                category,
+                text: truncate_chars(text, MAX_MESSAGE_CHARS),
+            });
+        } else {
+            parsed.omitted += 1;
+        }
+    }
+    Ok(parsed)
+}
+
+fn truncate_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }

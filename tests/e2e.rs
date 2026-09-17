@@ -8,6 +8,8 @@ mod adapters;
 mod agent_context;
 #[path = "e2e/analysis.rs"]
 mod analysis;
+#[path = "e2e/benchmark_messages.rs"]
+mod benchmark_messages;
 #[path = "e2e/changes.rs"]
 mod changes;
 #[path = "e2e/diff.rs"]
@@ -26,6 +28,8 @@ mod init;
 mod lifecycle;
 #[path = "e2e/log_rotation.rs"]
 mod log_rotation;
+#[path = "e2e/node_disk.rs"]
+mod node_disk;
 #[path = "e2e/operation_lock.rs"]
 mod operation_lock;
 #[path = "e2e/query.rs"]

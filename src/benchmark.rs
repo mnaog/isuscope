@@ -237,11 +237,24 @@ async fn capture_lines<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut lines = BufReader::new(reader).lines();
+    // Keep the bytes as written: a single invalid UTF-8 sequence (for example from two
+    // streams interleaved by ssh) must not end the capture and lose the rest of the output.
+    let mut reader = BufReader::new(reader);
     let mut file = tokio::fs::File::create(path).await?;
-    while let Some(line) = lines.next_line().await? {
-        file.write_all(line.as_bytes()).await?;
-        file.write_all(b"\n").await?;
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        if reader.read_until(b'\n', &mut buffer).await? == 0 {
+            break;
+        }
+        if buffer.last() != Some(&b'\n') {
+            buffer.push(b'\n');
+        }
+        file.write_all(&buffer).await?;
+        let raw = &buffer[..buffer.len() - 1];
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let line = String::from_utf8_lossy(raw);
+        let line = line.as_ref();
         if config.stream_output {
             if stderr {
                 eprintln!("{line}");
@@ -249,7 +262,7 @@ where
                 println!("{line}");
             }
         }
-        observe_line(&line, stderr, &score_pattern, &config, &observation);
+        observe_line(line, stderr, &score_pattern, &config, &observation);
     }
     file.flush().await?;
     Ok(())

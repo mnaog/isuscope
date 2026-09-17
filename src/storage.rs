@@ -36,6 +36,8 @@ struct StructuredSnapshot {
 #[derive(Debug, Serialize)]
 pub struct RunSummary {
     pub id: String,
+    /// The form printed by `run` and accepted everywhere a run is named.
+    pub short_id: String,
     pub started_at: String,
     pub commit_hash: Option<String>,
     pub dirty: bool,
@@ -49,6 +51,8 @@ pub struct RunSummary {
     pub analysis_status: String,
     pub latest_analysis_verdict: Option<String>,
     pub latest_analysis_body: Option<String>,
+    /// First parser failure message of a run that did not pass.
+    pub failure: Option<String>,
 }
 
 #[derive(Debug)]
@@ -305,8 +309,10 @@ impl Store {
              FROM runs r WHERE r.started_at >= ?2 ORDER BY r.started_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64, since], |row| {
+            let id: String = row.get(0)?;
             Ok(RunSummary {
-                id: row.get(0)?,
+                short_id: crate::runner::short_id(&id).into(),
+                id,
                 started_at: row.get(1)?,
                 commit_hash: row.get(2)?,
                 dirty: row.get(3)?,
@@ -320,11 +326,19 @@ impl Store {
                 analysis_status: row.get(10)?,
                 latest_analysis_verdict: row.get(11)?,
                 latest_analysis_body: row.get(12)?,
+                failure: None,
             })
         })?;
         let mut runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         for run in &mut runs {
             run.tags = self.tags(&run.id)?;
+            // Failed runs need no analysis, so the benchmark's own reason is their only record.
+            if run.passed != Some(true) && self.final_dir(&run.id).is_dir() {
+                run.failure = self
+                    .load(&run.id)
+                    .ok()
+                    .and_then(|manifest| manifest.failure_reasons().into_iter().next());
+            }
         }
         Ok(runs)
     }

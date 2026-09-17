@@ -52,6 +52,7 @@ pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
     check_commands(config, &mut report);
     check_identity(config, &mut report);
     check_nodes(config, &mut report).await;
+    check_node_disks(config, &mut report).await;
     check_profile_collectors(config, &mut report).await;
     check_initialize_markers(config, &mut report);
     check_parser_sample(config, &mut report).await;
@@ -315,6 +316,37 @@ async fn check_nodes(config: &LoadedConfig, report: &mut DoctorReport) {
             )),
             Ok(Err(error)) => report.fail(format!("SSH {target} failed: {error}")),
             Err(_) => report.fail(format!("SSH {target} timed out")),
+        }
+    }
+}
+
+/// Nodes whose SSH already failed in `check_nodes` are not reported again.
+async fn check_node_disks(config: &LoadedConfig, report: &mut DoctorReport) {
+    use crate::node_disk::{self, DiskLevel};
+    let disk = &config.config.disk;
+    if config.config.nodes.is_empty() || disk.paths.is_empty() {
+        return;
+    }
+    for node in node_disk::measure(config).await {
+        match node.tightest(disk) {
+            Some((mount, DiskLevel::Ok)) => report.pass(format!(
+                "disk {}: {}",
+                node.target,
+                node_disk::describe(mount)
+            )),
+            Some((mount, DiskLevel::Low)) => report.warn(format!(
+                "disk {}: {} (below {} MiB); rotate or truncate logs before it fills",
+                node.target,
+                node_disk::describe(mount),
+                disk.node_warn_free_mb
+            )),
+            Some((mount, DiskLevel::TooLow)) => report.fail(format!(
+                "disk {}: {} (below {} MiB); `run` will refuse to start",
+                node.target,
+                node_disk::describe(mount),
+                disk.node_min_free_mb
+            )),
+            None => {}
         }
     }
 }

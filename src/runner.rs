@@ -5,8 +5,8 @@ use crate::{
     enrichment::{self, EnrichmentOutput},
     git_snapshot,
     model::{
-        AnalysisStatus, BenchmarkResult, RunManifest, RunMode, RunState, SourceSnapshot,
-        ToolingSnapshot,
+        AnalysisStatus, BenchmarkMessageKind, BenchmarkResult, RunManifest, RunMode, RunState,
+        SourceSnapshot, ToolingSnapshot,
     },
     shutdown::Shutdown,
     storage::Store,
@@ -62,6 +62,7 @@ pub async fn execute(
             short_id(&run.id),
         );
     }
+    check_node_disks(&config).await?;
     let agent_context = agent_context::resolve(&config)?;
     let id = Uuid::now_v7().to_string();
     let staging = store.staging_dir(&id);
@@ -276,6 +277,17 @@ pub async fn execute(
             .unwrap_or_else(|| "-".into())
     );
     println!("state     {}", manifest.state.as_str());
+    for reason in manifest.failure_reasons().iter().take(3) {
+        println!("failure   {reason}");
+    }
+    let mut error_categories = Vec::<Option<&str>>::new();
+    for message in manifest.benchmark_messages(BenchmarkMessageKind::Error) {
+        let category = message.category.as_deref();
+        if !error_categories.contains(&category) && error_categories.len() < 3 {
+            error_categories.push(category);
+            println!("error     {}", message.text);
+        }
+    }
     println!("analysis  {}", manifest.analysis_status.as_str());
     println!("saved     {}", final_dir.display());
     if manifest.analysis_status == AnalysisStatus::Pending {
@@ -382,6 +394,33 @@ fn print_header(manifest: &RunManifest, config: &LoadedConfig) {
     }
     println!("data      {}", config.data_dir.display());
     println!();
+}
+
+/// Warns about nodes low on disk and refuses to benchmark when one is below the minimum.
+/// Unreachable nodes are left to the before collectors, which report SSH failures.
+async fn check_node_disks(config: &LoadedConfig) -> Result<()> {
+    use crate::node_disk::{self, DiskLevel};
+    let disk = &config.config.disk;
+    let mut too_low = Vec::new();
+    for node in node_disk::measure(config).await {
+        match node.tightest(disk) {
+            Some((mount, DiskLevel::Low)) => {
+                eprintln!("! disk {}: {}", node.node, node_disk::describe(mount));
+            }
+            Some((mount, DiskLevel::TooLow)) => {
+                too_low.push(format!("{}: {}", node.node, node_disk::describe(mount)));
+            }
+            _ => {}
+        }
+    }
+    if !too_low.is_empty() {
+        bail!(
+            "nodes are below the {} MiB free disk minimum ({}); free space before benchmarking, or lower [disk] node_min_free_mb",
+            disk.node_min_free_mb,
+            too_low.join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub fn short_id(id: &str) -> &str {

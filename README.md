@@ -24,7 +24,7 @@ isuscope diff BASE_RUN latest
 isuscope analyze RUN_ID supported --analysis "p95とDB時間が低下し、スコアも改善した"
 ```
 
-run IDは実行結果か`isuscope list`で確認します。`analyze`は更新対象を曖昧にしないため、run ID、一意な短縮ID、または一意なtagを明示します。判定は`supported`、`rejected`、`inconclusive`、`skipped`です。
+run IDは実行結果か`isuscope list`で確認します。`analyze`は更新対象を曖昧にしないため、run ID、一意な短縮ID、または一意なtagを明示します。`run`・`list`・`brief`はrun IDの末尾8文字を`short_id`として表示します（UUIDv7の先頭は近い時刻のrunで重なるため）。仮説や分析の本文でrunに触れるときもこの形にそろえてください。判定は`supported`、`rejected`、`inconclusive`、`skipped`です。`skipped`の理由は`--reason`でも`--analysis`でも書けます。
 
 ### 仮説の判定と変更の採否
 
@@ -42,6 +42,18 @@ isuscope brief RUN_ID
 isuscope change list --status provisional
 isuscope change show user-items-update
 ```
+
+分析と採否を同時に決めた場合は、`analyze`で一度に記録できます。
+
+```bash
+isuscope analyze RUN_ID supported --base BASE_RUN \
+  --analysis "アイドル接続が減りスコアも上がった" \
+  --change keepalive-200ms --decision accepted
+```
+
+- 採否の理由には分析本文を、根拠runにはこのrunと`--base`を使います。
+- 変更が未作成なら作成します。説明は`--description`、省略時はrunの仮説です。既存の変更に`--description`を付けるとエラーになります。
+- `provisional`の`--revisit`不足などは分析を書き込む前に検査し、分析だけが残ることはありません。
 
 - `analyze --base`は比較元の完全なrun IDを保存します。brief/report/UIは同じ比較処理で各1走のスコア差を表示し、誤差や性能採否は自動判定しません。
 - `change decide`の状態は`accepted`（採用）、`provisional`（暫定採用）、`rejected`（不採用）、`deferred`（保留）です。未記録と保留は別です。
@@ -149,6 +161,10 @@ isuscope query latest --base previous --view http --label-contains route=reserva
 各runにはスコアと成否、仮説と分析、Git commit・dirty patch・未追跡file hash、実行時のisuscope設定、collector出力と構造化metricを保存します。SQLiteは検索用の索引で、run directoryが記録の正本です。索引を失っても`isuscope list`の起動時に再構築されます。
 
 `doctor`はベンチを起動せずに、`sample_output`に`initialize_start_marker`・`initialize_finish_marker`の文言が含まれるかを確認し（含まれなければ区間分けが失われるので警告）、collectorの`preflight`（例: `preflight = ["sh", "-c", "sudo -n test -r /var/log/mysql/mysql-slow.log"]`）を対象nodeで実行し、`[benchmark] sample_output`に保存した実際のベンチ出力へ全parserを適用します。parserが不正な行を出せば失敗、0件なら警告です。最新runのHTTP routeに動的IDが残っていれば、`routes suggest`の確認を促します。
+
+parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例（categoryごとに最初の5件、最大20 category、各1000文字）で、runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure`、`brief`の`benchmark_messages`、`run`終了時の`failure`／`error`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
+
+`[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 
 `[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockは`mkdir`で作るdirectoryで、`owner`のpidが既に存在しなければ回収し、生きた所有者がいれば終了code 75で止まります。
 

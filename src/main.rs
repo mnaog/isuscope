@@ -189,15 +189,27 @@ enum Commands {
         /// 比較元run。解決した完全なIDを分析に保存します。
         #[arg(long)]
         base: Option<String>,
-        /// 結果の分析本文。
+        /// 結果の分析本文。skippedでは省略する理由として扱います。
         #[arg(long, conflicts_with = "analysis_file")]
         analysis: Option<String>,
         /// 結果の分析本文をUTF-8 fileから読み込みます。
         #[arg(long, conflicts_with = "analysis")]
         analysis_file: Option<PathBuf>,
-        /// 分析を省略する理由。
-        #[arg(long)]
+        /// 分析を省略する理由（skippedだけ。`--analysis`でも書けます）。
+        #[arg(long, conflicts_with_all = ["analysis", "analysis_file"])]
         reason: Option<String>,
+        /// 同時に採否を記録する変更ID。未作成なら作成します。
+        #[arg(long, requires = "decision")]
+        change: Option<String>,
+        /// `--change`の採否。理由には分析本文を使い、根拠runはこのrunと`--base`です。
+        #[arg(long, value_enum, requires = "change")]
+        decision: Option<isuscope::changes::DecisionStatus>,
+        /// 変更を新しく作るときの説明。省略時はrunの仮説を使います。
+        #[arg(long, requires = "change")]
+        description: Option<String>,
+        /// provisionalのときの再評価条件。
+        #[arg(long, requires = "change")]
+        revisit: Option<String>,
     },
     #[command(name = "__transition", hide = true)]
     InternalTransition {
@@ -649,34 +661,34 @@ async fn real_main(cli: Cli) -> Result<bool> {
             analysis,
             analysis_file,
             reason,
+            change,
+            decision,
+            description,
+            revisit,
         } => {
-            let body = if matches!(verdict, VerdictArg::Skipped) {
-                if analysis.is_some() || analysis_file.is_some() {
-                    anyhow::bail!(
-                        "the skipped verdict cannot be combined with --analysis or --analysis-file"
-                    );
-                }
-                reason
-                    .filter(|value| !value.trim().is_empty())
-                    .context("the skipped verdict requires a non-empty --reason")?
-            } else {
-                if reason.is_some() {
-                    anyhow::bail!("--reason may be used only with the skipped verdict");
-                }
-                let body = match (analysis, analysis_file) {
-                    (Some(body), None) => body,
-                    (None, Some(path)) => fs::read_to_string(&path)
-                        .with_context(|| format!("cannot read {}", path.display()))?,
-                    (None, None) => anyhow::bail!(
-                        "analysis requires either --analysis <text> or --analysis-file <path>"
-                    ),
-                    (Some(_), Some(_)) => unreachable!("clap enforces conflicting arguments"),
-                };
-                if body.trim().is_empty() {
-                    anyhow::bail!("analysis must not be empty");
-                }
-                body
+            let skipped = matches!(verdict, VerdictArg::Skipped);
+            if reason.is_some() && !skipped {
+                anyhow::bail!("--reason may be used only with the skipped verdict");
+            }
+            let body = match (reason, analysis, analysis_file) {
+                (Some(body), None, None) | (None, Some(body), None) => body,
+                (None, None, Some(path)) => fs::read_to_string(&path)
+                    .with_context(|| format!("cannot read {}", path.display()))?,
+                (None, None, None) if skipped => anyhow::bail!(
+                    "the skipped verdict requires a reason: --reason <text> or --analysis <text>"
+                ),
+                (None, None, None) => anyhow::bail!(
+                    "analysis requires either --analysis <text> or --analysis-file <path>"
+                ),
+                _ => unreachable!("clap enforces conflicting arguments"),
             };
+            if body.trim().is_empty() {
+                anyhow::bail!(if skipped {
+                    "the skipped verdict requires a non-empty reason"
+                } else {
+                    "analysis must not be empty"
+                });
+            }
             let mut store = Store::open(&config.data_dir)?;
             let id = store
                 .resolve_id(&run)?
@@ -688,7 +700,19 @@ async fn real_main(cli: Cli) -> Result<bool> {
                         .with_context(|| format!("base run '{requested}' was not found"))
                 })
                 .transpose()?;
-            let manifest = store.append_analysis_with_base(&id, verdict.into(), body, base)?;
+            // Validate the decision before appending, so a rejected decision leaves no analysis.
+            let decision = match (change, decision) {
+                (Some(change), Some(status)) => Some(store.prepare_change_decision(
+                    &change,
+                    &id,
+                    status,
+                    description,
+                    revisit,
+                )?),
+                _ => None,
+            };
+            let manifest =
+                store.append_analysis_with_base(&id, verdict.into(), body.clone(), base.clone())?;
             let latest = manifest
                 .analyses
                 .last()
@@ -697,6 +721,13 @@ async fn real_main(cli: Cli) -> Result<bool> {
             println!("verdict   {}", latest.verdict.as_str());
             println!("analysis  {}", manifest.analysis_status.as_str());
             println!("revisions {}", manifest.analyses.len());
+            if let Some(prepared) = decision {
+                let mut runs = vec![id.clone()];
+                runs.extend(base);
+                let recorded = store.record_change_decision(prepared, body, runs)?;
+                println!("change    {}", recorded.change_id);
+                println!("decision  {}", recorded.status.as_str());
+            }
             Ok(true)
         }
         Commands::Change { command } => {

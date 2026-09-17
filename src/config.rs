@@ -25,9 +25,47 @@ pub struct Config {
     #[serde(default)]
     pub lock: LockConfig,
     #[serde(default)]
+    pub disk: DiskConfig,
+    #[serde(default)]
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub collectors: Vec<CollectorConfig>,
+}
+
+/// Free space checked on every node by `doctor` and before each benchmark.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiskConfig {
+    /// Paths whose filesystems are checked. An empty list disables the check.
+    #[serde(default = "default_disk_paths")]
+    pub paths: Vec<String>,
+    /// Below this, `doctor` and `run` warn.
+    #[serde(default = "default_node_warn_free_mb")]
+    pub node_warn_free_mb: u64,
+    /// Below this, `doctor` fails and `run` refuses to start the benchmark. 0 disables it.
+    #[serde(default = "default_node_min_free_mb")]
+    pub node_min_free_mb: u64,
+}
+
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            paths: default_disk_paths(),
+            node_warn_free_mb: default_node_warn_free_mb(),
+            node_min_free_mb: default_node_min_free_mb(),
+        }
+    }
+}
+
+fn default_disk_paths() -> Vec<String> {
+    vec!["/".into(), "/var/log".into(), "/tmp".into()]
+}
+
+fn default_node_warn_free_mb() -> u64 {
+    4096
+}
+
+fn default_node_min_free_mb() -> u64 {
+    1024
 }
 
 /// Operation lock shared with project scripts through `isuscope lock`.

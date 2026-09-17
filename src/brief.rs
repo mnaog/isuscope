@@ -1,5 +1,5 @@
 use crate::{
-    model::Transition,
+    model::{BenchmarkMessageKind, RunManifest, Transition},
     query::{self, MetricQueryOutput, MetricQueryRow},
     report::{
         CoverageSummary, CpuSummary, DatabaseSummary, HostSummary, HttpRouteSummary,
@@ -17,6 +17,8 @@ pub struct BriefOutput {
     pub coverage_issues: BriefSection<CoverageIssueGroup>,
     pub coverage_info_count: usize,
     pub benchmark: BriefSection<MetricQueryRow>,
+    /// Parser-kept benchmark output lines: why it failed and what the errors were.
+    pub benchmark_messages: BriefBenchmarkMessages,
     pub http: BriefSection<HttpRouteSummary>,
     pub database: BriefSection<DatabaseSummary>,
     pub omitted_alternative_database_rows: usize,
@@ -31,6 +33,8 @@ pub struct BriefOutput {
 #[derive(Debug, Serialize)]
 pub struct BriefRun {
     pub id: String,
+    /// The form printed by `run` and accepted everywhere a run is named.
+    pub short_id: String,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub state: String,
@@ -41,6 +45,44 @@ pub struct BriefRun {
     pub commit_hash: Option<String>,
     pub dirty: bool,
     pub metric_count: usize,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct BriefBenchmarkMessages {
+    pub failure: Vec<String>,
+    pub errors: Vec<BriefErrorSamples>,
+    pub omitted_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefErrorSamples {
+    pub category: Option<String>,
+    pub samples: Vec<String>,
+}
+
+pub fn benchmark_messages(run: &RunManifest) -> BriefBenchmarkMessages {
+    let mut errors = Vec::<BriefErrorSamples>::new();
+    for message in run.benchmark_messages(BenchmarkMessageKind::Error) {
+        match errors
+            .iter_mut()
+            .find(|group| group.category == message.category)
+        {
+            Some(group) => group.samples.push(message.text.clone()),
+            None => errors.push(BriefErrorSamples {
+                category: message.category.clone(),
+                samples: vec![message.text.clone()],
+            }),
+        }
+    }
+    BriefBenchmarkMessages {
+        failure: run.failure_reasons(),
+        errors,
+        omitted_count: run
+            .enrichments
+            .iter()
+            .map(|enrichment| enrichment.omitted_message_count)
+            .sum(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +121,7 @@ pub fn build(
         row.average = query::round_to(row.average, 3);
         row.peak = query::round_to(row.peak, 3);
     });
+    let benchmark_messages = benchmark_messages(&run);
     let unavailable_artifact_count = diagnostics
         .artifacts
         .iter()
@@ -88,6 +131,7 @@ pub fn build(
         schema_version: 1,
         review: None,
         run: BriefRun {
+            short_id: crate::runner::short_id(&run.id).into(),
             id: run.id,
             started_at: run.started_at.to_rfc3339(),
             finished_at: run.finished_at.map(|value| value.to_rfc3339()),
@@ -103,6 +147,7 @@ pub fn build(
         coverage_issues: section(coverage_issues, limit),
         coverage_info_count,
         benchmark: section(benchmark.rows, limit),
+        benchmark_messages,
         http: section(http, limit),
         database: section(database, limit),
         omitted_alternative_database_rows,

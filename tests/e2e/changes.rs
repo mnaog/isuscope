@@ -323,3 +323,114 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     assert!(html.contains("inconclusive"));
     assert!(html.contains("各1走"));
 }
+
+#[test]
+fn analyze_records_a_change_decision_with_the_analysis() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    fs::create_dir(p.join(".isuscope")).unwrap();
+    config(p, 100);
+    ok(p, &["run", "--hypothesis", "baseline"]);
+    let base = json(p, &["list"])["runs"][0]["short_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // A skipped analysis takes its reason through --analysis as well as --reason.
+    ok(
+        p,
+        &["analyze", &base, "skipped", "--analysis", "baseline only"],
+    );
+    config(p, 110);
+    ok(
+        p,
+        &[
+            "run",
+            "--hypothesis",
+            "shorter keepalive frees idle connections",
+        ],
+    );
+    let candidate = json(p, &["list"])["runs"][0]["short_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // A provisional decision without a revisit condition is refused before anything is written.
+    let refused = cli(
+        p,
+        &[
+            "analyze",
+            &candidate,
+            "supported",
+            "--analysis",
+            "idle connections fell",
+            "--change",
+            "keepalive",
+            "--decision",
+            "provisional",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--revisit"));
+    assert_eq!(json(p, &["list"])["runs"][0]["analysis_status"], "pending");
+
+    let recorded = ok(
+        p,
+        &[
+            "analyze",
+            &candidate,
+            "supported",
+            "--base",
+            &base,
+            "--analysis",
+            "idle connections fell and score rose",
+            "--change",
+            "keepalive",
+            "--decision",
+            "accepted",
+        ],
+    );
+    assert!(recorded.contains("decision  accepted"), "{recorded}");
+    let history = json(p, &["change", "show", "keepalive"]);
+    assert_eq!(
+        history["change"]["description"],
+        "shorter keepalive frees idle connections"
+    );
+    let decision = &history["decisions"][0];
+    assert_eq!(decision["status"], "accepted");
+    assert_eq!(decision["reason"], "idle connections fell and score rose");
+    let evidence = decision["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["run_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(evidence.len(), 2);
+    assert!(evidence[0].ends_with(&candidate) && evidence[1].ends_with(&base));
+
+    // --description only names a new change.
+    let duplicate = cli(
+        p,
+        &[
+            "analyze",
+            &candidate,
+            "supported",
+            "--analysis",
+            "revised",
+            "--change",
+            "keepalive",
+            "--decision",
+            "rejected",
+            "--description",
+            "renamed",
+        ],
+    );
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
+    assert_eq!(
+        json(p, &["change", "show", "keepalive"])["decisions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}

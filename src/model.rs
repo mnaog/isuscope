@@ -208,6 +208,34 @@ pub struct CollectorResult {
     pub log_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkMessageKind {
+    /// Why the benchmark failed, e.g. the validation error that stopped it.
+    Failure,
+    /// A representative error the benchmark reported, grouped by `category`.
+    Error,
+}
+
+impl BenchmarkMessageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Failure => "failure",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A benchmark output line kept verbatim by a parser. Metrics carry counts; messages keep
+/// the text needed to tell what actually happened (a failed validation, an error target).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkMessage {
+    pub kind: BenchmarkMessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrichmentResult {
     pub name: String,
@@ -218,6 +246,44 @@ pub struct EnrichmentResult {
     pub log_ids: Vec<String>,
     #[serde(default)]
     pub tooling_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<BenchmarkMessage>,
+    /// Messages dropped by the per-kind and per-category sample limits.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted_message_count: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+impl RunManifest {
+    /// Parser messages of one kind in parser order.
+    pub fn benchmark_messages(
+        &self,
+        kind: BenchmarkMessageKind,
+    ) -> impl Iterator<Item = &BenchmarkMessage> {
+        self.enrichments
+            .iter()
+            .flat_map(|enrichment| enrichment.messages.iter())
+            .filter(move |message| message.kind == kind)
+    }
+
+    /// Why a run did not pass: the parsers' failure lines, or isuscope's own error when the
+    /// benchmark produced none (for example the command exited before printing anything).
+    pub fn failure_reasons(&self) -> Vec<String> {
+        if self.benchmark.passed == Some(true) {
+            return Vec::new();
+        }
+        let parsed = self
+            .benchmark_messages(BenchmarkMessageKind::Failure)
+            .map(|message| message.text.clone())
+            .collect::<Vec<_>>();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+        self.benchmark.error.iter().cloned().collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

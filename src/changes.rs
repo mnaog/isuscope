@@ -55,6 +55,16 @@ pub struct Decision {
     pub evidence: Vec<Evidence>,
 }
 
+/// A decision validated by [`Store::prepare_change_decision`] and not yet written.
+#[derive(Debug)]
+pub struct PreparedDecision {
+    change_id: String,
+    status: DecisionStatus,
+    revisit: Option<String>,
+    /// Description and target of a change that does not exist yet.
+    create: Option<(String, Option<String>)>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChangeHistory {
     pub change: Change,
@@ -252,6 +262,86 @@ impl Store {
         )?;
         self.restore_changes()?;
         Ok(decision)
+    }
+
+    /// Checks an `analyze --change --decision` request before the analysis is written.
+    /// A missing change is created from `description`, or from the run's hypothesis.
+    pub fn prepare_change_decision(
+        &self,
+        change_id: &str,
+        run_id: &str,
+        status: DecisionStatus,
+        description: Option<String>,
+        revisit: Option<String>,
+    ) -> Result<PreparedDecision> {
+        validate_id(change_id)?;
+        if status == DecisionStatus::Provisional
+            && revisit.as_ref().is_none_or(|v| v.trim().is_empty())
+        {
+            bail!("provisional decisions require a non-empty --revisit");
+        }
+        if !self.final_dir(run_id).is_dir() {
+            bail!("evidence run must be finalized");
+        }
+        let exists = self
+            .data_dir
+            .join("changes")
+            .join(change_id)
+            .join("change.json")
+            .is_file();
+        let create = if exists {
+            if description.is_some() {
+                bail!(
+                    "change '{change_id}' already exists; --description is only for a new change"
+                );
+            }
+            None
+        } else {
+            let run = self.load(run_id)?;
+            let description = description.unwrap_or(run.hypothesis);
+            if description.trim().is_empty() {
+                bail!("a new change needs --description when the run has no hypothesis");
+            }
+            let target = run
+                .source
+                .commit_hash
+                .map(|hash| format!("commit {}", &hash[..hash.len().min(12)]));
+            Some((description, target))
+        };
+        Ok(PreparedDecision {
+            change_id: change_id.into(),
+            status,
+            revisit,
+            create,
+        })
+    }
+
+    pub fn record_change_decision(
+        &mut self,
+        prepared: PreparedDecision,
+        reason: String,
+        runs: Vec<String>,
+    ) -> Result<Decision> {
+        if let Some((description, target)) = prepared.create {
+            let path = self
+                .data_dir
+                .join("changes")
+                .join(&prepared.change_id)
+                .join("change.json");
+            // Another writer may have created it since preparation; keep theirs.
+            if let Err(error) = self.create_change(&prepared.change_id, description, target)
+                && !path.is_file()
+            {
+                return Err(error);
+            }
+        }
+        self.decide_change(
+            &prepared.change_id,
+            prepared.status,
+            reason,
+            prepared.revisit,
+            runs,
+        )
     }
 
     pub fn list_changes(

@@ -13,6 +13,7 @@ pub mod init;
 pub mod lock;
 pub mod metric_semantics;
 pub mod model;
+pub mod node_disk;
 pub mod process;
 pub mod project_tools;
 pub mod query;

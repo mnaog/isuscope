@@ -476,8 +476,9 @@ pub(crate) fn parse_protocol(
     let mut fingerprints = Vec::new();
     let mut transitions = Vec::new();
     use std::io::BufRead;
-    for line in reader.lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+    // Split on bytes so one line that is not UTF-8 is skipped instead of ending the parse.
+    for line in reader.split(b'\n').map_while(Result::ok) {
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         match value.get("type").and_then(Value::as_str) {

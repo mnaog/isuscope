@@ -241,6 +241,13 @@ marker=/tmp/isuscope-{run_id}.nginx.marker
 command -v sha256sum >/dev/null 2>&1 || exit 75
 test -r "$log" || exit 75
 offset=$(wc -c < "$log" | tr -d ' ')
+# 前回までの差分は回収済み。上限を超えたログは空にしてnodeのdiskを守る
+# (nginxはO_APPENDで書くので、次の行はfileの先頭から入る)。
+limit=1073741824
+if test "$offset" -gt "$limit" && sudo -n truncate -s 0 "$log" 2>/dev/null; then
+  echo "truncated $log after it exceeded $limit bytes" >&2
+  offset=$(wc -c < "$log" | tr -d ' ')
+fi
 sample=$offset
 test "$sample" -le 65536 || sample=65536
 digest=$(head -c "$sample" "$log" | sha256sum)
@@ -388,6 +395,13 @@ marker=/tmp/isuscope-{run_id}.mysql.marker
 command -v sha256sum >/dev/null 2>&1 || exit 75
 test -r "$log" || exit 75
 offset=$(wc -c < "$log" | tr -d ' ')
+# 前回までの差分は回収済み。上限を超えたslow logは空にしてnodeのdiskを守る
+# (mysqldはappendで書くので、次の行はfileの先頭から入る)。
+limit=1073741824
+if test "$offset" -gt "$limit" && sudo -n truncate -s 0 "$log" 2>/dev/null; then
+  echo "truncated $log after it exceeded $limit bytes" >&2
+  offset=$(wc -c < "$log" | tr -d ' ')
+fi
 sample=$offset
 test "$sample" -le 65536 || sample=65536
 digest=$(head -c "$sample" "$log" | sha256sum)
