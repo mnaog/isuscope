@@ -644,11 +644,27 @@ pub(crate) fn parse_standard_output(
 }
 
 fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
-    let start = raw
+    // `# isuscope-perf-clock <wall> <uptime>`: sampleの時刻はCLOCK_MONOTONIC（uptimeと同じ基準）で、
+    // 壁時計との差を足せば絶対時刻になる。`# isuscope-perf-start <wall>`は旧形式で、
+    // `--reltime`の時刻（最初のsampleからの経過）をperf起動時の壁時計へ足す。
+    let clock = raw
         .lines()
-        .find_map(|line| line.strip_prefix("# isuscope-perf-start "))
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .context("perf script output has no valid isuscope start marker")?;
+        .find_map(|line| line.strip_prefix("# isuscope-perf-clock "))
+        .and_then(|value| {
+            let mut fields = value.split_whitespace();
+            let wall = fields.next()?.parse::<f64>().ok()?;
+            let uptime = fields.next()?.parse::<f64>().ok()?;
+            Some((wall, uptime))
+        });
+    let start = match clock {
+        Some((wall, uptime)) => wall - uptime,
+        None => raw
+            .lines()
+            .find_map(|line| line.strip_prefix("# isuscope-perf-start "))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .context("perf script output has no valid isuscope start marker")?,
+    };
+    let marker_wall = clock.map(|(wall, _)| wall);
     // A sample header is `comm [pid] [cpu] time: event: [ip sym (dso)]`; perf may right-align
     // comm with leading spaces. With `perf record -g` and no `-G`, the stack follows on
     // tab-indented lines and the first frame is the leaf.
@@ -717,6 +733,14 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
         }
         let relative = header["time"].parse::<f64>()?;
         let wall = start + relative;
+        // 時計の基準が食い違っていれば、黙って別の時間帯へ置かずに失敗させる。
+        if let Some(marker) = marker_wall
+            && !(marker - 3_600.0..=marker + 86_400.0).contains(&wall)
+        {
+            anyhow::bail!(
+                "perf sample time {wall:.3} does not match the recorded clock (started at {marker:.3})"
+            );
+        }
         let seconds = wall.floor() as i64;
         let nanos = ((wall - wall.floor()) * 1_000_000_000.0).round() as u32;
         let Some(at) = chrono::DateTime::from_timestamp(seconds, nanos.min(999_999_999)) else {
@@ -1097,7 +1121,13 @@ fn normalize_sql_digest(query: &str) -> String {
                 }
             }
             output.push('?');
-        } else if character.is_ascii_digit() {
+        } else if character.is_ascii_digit()
+            && !output.ends_with(|previous: char| {
+                previous.is_ascii_alphanumeric() || matches!(previous, '_' | '$')
+            })
+        {
+            // 識別子の途中の数字（`t1`、`user_items_2`）は値ではない。置き換えると
+            // 別のtableや列が同じdigestへ混ざる。
             while chars
                 .peek()
                 .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '.' | 'x' | 'X'))
@@ -1438,6 +1468,7 @@ fn parse_sysstat(
         .ok()
         .and_then(|pattern| pattern.captures(raw))
         .and_then(|capture| NaiveDate::parse_from_str(&capture[1], "%m/%d/%y").ok());
+    let mut clock = SysstatClock { date, last: None };
     let mut metrics = Vec::new();
     for line in raw.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
@@ -1449,7 +1480,7 @@ fn parse_sysstat(
             let cpu_index = header.iter().position(|field| field == "CPU");
             if fields.len() == header.len() && cpu_index.is_some_and(|index| fields[index] == "all")
             {
-                let timestamp = sysstat_timestamp(date, &fields);
+                let timestamp = clock.timestamp(&fields);
                 if timestamp.is_none() {
                     continue;
                 }
@@ -1514,7 +1545,7 @@ fn parse_sysstat(
             continue;
         }
         let device = fields[dev_index].to_string();
-        let timestamp = sysstat_timestamp(date, &fields);
+        let timestamp = clock.timestamp(&fields);
         if timestamp.is_none() {
             continue;
         }
@@ -1726,15 +1757,33 @@ fn within_interval(
     interval.is_none_or(|(start, end)| timestamp.is_some_and(|at| at >= start && at <= end))
 }
 
-fn sysstat_timestamp(date: Option<NaiveDate>, fields: &[&str]) -> Option<chrono::DateTime<Utc>> {
-    let value = match fields.get(1).copied() {
-        Some("AM" | "PM") => format!("{} {}", fields.first()?, fields[1]),
-        _ => fields.first()?.to_string(),
-    };
-    let time = NaiveTime::parse_from_str(&value, "%H:%M:%S")
-        .or_else(|_| NaiveTime::parse_from_str(&value, "%I:%M:%S %p"))
-        .ok()?;
-    Some(Utc.from_utc_datetime(&NaiveDateTime::new(date?, time)))
+/// sarは日付を出力の先頭に1回しか書かず、各行は時刻だけを持つ。0時（TZ=UTCなので
+/// JSTの9時）をまたぐと時刻が戻るので、そこで日付を1日進める。
+struct SysstatClock {
+    date: Option<NaiveDate>,
+    last: Option<NaiveDateTime>,
+}
+
+impl SysstatClock {
+    fn timestamp(&mut self, fields: &[&str]) -> Option<chrono::DateTime<Utc>> {
+        let value = match fields.get(1).copied() {
+            Some("AM" | "PM") => format!("{} {}", fields.first()?, fields[1]),
+            _ => fields.first()?.to_string(),
+        };
+        let time = NaiveTime::parse_from_str(&value, "%H:%M:%S")
+            .or_else(|_| NaiveTime::parse_from_str(&value, "%I:%M:%S %p"))
+            .ok()?;
+        let mut at = NaiveDateTime::new(self.date?, time);
+        if let Some(last) = self.last
+            && at + chrono::Duration::hours(12) < last
+        {
+            let next = self.date?.succ_opt()?;
+            self.date = Some(next);
+            at = NaiveDateTime::new(next, time);
+        }
+        self.last = Some(at);
+        Some(Utc.from_utc_datetime(&at))
+    }
 }
 
 fn expand(
@@ -1921,6 +1970,71 @@ fn matches_phase(left: CollectorPhase, right: CollectorPhase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perf_samples_on_the_monotonic_clock_become_wall_time() {
+        // perf-startが残す壁時計とuptime。sampleの時刻はCLOCK_MONOTONIC（uptimeと同じ基準）。
+        let raw = "# isuscope-perf-clock 1787827200.250000000 1000.25\n\
+nginx 1200 [000] 1000.350000000: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)\n\
+nginx 1200 [001] 1006.000000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/nginx)\n";
+        let metrics = parse_perf_script(raw).unwrap();
+        let buckets = metrics
+            .iter()
+            .filter(|metric| metric.name == "cpu.sample_count")
+            .map(|metric| metric.timestamp.unwrap().to_rfc3339())
+            .collect::<std::collections::BTreeSet<_>>();
+        // 1787827200.35 → 5秒bucketの1787827200、1787827206.0 → 1787827205。
+        assert_eq!(
+            buckets.into_iter().collect::<Vec<_>>(),
+            ["2026-08-27T10:40:00+00:00", "2026-08-27T10:40:05+00:00"]
+        );
+
+        // busyboxのdateは`%N`を出さないので、小数部の無い壁時計も読める。
+        assert!(parse_perf_script("# isuscope-perf-clock 1787827200. 1000.25\n").is_ok());
+
+        // 時計の基準が合わない（別の時計で記録された）なら、黙って別の時刻へ置かずに失敗する。
+        let mismatched = "# isuscope-perf-clock 1787827200.25 1000.25\n\
+nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)\n";
+        assert!(parse_perf_script(mismatched).is_err());
+    }
+
+    #[test]
+    fn sysstat_samples_after_midnight_move_to_the_next_day() {
+        let raw = "Linux 5.15.0 (app1) \t09/18/26 \t_x86_64_\t(2 CPU)\n\n\
+23:59:59        CPU     %user     %nice   %system   %iowait    %steal     %idle\n\
+23:59:59        all     10.00      0.00      5.00      0.00      0.00     85.00\n\
+00:00:00        CPU     %user     %nice   %system   %iowait    %steal     %idle\n\
+00:00:00        all     20.00      0.00      5.00      0.00      0.00     75.00\n";
+        let interval = Some((
+            "2026-09-18T23:59:58Z".parse().unwrap(),
+            "2026-09-19T00:00:02Z".parse().unwrap(),
+        ));
+        let metrics = parse_sysstat(raw, interval);
+        let busy = metrics
+            .iter()
+            .filter(|metric| metric.name == "host.cpu_busy_percent" && metric.timestamp.is_some())
+            .map(|metric| (metric.timestamp.unwrap().to_rfc3339(), metric.value))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            busy,
+            [
+                ("2026-09-18T23:59:59+00:00".to_owned(), 15.0),
+                ("2026-09-19T00:00:00+00:00".to_owned(), 25.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_digests_keep_digits_inside_identifiers() {
+        assert_eq!(
+            normalize_sql_digest("SELECT * FROM user_items_2 t1 WHERE t1.id = 42 LIMIT 10"),
+            "select * from user_items_2 t1 where t1.id = ? limit ?"
+        );
+        assert_eq!(
+            normalize_sql_digest("UPDATE t SET c=0x1F, d=-3.5e2 WHERE `col9` IN (1,2)"),
+            "update t set c=?,d=-? where `col9` in (?,?)"
+        );
+    }
 
     #[test]
     fn profile_artifacts_require_svg_and_folded_shapes() {

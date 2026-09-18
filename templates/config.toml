@@ -250,22 +250,32 @@ for unit in $units; do
   test -n "$cgroup" || continue
   base=/sys/fs/cgroup$cgroup
   test -r "$base/cpu.stat" || continue
-  # 上限が無いcgroupはthrottleされないので、quotaがあるものだけ追う。
+  # 上限が無いcgroupのthrottleは0のまま出る。割当量（cpu_quota_cores）は上限があるunitだけ出す。
   printf '%s\t%s\n' "$unit" "$base" >> "$map"
 done
 test -s "$map" || exit 75
 emit() { printf '{"type":"metric","name":"%s","value":%s,"unit":"%s","labels":{"service":"%s"},"timestamp":"%s"}\n' "$1" "$2" "$3" "$4" "$ts"; }
 read_throttle() { awk '$1=="nr_throttled"{n=$2} $1=="throttled_usec"{t=$2} END{print n+0, t+0}' "$1/cpu.stat"; }
+# 経過時間は/proc/uptimeから1/100秒で取り、率はその実測間隔で割る（host-samplerと同じ）。
+read_centis() {
+  read -r up _ < /proc/uptime
+  frac=${up#*.}
+  frac=${frac#0}
+  centis=$(( ${up%.*} * 100 + ${frac:-0} ))
+}
 tab=$(printf '\t')
 previous=$(while IFS="$tab" read -r unit base; do printf '%s %s\n' "$unit" "$(read_throttle "$base")"; done < "$map")
+read_centis; previous_centis=$centis
 while :; do
   sleep 1
+  read_centis; dt_cs=$(( centis - previous_centis )); previous_centis=$centis
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   current=$(while IFS="$tab" read -r unit base; do printf '%s %s\n' "$unit" "$(read_throttle "$base")"; done < "$map")
-  printf '%s\n---\n%s\n' "$previous" "$current" | awk 'BEGIN { first = 1 }
+  [ "$dt_cs" -ge 50 ] && [ "$dt_cs" -le 6000 ] || { previous=$current; continue; }
+  printf '%s\n---\n%s\n' "$previous" "$current" | awk -v dt="$dt_cs" 'BEGIN { first = 1 }
     /^---$/ { first = 0; next }
     first { periods[$1] = $2; usec[$1] = $3; next }
-    ($1 in periods) { printf "%s %d %.3f\n", $1, $2 - periods[$1], ($3 - usec[$1]) / 10000 }' |
+    ($1 in periods) { printf "%s %.3f %.3f\n", $1, ($2 - periods[$1]) * 100 / dt, ($3 - usec[$1]) / (100 * dt) }' |
   while read -r unit periods percent; do
     emit service.cpu_throttled_periods_per_second "$periods" periods "$unit"
     emit service.cpu_throttled_percent "$percent" percent "$unit"
@@ -285,8 +295,46 @@ name = "perf-start"
 phase = "before"
 transport = "ssh"
 roles = ["app"]
-command = ["sh", "-c", "set -eu; base=/tmp/isuscope-{run_id}.perf; command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; sudo -n rm -f \"$base.data\" \"$base.log\" \"$base.pid\"; date +%s.%N > \"$base.start\"; sudo -n sh -c 'nohup env LC_ALL=C perf record -a -g -F 99 -o \"$1.data\" -- sleep 86400 >\"$1.log\" 2>&1 & echo $! >\"$1.pid\"' sh \"$base\"; i=0; while :; do pid=$(sudo -n cat \"$base.pid\" 2>/dev/null) || exit 75; case $pid in ''|*[!0-9]*) exit 75 ;; esac; if sudo -n kill -0 \"$pid\" 2>/dev/null; then break; fi; i=$((i+1)); if test \"$i\" -ge 20; then sudo -n cat \"$base.log\" >&2 || true; exit 75; fi; sleep 0.1; done"]
-timeout_seconds = 10
+command = ["sh", "-c", '''
+set -eu
+base=/tmp/isuscope-{run_id}.perf
+command -v perf >/dev/null 2>&1 || exit 75
+command -v sudo >/dev/null 2>&1 || exit 75
+sudo -n true >/dev/null 2>&1 || exit 75
+# 引数は追加のperf record option（空でよい）。perfは受け付けないoptionですぐ終わるので、
+# 起動を確かめた後も少し待って生きていることを見る。
+start_perf() {
+  sudo -n rm -f "$base.data" "$base.log" "$base.pid"
+  sudo -n sh -c 'nohup env LC_ALL=C perf record $2 -a -g -F 99 -o "$1.data" -- sleep 86400 >"$1.log" 2>&1 & echo $! >"$1.pid"' sh "$base" "$1"
+  i=0
+  while :; do
+    pid=$(sudo -n cat "$base.pid" 2>/dev/null) || return 1
+    case $pid in ''|*[!0-9]*) return 1 ;; esac
+    if sudo -n kill -0 "$pid" 2>/dev/null; then
+      sleep 0.3
+      sudo -n kill -0 "$pid" 2>/dev/null
+      return
+    fi
+    i=$((i+1))
+    test "$i" -lt 20 || return 1
+    sleep 0.1
+  done
+}
+# perfの時刻をCLOCK_MONOTONIC（/proc/uptimeと同じ基準）に固定し、壁時計との差を残す。
+# 既定の時計はNTPで補正されないので、起動から日数が経つと壁時計から数秒ずれる。
+# 対応しないperfでは従来どおり、最初のsampleを起点にした相対時刻へ戻す。
+wall=$(date +%s.%N)
+uptime=$(cut -d' ' -f1 /proc/uptime)
+clock=monotonic
+if ! start_perf "-k monotonic"; then
+  clock=legacy
+  wall=$(date +%s.%N)
+  uptime=$(cut -d' ' -f1 /proc/uptime)
+  start_perf "" || { sudo -n cat "$base.log" >&2 || true; exit 75; }
+fi
+printf '%s %s %s\n' "$wall" "$uptime" "$clock" > "$base.start"
+''']
+timeout_seconds = 15
 unavailable_exit_codes = [75]
 
 [[collectors]]
@@ -340,7 +388,25 @@ name = "perf-series"
 phase = "after"
 transport = "ssh"
 roles = ["app"]
-command = ["sh", "-c", "base=/tmp/isuscope-{run_id}.perf; cleanup() { sudo -n rm -f \"$base.data\" \"$base.log\" \"$base.pid\" >/dev/null 2>&1 || true; rm -f \"$base.start\"; }; trap cleanup EXIT; command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; sudo -n test -s \"$base.data\" || exit 75; test -s \"$base.start\" || exit 75; printf '# isuscope-perf-start %s\\n' \"$(cat \"$base.start\")\"; sudo -n env LC_ALL=C perf script -G --reltime --ns -F comm,time,event,ip,sym,dso -i \"$base.data\""]
+command = ["sh", "-c", '''
+base=/tmp/isuscope-{run_id}.perf
+cleanup() { sudo -n rm -f "$base.data" "$base.log" "$base.pid" >/dev/null 2>&1 || true; rm -f "$base.start"; }
+trap cleanup EXIT
+command -v perf >/dev/null 2>&1 || exit 75
+command -v sudo >/dev/null 2>&1 || exit 75
+sudo -n true >/dev/null 2>&1 || exit 75
+sudo -n test -s "$base.data" || exit 75
+test -s "$base.start" || exit 75
+read -r wall uptime clock < "$base.start" || exit 75
+if [ "${clock:-}" = monotonic ]; then
+  # sampleの時刻はCLOCK_MONOTONIC。壁時計との差からparserが絶対時刻へ直す。
+  printf '# isuscope-perf-clock %s %s\n' "$wall" "$uptime"
+  sudo -n env LC_ALL=C perf script -G --ns -F comm,time,event,ip,sym,dso -i "$base.data"
+else
+  printf '# isuscope-perf-start %s\n' "$wall"
+  sudo -n env LC_ALL=C perf script -G --reltime --ns -F comm,time,event,ip,sym,dso -i "$base.data"
+fi
+''']
 parser = "perf-script"
 timeout_seconds = 30
 unavailable_exit_codes = [75]
@@ -593,14 +659,24 @@ command -v sudo >/dev/null 2>&1 || exit 75
 status() { sudo -n mysql -N -B -e 'SHOW GLOBAL STATUS' 2>/dev/null; }
 test -n "$(status)" || exit 75
 trap 'exit 0' HUP INT TERM
+# `SHOW GLOBAL STATUS`自体に時間がかかるので、率は実測間隔（/proc/uptime、1/100秒）で割る。
+read_centis() {
+  read -r up _ < /proc/uptime
+  frac=${up#*.}
+  frac=${frac#0}
+  centis=$(( ${up%.*} * 100 + ${frac:-0} ))
+}
 interval=2
 previous=$(status)
+read_centis; previous_centis=$centis
 while :; do
   sleep "$interval"
   current=$(status)
   test -n "$current" || continue
+  read_centis; dt_cs=$(( centis - previous_centis )); previous_centis=$centis
+  if [ "$dt_cs" -lt 50 ] || [ "$dt_cs" -gt 6000 ]; then previous=$current; continue; fi
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  printf '%s\n---\n%s\n' "$previous" "$current" | awk -v ts="$ts" -v dt="$interval" 'BEGIN { first = 1 }
+  printf '%s\n---\n%s\n' "$previous" "$current" | awk -v ts="$ts" -v dt="$(awk -v cs="$dt_cs" 'BEGIN { printf "%.2f", cs / 100 }')" 'BEGIN { first = 1 }
     /^---$/ { first = 0; next }
     first { p[$1] = $2; next }
     { c[$1] = $2 }
