@@ -12,7 +12,7 @@ use crate::{
     storage::Store,
     tooling,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use std::fs;
 use uuid::Uuid;
@@ -46,12 +46,20 @@ pub async fn execute(
         bail!("hypothesis must not be empty");
     }
     let mut store = Store::open(&config.data_dir)?;
-    let recovered = store.recover_incomplete()?;
-    if !recovered.is_empty() {
-        for id in &recovered {
+    let recovery = store.recover_incomplete()?;
+    if !recovery.recovered.is_empty() {
+        for id in &recovery.recovered {
             println!("recovered  {} (aborted)", short_id(id));
         }
-        collector::cleanup_abandoned(&config, &recovered).await;
+        collector::cleanup_abandoned(&config, &recovery.recovered).await;
+    }
+    // 同じdata directoryで2つのベンチを重ねない。`[lock]`を設定していなくても、
+    // 実行中のrunの印でここは守る。
+    if let Some(active) = recovery.active.first() {
+        bail!(
+            "run {} is still in progress in another isuscope process; wait for it to finish",
+            short_id(active)
+        );
     }
     let pending = store.pending_analyses()?;
     if let Some(run) = pending.first() {
@@ -65,6 +73,9 @@ pub async fn execute(
     check_node_disks(&config).await?;
     let agent_context = agent_context::resolve(&config)?;
     let id = Uuid::now_v7().to_string();
+    // run.jsonを書く前に印を握る。握る前に書くと、別processの回収処理に中断runと誤認される。
+    let _marker = crate::lock::RunMarker::try_hold(&store.run_marker_path(&id))?
+        .context("cannot hold the marker of a new run")?;
     let staging = store.staging_dir(&id);
     fs::create_dir_all(staging.join("source"))?;
     fs::create_dir_all(staging.join("logs"))?;

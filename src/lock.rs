@@ -108,6 +108,44 @@ impl Drop for OperationLock {
     }
 }
 
+/// 実行中のrunが持つ印。`runs/.incomplete/<id>.running`を`flock`で握り、processが終われば
+/// kernelが外します。回収処理はこれを握れたrunだけを「中断されたrun」として扱うので、
+/// 同じdata directoryで別のrunが走っていても、その途中のrunを横取りしません。
+pub struct RunMarker {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl RunMarker {
+    /// 握れたら`Some`、生きた別processが握っていれば`None`を返します。
+    pub fn try_hold(path: &Path) -> Result<Option<Self>> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        // SAFETY: the descriptor stays owned by `file`, and LOCK_NB never blocks.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("cannot lock {}", path.display()));
+        }
+        Ok(Some(Self {
+            path: path.to_path_buf(),
+            _file: file,
+        }))
+    }
+}
+
+impl Drop for RunMarker {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Runs `command` while holding the lock and returns its exit status code.
 /// Each locked run appends `started_at, operation, seconds, exit` to `operation-timing.tsv`
 /// next to the lock so slow steps can be measured later.

@@ -205,7 +205,13 @@ fn check_commands(config: &LoadedConfig, report: &mut DoctorReport) {
         );
     }
     for collector in &config.config.collectors {
-        if matches!(collector.transport, Transport::Local) {
+        // `isuscope`はPATHではなく実行中のbinaryで動かすので、探す必要がない。
+        if matches!(collector.transport, Transport::Local) && collector.command[0] == "isuscope" {
+            report.pass(format!(
+                "local collector `{}` command: this isuscope binary",
+                collector.name
+            ));
+        } else if matches!(collector.transport, Transport::Local) {
             check_program(
                 &collector.command[0],
                 &config.project_root,

@@ -48,7 +48,8 @@ pub async fn cleanup_abandoned(config: &LoadedConfig, run_ids: &[String]) {
             eprintln!("! refusing cleanup for invalid run ID {run_id}");
             continue;
         }
-        for node in &config.config.nodes {
+        // ベンチ機などルール側のnodeには、collectorと同じく一切触れない。
+        for node in config.config.nodes.iter().filter(|node| !node.rule_side) {
             if let Err(error) = cleanup_node(config, node, run_id).await {
                 eprintln!("! abandoned cleanup failed on {}: {error:#}", node.name);
             }
@@ -1827,11 +1828,23 @@ fn make_spec(
     Ok(ExecutionSpec {
         collector: collector.clone(),
         node: node.cloned(),
-        program: program.clone(),
+        program: self_program(program),
         args: args.to_vec(),
         id_prefix,
         working_dir: config.project_root.clone(),
     })
+}
+
+/// `isuscope`を呼ぶlocal collector（`__transition`など）は、PATH上のものではなく今動いている
+/// binaryで実行します。PATHに古い版が残っていると、同じrunの中でmetricの名前や計算が
+/// 食い違うためです。
+fn self_program(program: &str) -> String {
+    if program == "isuscope"
+        && let Ok(current) = std::env::current_exe()
+    {
+        return current.display().to_string();
+    }
+    program.to_owned()
 }
 
 fn replace_placeholders(

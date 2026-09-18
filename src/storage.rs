@@ -55,6 +55,14 @@ pub struct RunSummary {
     pub failure: Option<String>,
 }
 
+#[derive(Debug, Default)]
+pub struct Recovery {
+    /// 終了処理をせずに止まっていたので、`aborted`として確定したrun。
+    pub recovered: Vec<String>,
+    /// 別のprocessで実行中のrun。触らずに残した。
+    pub active: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct PendingAnalysis {
     pub id: String,
@@ -65,9 +73,19 @@ impl Store {
     pub fn open(data_dir: &Path) -> Result<Self> {
         fs::create_dir_all(data_dir.join("runs/.incomplete"))?;
         let connection = Connection::open(data_dir.join("isuscope.sqlite3"))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.busy_timeout(std::time::Duration::from_secs(10))?;
+        enable_wal(&connection)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&connection)?;
+        // 同時に開いた別processと、schemaの作成・更新が交錯しないよう1つのtransactionにする。
+        // IMMEDIATEなので、後から来た側はbusy timeoutの間だけ待つ。
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        match migrate(&connection) {
+            Ok(()) => connection.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
         let mut store = Self {
             data_dir: data_dir.to_path_buf(),
             connection,
@@ -85,9 +103,18 @@ impl Store {
         self.data_dir.join("runs").join(id)
     }
 
-    pub fn recover_incomplete(&mut self) -> Result<Vec<String>> {
+    /// 実行中のrunが持つ印の場所。staging directoryの外に置くので、確定時の移動に巻き込まれない。
+    pub fn run_marker_path(&self, id: &str) -> PathBuf {
+        self.data_dir
+            .join("runs/.incomplete")
+            .join(format!("{id}.running"))
+    }
+
+    /// 終了処理をせずに止まったrunを`aborted`として確定します。別のprocessで実行中のrunは
+    /// 印（[`crate::lock::RunMarker`]）で見分けて触らず、`active`として返します。
+    pub fn recover_incomplete(&mut self) -> Result<Recovery> {
         let incomplete = self.data_dir.join("runs/.incomplete");
-        let mut recovered = Vec::new();
+        let mut recovery = Recovery::default();
         for entry in fs::read_dir(&incomplete)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -95,6 +122,16 @@ impl Store {
             }
             let staging = entry.path();
             let manifest_path = staging.join("run.json");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let Some(_marker) = crate::lock::RunMarker::try_hold(&self.run_marker_path(&id))?
+            else {
+                recovery.active.push(id);
+                continue;
+            };
+            // 印を取る直前に、そのrunが正常に確定していることがある。
             if !manifest_path.is_file() {
                 continue;
             }
@@ -145,9 +182,9 @@ impl Store {
                     params![manifest.id, tag],
                 )?;
             }
-            recovered.push(manifest.id);
+            recovery.recovered.push(manifest.id);
         }
-        Ok(recovered)
+        Ok(recovery)
     }
 
     pub fn begin(&self, manifest: &RunManifest) -> Result<PathBuf> {
@@ -1177,6 +1214,24 @@ impl Drop for AnalysisLock {
     }
 }
 
+/// WALへの切り替えは、別processが同じ新しいDBを作っている最中だとbusy handlerを通らずに
+/// `database is locked`で失敗するので、短く待ってやり直す。
+fn enable_wal(connection: &Connection) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match connection.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn migrate(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "
@@ -1378,7 +1433,7 @@ mod tests {
 
         let mut store = Store::open(directory.path()).unwrap();
         assert_eq!(
-            store.recover_incomplete().unwrap(),
+            store.recover_incomplete().unwrap().recovered,
             vec![manifest.id.clone()]
         );
         let recovered = store.load(&manifest.id).unwrap();

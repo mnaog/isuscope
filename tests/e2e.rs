@@ -14,6 +14,8 @@ mod benchmark_messages;
 mod brief_shape;
 #[path = "e2e/changes.rs"]
 mod changes;
+#[path = "e2e/concurrency.rs"]
+mod concurrency;
 #[path = "e2e/discovery.rs"]
 mod discovery;
 #[path = "e2e/doctor.rs"]
