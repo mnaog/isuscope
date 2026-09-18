@@ -218,8 +218,11 @@ fn emit_connection_metrics(connections: &mut ConnectionStats) -> Result<()> {
     if connections.open.is_empty() {
         return Ok(());
     }
-    // Average connections in use per bucket: each connection contributes the time between its
-    // first request and its last response, which is when the load generator was holding it.
+    // Average connections *in use* per bucket: each connection contributes the time between its
+    // first request and its last response. This is not how long the load generator held the
+    // socket: keepalive idle time after the last response is not in the access log, so it is not
+    // counted here. The number of sockets actually held is `host.tcp_established`, sampled from
+    // the kernel.
     let mut busy_seconds: BTreeMap<(DateTime<Utc>, String), f64> = BTreeMap::new();
     let mut requests_per_connection: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for ((node, _), connection) in &connections.open {
@@ -243,7 +246,7 @@ fn emit_connection_metrics(connections: &mut ConnectionStats) -> Result<()> {
     }
     for ((bucket, node), seconds) in &busy_seconds {
         emit_metric_at(
-            "client.connections_active",
+            "client.connections_in_use",
             seconds / BUCKET_SECONDS as f64,
             "connections",
             BTreeMap::from([("node".into(), node.clone())]),
