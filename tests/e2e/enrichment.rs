@@ -112,15 +112,15 @@ command = ["sh", "-c", "printf '%s\\n' '{{\"type\":\"metric\",\"name\":\"benchma
         .output()
         .unwrap();
     assert!(!removed_annotate.status.success());
-    let report = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "candidate"])
+    let listed = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["list"])
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(report.status.success());
-    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
-    assert_eq!(report["run"]["note"], "initial parser");
-    assert_eq!(report["run"]["tags"], serde_json::json!(["candidate"]));
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["runs"][0]["note"], "initial parser");
+    assert_eq!(listed["runs"][0]["tags"], serde_json::json!(["candidate"]));
 
     for suffix in ["", "-wal", "-shm"] {
         let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
@@ -129,7 +129,7 @@ command = ["sh", "-c", "printf '%s\\n' '{{\"type\":\"metric\",\"name\":\"benchma
         }
     }
     let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "candidate"])
+        .args(["brief", "candidate"])
         .current_dir(project.path())
         .output()
         .unwrap();

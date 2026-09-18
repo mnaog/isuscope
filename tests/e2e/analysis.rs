@@ -168,19 +168,29 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         }
     }
     let restored = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", &analyzed_run])
+        .args(["brief", &analyzed_run])
         .current_dir(project.path())
         .output()
         .unwrap();
     assert!(restored.status.success());
-    let report: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+    let brief: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
     assert_eq!(
-        report["run"]["hypothesis"],
+        brief["run"]["hypothesis"],
         "removing one allocation raises score without errors"
     );
-    assert_eq!(report["run"]["analyses"][1]["verdict"], "inconclusive");
+    // Every revision survives the rebuilt index, not just the latest one.
+    let revisions = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "sql",
+            "SELECT verdict, body FROM run_analyses ORDER BY created_at, id",
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let revisions: serde_json::Value = serde_json::from_slice(&revisions.stdout).unwrap();
+    assert_eq!(revisions["rows"][1]["verdict"], "inconclusive");
     assert_eq!(
-        report["run"]["analyses"][1]["body"],
+        revisions["rows"][1]["body"],
         "One sample is insufficient; retain the change provisionally."
     );
     let restored = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();

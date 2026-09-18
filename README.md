@@ -121,17 +121,16 @@ isuscope doctor
 | `lock -- <command>` | 変更系操作の共通lockを取ってcommandを実行する。取得済みの子processでは再取得せず、実行時間を`operation-timing.tsv`へ追記する |
 | `pin <run>` | runを生ログ（`logs/`）ごとGitへstageする |
 | `routes suggest [run]` | 動的IDの残るHTTP routeから`[[routes]]`候補を作る。`--output`で書き出し先を指定する |
-| `report` | 1 runのcompactな診断JSONを出力する |
 | `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
-| `diff` | 2 runを全件比較してからcompactな差分JSONを出力する |
 | `metrics` | metric名、時刻範囲、label cardinalityをJSONで調べる |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
+| `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `ui` | 人間向けHTML UIをlocalhostで起動する |
 
-`list`、`brief`、`report`、`diff`、`metrics`、`series`、`query`は機械処理しやすいJSONを返します。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+`list`、`brief`、`metrics`、`series`、`query`、`sql`は機械処理しやすいJSONを返します。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取れ、人が見る場合は`ui`に同じ表示が残っています。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
 
 ```console
 isuscope brief latest

@@ -103,17 +103,20 @@ run this benchmark
             "turn-current".into()
         )
     );
-    let report = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "latest"])
+    let context = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "sql",
+            "SELECT history_path, input_id FROM run_agent_context",
+        ])
         .current_dir(project.path())
         .output()
         .unwrap();
-    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let context: serde_json::Value = serde_json::from_slice(&context.stdout).unwrap();
     assert_eq!(
-        report["run"]["agent_context"]["history_path"],
+        context["rows"][0]["history_path"],
         "docs/codex-history/20260827-200000.md"
     );
-    assert_eq!(report["run"]["agent_context"]["input_id"], "turn-current");
+    assert_eq!(context["rows"][0]["input_id"], "turn-current");
     drop(database);
     for suffix in ["", "-wal", "-shm"] {
         let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));

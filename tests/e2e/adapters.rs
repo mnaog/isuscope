@@ -36,13 +36,13 @@ fn mutating_commands_require_an_explicit_run() {
 }
 
 #[test]
-fn diff_requires_both_runs() {
+fn sql_requires_a_statement_or_the_schema_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["diff", "base-only"])
+        .args(["sql"])
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("<CANDIDATE>"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<QUERY>"));
 }
 
 #[test]

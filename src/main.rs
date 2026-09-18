@@ -3,11 +3,11 @@ use clap::{Args, Parser, Subcommand};
 use isuscope::{
     brief,
     config::LoadedConfig,
-    diff, doctor, enrichment, init,
+    doctor, enrichment, init,
     metric_semantics::{self, MetricAggregation},
     model::{AnalysisVerdict, RunManifest, RunMode},
     query::{self, DatabaseQueryOptions, HttpQueryOptions, MetricQueryOptions, QueryScope},
-    report::{self, RunDiagnostics, RunReport},
+    report::{self, RunDiagnostics},
     runner::{self, RunAnnotations},
     shutdown::Shutdown,
     storage::{RunSummary, Store},
@@ -72,12 +72,6 @@ enum Commands {
     },
     /// 最新runの人間向けUIをlocalhostで起動します。
     Ui,
-    /// 1回のrunを構造化したReport JSONとして出力します。
-    Report {
-        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
-        #[arg(default_value = "latest")]
-        run: String,
-    },
     /// runの判断材料だけを小さい機械向けJSONで出力します。
     Brief {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
@@ -87,12 +81,20 @@ enum Commands {
         #[arg(long, default_value_t = 5, value_parser = parse_list_limit)]
         limit: usize,
     },
-    /// 2回のrunを全件比較後にcompact化したDiff JSONとして出力します。
-    Diff {
-        /// 比較基準のrun ID、一意な短縮ID、または一意なtagを指定します。
-        base: String,
-        /// 比較対象のrun ID、一意な短縮ID、または一意なtagを指定します。
-        candidate: String,
+    /// 保存済みindexへ読み取り専用のSQLを実行します。briefとqueryで足りない問いに使います。
+    Sql {
+        /// 実行するSELECT。`--schema`と同時には指定できません。
+        #[arg(conflicts_with = "schema", required_unless_present = "schema")]
+        query: Option<String>,
+        /// indexのCREATE文を出力します。
+        #[arg(long)]
+        schema: bool,
+        /// 返す行数の上限。
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// 出力形式。
+        #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
+        format: isuscope::sql::SqlFormat,
     },
     /// metric名、時刻範囲、label cardinalityをJSONで出力します。
     Metrics {
@@ -575,16 +577,28 @@ async fn real_main(cli: Cli) -> Result<bool> {
             isuscope::ui::serve(config, Shutdown::listen()).await?;
             Ok(true)
         }
-        Commands::Report { run } => {
-            show_report(&config, &run)?;
-            Ok(true)
-        }
         Commands::Brief { run, limit } => {
             show_brief(&config, &run, limit)?;
             Ok(true)
         }
-        Commands::Diff { base, candidate } => {
-            show_diff(&config, &base, &candidate)?;
+        Commands::Sql {
+            query,
+            schema,
+            limit,
+            format,
+        } => {
+            if schema {
+                print!("{}", isuscope::sql::schema(&config)?);
+                return Ok(true);
+            }
+            let query = query.context("a SELECT statement or --schema is required")?;
+            let output = isuscope::sql::query(&config, &query, limit)?;
+            match format {
+                isuscope::sql::SqlFormat::Json => write_stdout_json(&output)?,
+                isuscope::sql::SqlFormat::Tsv => {
+                    isuscope::sql::write_tsv(&output, std::io::stdout().lock())?
+                }
+            }
             Ok(true)
         }
         Commands::Metrics { run } => {
@@ -1555,13 +1569,6 @@ fn write_stdout_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
-fn show_report(config: &LoadedConfig, requested: &str) -> Result<()> {
-    let store = Store::open(&config.data_dir)?;
-    let report = load_report(config, &store, requested)?;
-    write_stdout_json(&report)?;
-    Ok(())
-}
-
 fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     let diagnostics = load_diagnostics(config, &store, requested)?;
@@ -1587,20 +1594,6 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
     let mut brief = brief::build(diagnostics, benchmark, limit);
     brief.review = Some(review);
     write_stdout_json(&brief)?;
-    Ok(())
-}
-
-fn load_report(config: &LoadedConfig, store: &Store, requested: &str) -> Result<RunReport> {
-    let mut report = load_diagnostics(config, store, requested)?.into_report();
-    report.review = Some(store.run_review(&report.run)?);
-    Ok(report)
-}
-
-fn show_diff(config: &LoadedConfig, base: &str, candidate: &str) -> Result<()> {
-    let store = Store::open(&config.data_dir)?;
-    let base = load_diagnostics(config, &store, base)?;
-    let candidate = load_diagnostics(config, &store, candidate)?;
-    write_stdout_json(&diff::build(base, candidate))?;
     Ok(())
 }
 

@@ -12,8 +12,6 @@ mod analysis;
 mod benchmark_messages;
 #[path = "e2e/changes.rs"]
 mod changes;
-#[path = "e2e/diff.rs"]
-mod diff;
 #[path = "e2e/discovery.rs"]
 mod discovery;
 #[path = "e2e/doctor.rs"]
@@ -34,3 +32,5 @@ mod node_disk;
 mod operation_lock;
 #[path = "e2e/query.rs"]
 mod query;
+#[path = "e2e/sql.rs"]
+mod sql;

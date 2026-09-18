@@ -20,6 +20,7 @@ pub mod query;
 pub mod report;
 pub mod runner;
 pub mod shutdown;
+pub mod sql;
 pub mod storage;
 pub mod tooling;
 pub mod transition;

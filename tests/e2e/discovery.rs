@@ -111,44 +111,26 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert_eq!(list["runs"][0]["score"], 12345);
     assert_eq!(list["runs"][0]["analysis_status"], "pending");
 
-    let report = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "latest"])
+    let brief = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["brief", "latest"])
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(report.status.success());
-    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
-    assert_eq!(report["schema_version"], 6);
-    assert_eq!(report["run"]["benchmark"]["score"], 12345);
-    assert!(report.get("evidence").is_none());
-    assert_eq!(report["transitions"]["items"][0]["count"], 7);
+    assert!(brief.status.success());
+    let brief: serde_json::Value = serde_json::from_slice(&brief.stdout).unwrap();
+    assert_eq!(brief["schema_version"], 1);
+    assert_eq!(brief["run"]["score"], 12345);
+    assert_eq!(brief["transitions"]["items"][0]["count"], 7);
 
-    let removed_include_evidence = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "latest", "--include-evidence"])
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-    assert!(!removed_include_evidence.status.success());
-
-    let removed_full = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "latest", "--full"])
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-    assert!(!removed_full.status.success());
-
-    let removed_format = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "latest", "--format", "html"])
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-    assert!(!removed_format.status.success());
-    let removed_output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["report", "latest", "--output", "report.json"])
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-    assert!(!removed_output.status.success());
+    // `report` and `diff` were removed; brief, query and sql cover the same data.
+    for removed in [vec!["report", "latest"], vec!["diff", "latest", "latest"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(&removed)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{removed:?} still exists");
+    }
 
     let mut ui = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .arg("ui")
