@@ -26,7 +26,8 @@ pub struct BriefOutput {
     pub database: BriefSection<DatabaseSummary>,
     pub omitted_alternative_database_rows: usize,
     pub cpu: BriefSection<CpuSummary>,
-    pub host: BriefSection<HostSummary>,
+    /// 1 node 1行。詳細は`query --scope series --window load`で掘ります。
+    pub hosts: Vec<BriefHostNode>,
     /// Load-generator side, when the access log carries `$connection` and `$msec`.
     pub client: BriefSection<HostSummary>,
     /// Per backend, when the access log carries `$upstream_addr` and the upstream times.
@@ -35,6 +36,48 @@ pub struct BriefOutput {
     pub artifact_issues: BriefSection<ProfileArtifact>,
     pub unavailable_artifact_count: usize,
     pub warnings: Vec<String>,
+}
+
+/// nodeごとの1行。全nodeの状況を最初の画面で見切れるようにするための要約で、
+/// 個々のmetricはここから`query`へ進みます。
+#[derive(Debug, Serialize)]
+pub struct BriefHostNode {
+    pub node: String,
+    pub cpu_busy_percent: Option<f64>,
+    pub cpu_busy_peak_percent: Option<f64>,
+    /// 最も詰まっていたコアのピーク。全体に余裕があっても1コアだけ飽和する構成を見落とさない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub busiest_core_peak_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iowait_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steal_percent: Option<f64>,
+    /// PSIのうち最も高かったもの（resource名とピーク）。taskが資源待ちで止まった時間の割合。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<BriefPressure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load1_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_used_peak_bytes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_util_peak_percent: Option<f64>,
+    /// CPUを多く使っていたserviceの上位。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top_services: Vec<BriefService>,
+    /// このnodeの詳細行数。`query`で何件に当たるかの目安。
+    pub detail_rows: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefPressure {
+    pub resource: String,
+    pub peak_percent: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefService {
+    pub service: String,
+    pub cpu_cores_peak: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,14 +171,10 @@ pub fn build(
     database.iter_mut().for_each(query::round_database_summary);
     let mut client = diagnostics.client;
     client.iter_mut().for_each(|row| {
-        row.average = query::round_to(row.average, 3);
+        row.value = row.value.map(|value| query::round_to(value, 3));
         row.peak = query::round_to(row.peak, 3);
     });
-    let mut host = diagnostics.host;
-    host.iter_mut().for_each(|row| {
-        row.average = query::round_to(row.average, 3);
-        row.peak = query::round_to(row.peak, 3);
-    });
+    let hosts = host_nodes(&diagnostics.host);
     let benchmark_messages = benchmark_messages(&run);
     let unavailable_artifact_count = diagnostics
         .artifacts
@@ -169,7 +208,7 @@ pub fn build(
         database: section(database, limit),
         omitted_alternative_database_rows,
         cpu: section(diagnostics.cpu, limit),
-        host: section(host, limit),
+        hosts,
         client: section(client, limit),
         upstreams: section(diagnostics.upstreams, limit),
         transitions: section(diagnostics.transitions, limit),
@@ -263,6 +302,75 @@ fn preferred_database(database: Vec<DatabaseSummary>) -> (Vec<DatabaseSummary>, 
         .collect::<Vec<_>>();
     let omitted = total_count - database.len();
     (database, omitted)
+}
+
+/// nodeごとに1行へ畳む。全体像を見る入口なので、件数ではなく網羅を優先する。
+fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
+    let mut nodes: BTreeMap<&str, Vec<&HostSummary>> = BTreeMap::new();
+    for row in rows {
+        nodes.entry(row.node.as_str()).or_default().push(row);
+    }
+    nodes
+        .into_iter()
+        .map(|(node, rows)| {
+            let average = |name: &str| {
+                rows.iter()
+                    .filter(|row| row.metric == name)
+                    .filter_map(|row| row.value)
+                    .reduce(f64::max)
+                    .map(|value| query::round_to(value, 2))
+            };
+            let peak = |name: &str| {
+                rows.iter()
+                    .filter(|row| row.metric == name)
+                    .map(|row| row.peak)
+                    .reduce(f64::max)
+                    .map(|value| query::round_to(value, 2))
+            };
+            let busiest_core_peak_percent =
+                peak("host.core_busy_max_percent").or_else(|| peak("host.core_busy_percent"));
+            let pressure = rows
+                .iter()
+                .filter(|row| {
+                    row.metric.starts_with("host.psi_") && row.metric.ends_with("_some_percent")
+                })
+                .max_by(|a, b| a.peak.total_cmp(&b.peak))
+                .map(|row| BriefPressure {
+                    resource: row
+                        .metric
+                        .trim_start_matches("host.psi_")
+                        .trim_end_matches("_some_percent")
+                        .into(),
+                    peak_percent: query::round_to(row.peak, 2),
+                });
+            let mut services = rows
+                .iter()
+                .filter(|row| row.metric == "service.cpu_cores")
+                .map(|row| BriefService {
+                    service: row.target.clone(),
+                    cpu_cores_peak: query::round_to(row.peak, 3),
+                })
+                .collect::<Vec<_>>();
+            services.sort_by(|a, b| b.cpu_cores_peak.total_cmp(&a.cpu_cores_peak));
+            services.truncate(3);
+            BriefHostNode {
+                node: node.into(),
+                cpu_busy_percent: average("host.cpu_busy_percent")
+                    .or_else(|| average("host.cpu_percent")),
+                cpu_busy_peak_percent: peak("host.cpu_busy_percent")
+                    .or_else(|| peak("host.cpu_percent")),
+                busiest_core_peak_percent,
+                iowait_percent: average("host.cpu_iowait_percent"),
+                steal_percent: average("host.cpu_steal_percent"),
+                pressure,
+                load1_peak: peak("host.load1"),
+                memory_used_peak_bytes: peak("host.memory_used_bytes"),
+                disk_util_peak_percent: peak("host.disk_util_percent"),
+                top_services: services,
+                detail_rows: rows.len(),
+            }
+        })
+        .collect()
 }
 
 fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {

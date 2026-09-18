@@ -10,6 +10,8 @@ mod agent_context;
 mod analysis;
 #[path = "e2e/benchmark_messages.rs"]
 mod benchmark_messages;
+#[path = "e2e/brief_shape.rs"]
+mod brief_shape;
 #[path = "e2e/changes.rs"]
 mod changes;
 #[path = "e2e/discovery.rs"]

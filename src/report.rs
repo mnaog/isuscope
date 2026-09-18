@@ -102,16 +102,23 @@ pub struct UpstreamSummary {
     pub response_p95_ms: Option<f64>,
 }
 
-#[derive(Debug, Default, Serialize, PartialEq)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct HostSummary {
     pub node: String,
     pub metric: String,
     pub target: String,
     pub source: String,
+    /// coreやquantileなど、同じ名前の中で対象を分けるlabel。混ぜると値の意味が壊れるため、
+    /// 集約keyに含めてそのまま残します。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
     pub unit: String,
-    pub average: f64,
+    /// `value`の作り方。分位点のように再集約できないものは`non-mergeable`で`value`はnullです。
+    pub aggregation: crate::metric_semantics::MetricAggregation,
+    pub value: Option<f64>,
     pub peak: f64,
     pub peak_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub samples: usize,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -285,7 +292,7 @@ pub fn write_html(report: &RunReport, mut writer: impl Write) -> Result<()> {
                 escape(&item.node),
                 escape(&item.metric),
                 escape(&item.target),
-                item.average,
+                item.value.unwrap_or(f64::NAN),
                 item.peak,
                 escape(&item.unit),
                 escape(&item.peak_at.map(|at| at.to_rfc3339()).unwrap_or_else(|| "-".into())),
@@ -666,8 +673,14 @@ fn summarize_metrics(
     series: &[Metric],
     keep: fn(&Metric) -> bool,
 ) -> Vec<HostSummary> {
-    let mut values =
-        BTreeMap::<(String, String, String, String), (String, f64, usize, f64, Option<_>)>::new();
+    struct Group {
+        unit: String,
+        aggregation: crate::metric_semantics::MetricAggregation,
+        values: Vec<f64>,
+        peak: f64,
+        peak_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let mut values = BTreeMap::<HostKey, Group>::new();
     let series_keys = series
         .iter()
         .filter(|metric| keep(metric))
@@ -678,43 +691,44 @@ fn summarize_metrics(
             .iter()
             .filter(|metric| keep(metric) && !series_keys.contains(&host_key(metric))),
     ) {
-        let target = metric
-            .labels
-            .get("device")
-            .or_else(|| metric.labels.get("service"))
-            .cloned()
-            .unwrap_or_else(|| "host".into());
-        let entry = values
-            .entry((
-                label(metric, "node"),
-                metric.name.clone(),
-                target,
-                label(metric, "collector"),
-            ))
-            .or_insert_with(|| (metric.unit.clone(), 0.0, 0, metric.value, metric.timestamp));
-        entry.1 += metric.value;
-        entry.2 += 1;
-        if metric.value > entry.3 {
-            entry.3 = metric.value;
-            entry.4 = metric.timestamp;
+        let entry = values.entry(host_key(metric)).or_insert_with(|| Group {
+            unit: metric.unit.clone(),
+            aggregation: crate::metric_semantics::time_series_aggregation(metric),
+            values: Vec::new(),
+            peak: metric.value,
+            peak_at: metric.timestamp,
+        });
+        entry.values.push(metric.value);
+        if metric.value > entry.peak {
+            entry.peak = metric.value;
+            entry.peak_at = metric.timestamp;
         }
     }
     let mut output = values
         .into_iter()
         .map(
-            |((node, metric, target, source), (unit, sum, count, peak, peak_at))| HostSummary {
+            |((node, metric, target, source, labels), group)| HostSummary {
                 node,
                 metric,
                 target,
                 source,
-                unit,
-                average: sum / count as f64,
-                peak,
-                peak_at,
+                labels: labels.into_iter().collect(),
+                unit: group.unit,
+                aggregation: group.aggregation,
+                value: crate::metric_semantics::aggregate(&group.values, group.aggregation),
+                peak: group.peak,
+                peak_at: group.peak_at,
+                samples: group.values.len(),
             },
         )
         .collect::<Vec<_>>();
-    output.sort_by(|a, b| a.node.cmp(&b.node).then_with(|| a.metric.cmp(&b.metric)));
+    output.sort_by(|a, b| {
+        a.node
+            .cmp(&b.node)
+            .then_with(|| a.metric.cmp(&b.metric))
+            .then_with(|| a.labels.cmp(&b.labels))
+            .then_with(|| a.target.cmp(&b.target))
+    });
     output
 }
 
@@ -858,7 +872,11 @@ fn metric_matches_collector(metric: &Metric, collector: &CollectorResult) -> boo
     }
 }
 
-fn host_key(metric: &Metric) -> (String, String, String) {
+/// node、metric名、対象（device/service）、collector、そして残りのlabel。
+/// 最後の要素を落とすと、coreやquantileの違う値が1行に混ざります。
+type HostKey = (String, String, String, String, Vec<(String, String)>);
+
+fn host_key(metric: &Metric) -> HostKey {
     (
         label(metric, "node"),
         metric.name.clone(),
@@ -868,6 +886,15 @@ fn host_key(metric: &Metric) -> (String, String, String) {
             .or_else(|| metric.labels.get("service"))
             .cloned()
             .unwrap_or_else(|| "host".into()),
+        label(metric, "collector"),
+        metric
+            .labels
+            .iter()
+            .filter(|(name, _)| {
+                !matches!(name.as_str(), "node" | "collector" | "device" | "service")
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
     )
 }
 
@@ -1111,7 +1138,7 @@ mod tests {
         let mut second = metric("host.cpu_percent", 80.0, &[("node", "app1")]);
         second.timestamp = "2026-08-27T12:00:01Z".parse().ok();
         let host = host_metrics(&[], &[first, second]);
-        assert_eq!(host[0].average, 50.0);
+        assert_eq!(host[0].value, Some(50.0));
         assert_eq!(host[0].peak, 80.0);
         assert!(host[0].peak_at.is_some());
 
@@ -1124,6 +1151,75 @@ mod tests {
             mixed
                 .iter()
                 .any(|value| value.node == "db1" && value.peak == 30.0)
+        );
+    }
+
+    #[test]
+    fn cores_and_quantiles_are_not_merged_into_one_row() {
+        let metric = |name: &str, value: f64, labels: &[(&str, &str)]| Metric {
+            name: name.into(),
+            value,
+            unit: "percent".into(),
+            timestamp: None,
+            labels: labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        };
+        // coreやquantileを1行に畳むと、存在しない値（core平均、分位点の平均）が出る。
+        let cores = host_metrics(
+            &[],
+            &[
+                metric(
+                    "host.core_busy_percent",
+                    100.0,
+                    &[("node", "app1"), ("core", "0")],
+                ),
+                metric(
+                    "host.core_busy_percent",
+                    0.0,
+                    &[("node", "app1"), ("core", "1")],
+                ),
+            ],
+        );
+        assert_eq!(cores.len(), 2);
+        assert_eq!(cores[0].labels.get("core").map(String::as_str), Some("0"));
+        assert_eq!(cores[0].value, Some(100.0));
+        assert_eq!(cores[1].value, Some(0.0));
+
+        let gaps = client_metrics(
+            &[],
+            &[
+                metric(
+                    "client.request_gap",
+                    0.001,
+                    &[("node", "app1"), ("quantile", "0.50")],
+                ),
+                metric(
+                    "client.request_gap",
+                    0.010,
+                    &[("node", "app1"), ("quantile", "0.95")],
+                ),
+                metric(
+                    "client.request_gap",
+                    0.100,
+                    &[("node", "app1"), ("quantile", "0.99")],
+                ),
+            ],
+        );
+        assert_eq!(gaps.len(), 3);
+        for row in &gaps {
+            assert_eq!(
+                row.aggregation,
+                crate::metric_semantics::MetricAggregation::MaxOfQuantile
+            );
+        }
+        assert_eq!(
+            gaps.iter()
+                .find(|row| row.labels["quantile"] == "0.99")
+                .unwrap()
+                .value,
+            Some(0.100)
         );
     }
 

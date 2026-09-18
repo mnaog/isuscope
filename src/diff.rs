@@ -171,10 +171,13 @@ pub struct HostDiff {
     pub metric: String,
     pub target: String,
     pub source: String,
+    /// coreやquantileなど、対象を分けるlabel。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
     pub presence: Presence,
     pub base_unit: Option<String>,
     pub candidate_unit: Option<String>,
-    pub average: NumericDiff,
+    pub value: NumericDiff,
     pub peak: NumericDiff,
     pub base_peak_at: Option<String>,
     pub candidate_peak_at: Option<String>,
@@ -607,7 +610,8 @@ fn cpu_diff(base: Vec<CpuSummary>, candidate: Vec<CpuSummary>) -> DiffSection<Cp
 }
 
 fn host_diff(base: Vec<HostSummary>, candidate: Vec<HostSummary>) -> DiffSection<HostDiff> {
-    type Key = (String, String, String, String);
+    // labelsもkeyに含める。含めないと、coreやquantileの違う行が互いの差分になる。
+    type Key = (String, String, String, String, Vec<(String, String)>);
     let mut base = base
         .into_iter()
         .map(|item| {
@@ -617,6 +621,7 @@ fn host_diff(base: Vec<HostSummary>, candidate: Vec<HostSummary>) -> DiffSection
                     item.metric.clone(),
                     item.target.clone(),
                     item.source.clone(),
+                    item.labels.clone().into_iter().collect(),
                 ),
                 item,
             )
@@ -631,6 +636,7 @@ fn host_diff(base: Vec<HostSummary>, candidate: Vec<HostSummary>) -> DiffSection
                     item.metric.clone(),
                     item.target.clone(),
                     item.source.clone(),
+                    item.labels.clone().into_iter().collect(),
                 ),
                 item,
             )
@@ -643,8 +649,14 @@ fn host_diff(base: Vec<HostSummary>, candidate: Vec<HostSummary>) -> DiffSection
         .collect::<BTreeSet<_>>();
     let items = keys
         .into_iter()
-        .map(|(node, metric, target, source)| {
-            let key = (node.clone(), metric.clone(), target.clone(), source.clone());
+        .map(|(node, metric, target, source, labels)| {
+            let key = (
+                node.clone(),
+                metric.clone(),
+                target.clone(),
+                source.clone(),
+                labels.clone(),
+            );
             let base = base.remove(&key);
             let candidate = candidate.remove(&key);
             HostDiff {
@@ -652,12 +664,13 @@ fn host_diff(base: Vec<HostSummary>, candidate: Vec<HostSummary>) -> DiffSection
                 metric,
                 target,
                 source,
+                labels: labels.into_iter().collect(),
                 presence: presence(&base, &candidate),
                 base_unit: base.as_ref().map(|item| item.unit.clone()),
                 candidate_unit: candidate.as_ref().map(|item| item.unit.clone()),
-                average: NumericDiff::new(
-                    base.as_ref().map(|item| item.average),
-                    candidate.as_ref().map(|item| item.average),
+                value: NumericDiff::new(
+                    base.as_ref().and_then(|item| item.value),
+                    candidate.as_ref().and_then(|item| item.value),
                 ),
                 peak: NumericDiff::new(
                     base.as_ref().map(|item| item.peak),
@@ -676,7 +689,7 @@ fn host_diff(base: Vec<HostSummary>, candidate: Vec<HostSummary>) -> DiffSection
         b.peak
             .magnitude()
             .total_cmp(&a.peak.magnitude())
-            .then_with(|| b.average.magnitude().total_cmp(&a.average.magnitude()))
+            .then_with(|| b.value.magnitude().total_cmp(&a.value.magnitude()))
             .then_with(|| a.metric.cmp(&b.metric))
     })
 }
@@ -810,7 +823,7 @@ pub fn write_html(diff: &RunDiff, mut writer: impl Write) -> Result<()> {
                 escape(&item.node),
                 escape(&item.metric),
                 escape(&item.target),
-                numeric(&item.average),
+                numeric(&item.value),
                 numeric(&item.peak),
             )
         })
