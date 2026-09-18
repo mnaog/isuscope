@@ -175,6 +175,8 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `host-sampler`はCPU・memory・loadに加えて、接続とネットワークのcounterも1秒ごとに出します。`host.tcp_passive_opens_per_second`、`host.tcp_established`、`host.tcp_time_wait`、`host.tcp_listen_overflows_per_second`、`host.tcp_listen_drops_per_second`、`host.tcp_syn_cookies_sent_per_second`、`host.tcp_time_wait_overflow_per_second`、`host.tcp_retransmit_segments_per_second`、NICごとの`host.net_rx_packets_per_second`などと、`host.cpu_softirq_percent`です。取りこぼしのcounterが0のままなら、接続の失敗はサーバー側ではありません。読むのは`/proc`の小さなfileだけで、追加のtoolもroot権限も要りません。
 
+ベンチ前後のcollectorは**node単位で並列**に実行します。同じnode内では設定順を保つので、perf-stopの後にperf-report、log markの後にdeltaという受け渡しは崩れません。localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
+
 `[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 
 `[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockは`mkdir`で作るdirectoryで、`owner`のpidが既に存在しなければ回収し、生きた所有者がいれば終了code 75で止まります。

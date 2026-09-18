@@ -103,6 +103,10 @@ pub fn selected(
     })
 }
 
+/// Runs a phase with one queue per node, and the queues in parallel. Collectors on the same
+/// node keep their configured order, because they hand work to each other there (perf-stop
+/// before perf-report, a log mark before its delta). Local collectors run last and in order,
+/// since they read what the node collectors just brought back.
 pub async fn run_phase(
     config: &LoadedConfig,
     mode: RunMode,
@@ -112,6 +116,9 @@ pub async fn run_phase(
     shutdown: Option<Shutdown>,
 ) -> Vec<CollectorOutput> {
     let mut outputs = Vec::new();
+    let mut queues: Vec<(String, Vec<(usize, ExecutionSpec)>)> = Vec::new();
+    let mut local: Vec<(usize, ExecutionSpec)> = Vec::new();
+    let mut order = 0;
     for collector in selected(config, mode, phase) {
         match expand(config, collector, run_id, run_dir) {
             Ok(specs) if specs.is_empty() => {
@@ -119,12 +126,46 @@ pub async fn run_phase(
             }
             Ok(specs) => {
                 for spec in specs {
-                    outputs.push(run_once(spec, run_dir, shutdown.clone()).await);
+                    order += 1;
+                    match &spec.node {
+                        None => local.push((order, spec)),
+                        Some(node) => {
+                            let name = node.name.clone();
+                            match queues.iter_mut().find(|(queue, _)| *queue == name) {
+                                Some((_, queue)) => queue.push((order, spec)),
+                                None => queues.push((name, vec![(order, spec)])),
+                            }
+                        }
+                    }
                 }
             }
             Err(error) => outputs.push(failed(collector, None, format!("{error:#}"))),
         }
     }
+
+    let mut running = tokio::task::JoinSet::new();
+    for (_, queue) in queues {
+        let run_dir = run_dir.to_path_buf();
+        let shutdown = shutdown.clone();
+        running.spawn(async move {
+            let mut results = Vec::with_capacity(queue.len());
+            for (order, spec) in queue {
+                results.push((order, run_once(spec, &run_dir, shutdown.clone()).await));
+            }
+            results
+        });
+    }
+    let mut ordered = running
+        .join_all()
+        .await
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for (order, spec) in local {
+        ordered.push((order, run_once(spec, run_dir, shutdown.clone()).await));
+    }
+    ordered.sort_by_key(|(order, _)| *order);
+    outputs.extend(ordered.into_iter().map(|(_, output)| output));
     outputs
 }
 

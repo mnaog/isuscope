@@ -295,6 +295,9 @@ unavailable_exit_codes = [75]
 name = "perf-flamegraph"
 phase = "after"
 transport = "ssh"
+# perf.dataをもう一度読み直す2つ目のpassなので、通常のrunでは作らない。人が見る図で、
+# 数値としてはperf-reportとperf-seriesで足りる。必要なときはmodesへ"run"を足す。
+modes = ["survey-run"]
 command = ["sh", "-c", '''
 set -eu
 base=/tmp/isuscope-{run_id}.perf
