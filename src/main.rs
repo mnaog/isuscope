@@ -1528,6 +1528,7 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
     let diagnostics = load_diagnostics(config, &store, requested)?;
     let review = store.run_review(&diagnostics.run)?;
     let id = diagnostics.run.id.clone();
+    let id_for_score = id.clone();
     let benchmark_metrics = store.query_metrics(&id, &[], Some("benchmark."), Some(false))?;
     let benchmark = query::metric_query(
         id,
@@ -1545,7 +1546,24 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
             limit: usize::MAX,
         },
     );
-    let mut brief = brief::build(diagnostics, benchmark, limit);
+    let score_metrics = store.query_metrics(&id_for_score, &[], Some("score."), Some(false))?;
+    let score_inputs = query::metric_query(
+        id_for_score,
+        score_metrics,
+        MetricQueryOptions {
+            scope: QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: Some("score.".into()),
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        },
+    );
+    let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
     brief.review = Some(review);
     write_stdout_json(&brief)?;
     Ok(())

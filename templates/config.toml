@@ -524,6 +524,31 @@ modes = ["survey-run"]
 command = ["isuscope", "__transition", "--run-dir", "{run_dir}", "--prefix", "nginx-log-delta-", "--rules", ".isuscope/routes.toml"]
 timeout_seconds = 30
 
+# 得点が「リクエスト数×重み」で決まらない問題（ISUCON13のtip合計など）では、得点の源に
+# なっている値を自分のシステムから読みます。ベンチ側には触れません。負荷走行で何が増えるかを
+# 特定するための調査なので、survey-runのときだけ動かします。
+# 値は`score.`で始まるmetricとして出すと、briefの`score_inputs`に並びます。
+# [[collectors]]
+# name = "score-probe"
+# phase = "after"
+# transport = "ssh"
+# roles = ["db"]
+# modes = ["survey-run"]
+# command = ["sh", "-c", '''
+# set -eu
+# command -v mysql >/dev/null 2>&1 || exit 75
+# command -v sudo >/dev/null 2>&1 || exit 75
+# # 当日の問題に合わせて、得点の源になりそうな値を数える。複数行を出してよい。
+# sudo -n mysql -N -B isucon -e '
+#   SELECT "score.tip_total", IFNULL(SUM(tip), 0) FROM livecomments;
+#   SELECT "score.completed_rides", COUNT(*) FROM rides WHERE status = "COMPLETED";
+# ' 2>/dev/null |
+# while read -r name value; do
+#   printf '{"type":"metric","name":"%s","value":%s,"unit":"points"}\n' "$name" "$value"
+# done
+# ''']
+# unavailable_exit_codes = [75]
+
 # 最初のsurvey-runで通常HTTPのrequest/response bodyを全件保存したい場合だけ有効化します。
 # benchmarkの接続先を127.0.0.1:18080へ変更し、upstreamを実applicationへ合わせてください。
 # SSE、WebSocket、HTTPS upstreamには対応せず、response bufferingによる観測負荷があります。

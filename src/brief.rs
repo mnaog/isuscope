@@ -17,6 +17,9 @@ pub struct BriefOutput {
     pub coverage_issues: BriefSection<CoverageIssueGroup>,
     pub coverage_info_count: usize,
     pub benchmark: BriefSection<MetricQueryRow>,
+    /// Values read from the system under test to work out what the score is made of.
+    /// Collected in `survey-run`, where that question is settled.
+    pub score_inputs: BriefSection<MetricQueryRow>,
     /// Parser-kept benchmark output lines: why it failed and what the errors were.
     pub benchmark_messages: BriefBenchmarkMessages,
     pub http: BriefSection<HttpRouteSummary>,
@@ -113,6 +116,7 @@ pub struct CoverageIssueGroup {
 pub fn build(
     diagnostics: RunDiagnostics,
     benchmark: MetricQueryOutput,
+    score_inputs: MetricQueryOutput,
     limit: usize,
 ) -> BriefOutput {
     let run = diagnostics.run;
@@ -159,6 +163,7 @@ pub fn build(
         coverage_issues: section(coverage_issues, limit),
         coverage_info_count,
         benchmark: section(benchmark.rows, limit),
+        score_inputs: section(score_inputs.rows, limit),
         benchmark_messages,
         http: section(http, limit),
         database: section(database, limit),

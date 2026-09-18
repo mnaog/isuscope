@@ -34,5 +34,7 @@ mod operation_lock;
 mod parallel;
 #[path = "e2e/query.rs"]
 mod query;
+#[path = "e2e/score_inputs.rs"]
+mod score_inputs;
 #[path = "e2e/sql.rs"]
 mod sql;
