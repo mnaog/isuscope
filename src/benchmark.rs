@@ -242,7 +242,6 @@ async fn execute_command(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 /// 取り込みtaskの完了を待つ。pipeの書き手が残って閉じない場合は打ち切り、
 /// そこまでに書けたlogで先へ進む。
 async fn finish_capture(task: tokio::task::JoinHandle<Result<()>>, stream: &str) -> Result<()> {
@@ -260,6 +259,7 @@ async fn finish_capture(task: tokio::task::JoinHandle<Result<()>>, stream: &str)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn capture_lines<R>(
     reader: R,
     path: PathBuf,
