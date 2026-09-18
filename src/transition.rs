@@ -90,8 +90,29 @@ struct ReadState<'a> {
     sessions: &'a mut BTreeMap<String, Vec<Event>>,
     route_stats: &'a mut BTreeMap<(String, String, String), RouteStats>,
     bucket_stats: &'a mut BTreeMap<(DateTime<Utc>, String, String, String), RouteStats>,
+    connections: &'a mut ConnectionStats,
     interval: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
+
+/// How the load generator used its connections, from `$connection` and `$msec` in the log.
+/// Server time is one part of a client's cycle; the rest shows up as the gap between the
+/// response and that connection's next request, and as how many connections it keeps open.
+#[derive(Default)]
+struct ConnectionStats {
+    /// (node, connection id) -> first request start, last response end, request count.
+    open: BTreeMap<(String, String), Connection>,
+    /// Gaps between one response and the next request on the same connection.
+    gaps_ms: BTreeMap<(DateTime<Utc>, String), Vec<f64>>,
+    opened: BTreeMap<(DateTime<Utc>, String), u64>,
+}
+
+struct Connection {
+    first_start: f64,
+    last_end: f64,
+    requests: u64,
+}
+
+const BUCKET_SECONDS: i64 = 5;
 
 const MAX_ROUTE_SERIES: usize = 1_024;
 
@@ -108,6 +129,9 @@ pub struct TransitionOptions<'a> {
     pub upstream_time_field: &'a str,
     pub bytes_field: &'a str,
     pub connection_requests_field: &'a str,
+    pub connection_field: &'a str,
+    /// Log field holding the response end as epoch seconds (nginx `$msec`).
+    pub end_time_field: &'a str,
     pub series_only: bool,
 }
 
@@ -119,6 +143,7 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
     let mut route_stats: BTreeMap<(String, String, String), RouteStats> = BTreeMap::new();
     let mut bucket_stats: BTreeMap<(DateTime<Utc>, String, String, String), RouteStats> =
         BTreeMap::new();
+    let mut connections = ConnectionStats::default();
     let interval = benchmark_interval(options.run_dir);
     for path in paths {
         let node = node_from_path(&path, options.prefix);
@@ -126,11 +151,13 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
             sessions: &mut sessions,
             route_stats: &mut route_stats,
             bucket_stats: &mut bucket_stats,
+            connections: &mut connections,
             interval,
         };
         read_log(&path, &node, &options, &rules, &mut state)?;
     }
 
+    emit_connection_metrics(&mut connections)?;
     let mut edges: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     if options.series_only {
         emit_bucket_metrics(&mut bucket_stats)?;
@@ -166,6 +193,163 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
     emit_route_metrics(&mut route_stats)?;
     emit_bucket_metrics(&mut bucket_stats)?;
     Ok(edges.len())
+}
+
+/// Emits per-bucket connection use and the run-level gap summary, per node.
+fn emit_connection_metrics(connections: &mut ConnectionStats) -> Result<()> {
+    if connections.open.is_empty() {
+        return Ok(());
+    }
+    // Average connections in use per bucket: each connection contributes the time between its
+    // first request and its last response, which is when the load generator was holding it.
+    let mut busy_seconds: BTreeMap<(DateTime<Utc>, String), f64> = BTreeMap::new();
+    let mut requests_per_connection: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for ((node, _), connection) in &connections.open {
+        requests_per_connection
+            .entry(node.clone())
+            .or_default()
+            .push(connection.requests as f64);
+        let mut start = connection.first_start;
+        while start <= connection.last_end {
+            let Some(bucket) = bucket_start(start) else {
+                break;
+            };
+            let bucket_end = bucket.timestamp() as f64 + BUCKET_SECONDS as f64;
+            let end = connection.last_end.min(bucket_end);
+            *busy_seconds.entry((bucket, node.clone())).or_insert(0.0) += (end - start).max(0.0);
+            if end >= connection.last_end {
+                break;
+            }
+            start = end;
+        }
+    }
+    for ((bucket, node), seconds) in &busy_seconds {
+        emit_metric_at(
+            "client.connections_active",
+            seconds / BUCKET_SECONDS as f64,
+            "connections",
+            BTreeMap::from([("node".into(), node.clone())]),
+            *bucket,
+        )?;
+    }
+    for ((bucket, node), opened) in &connections.opened {
+        emit_metric_at(
+            "client.connections_opened",
+            *opened as f64,
+            "connections",
+            BTreeMap::from([("node".into(), node.clone())]),
+            *bucket,
+        )?;
+    }
+    let mut run_gaps: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for ((bucket, node), gaps) in &mut connections.gaps_ms {
+        let labels = BTreeMap::from([("node".into(), node.clone())]);
+        emit_quantiles_at("client.request_gap", gaps, &labels, *bucket)?;
+        run_gaps
+            .entry(node.clone())
+            .or_default()
+            .extend(gaps.iter());
+    }
+    for (node, gaps) in &mut run_gaps {
+        let labels = BTreeMap::from([("node".into(), node.clone())]);
+        emit_duration_summary("client.request_gap", gaps, &labels)?;
+        emit_quantiles("client.request_gap", gaps, &labels)?;
+    }
+    for (node, requests) in &mut requests_per_connection {
+        let labels = BTreeMap::from([("node".into(), node.clone())]);
+        let Some(summary) = duration_summary(requests) else {
+            continue;
+        };
+        emit_metric(
+            "client.connection_requests_mean",
+            summary.mean,
+            "requests",
+            labels.clone(),
+        )?;
+        emit_metric(
+            "client.connection_requests_max",
+            summary.max,
+            "requests",
+            labels.clone(),
+        )?;
+        emit_metric(
+            "client.connections_opened_total",
+            requests.len() as f64,
+            "connections",
+            labels,
+        )?;
+    }
+    Ok(())
+}
+
+/// Follows one connection through the log: when it was opened, how many requests it carried
+/// and how long the load generator waited before sending the next one on it.
+fn record_connection(
+    fields: &BTreeMap<&str, &str>,
+    node: &str,
+    options: &TransitionOptions<'_>,
+    state: &mut ReadState<'_>,
+    at: Option<DateTime<Utc>>,
+) {
+    let (Some(id), Some(end), Some(duration_ms)) = (
+        fields.get(options.connection_field),
+        fields
+            .get(options.end_time_field)
+            .and_then(|value| value.parse::<f64>().ok()),
+        fields
+            .get(options.request_time_field)
+            .and_then(|value| parse_seconds_ms(value)),
+    ) else {
+        return;
+    };
+    if !within_interval(at, state.interval) {
+        return;
+    }
+    let start = end - duration_ms / 1_000.0;
+    let Some(bucket) = bucket_start(end) else {
+        return;
+    };
+    match state
+        .connections
+        .open
+        .get_mut(&(node.to_owned(), (*id).to_owned()))
+    {
+        Some(connection) => {
+            // Requests can be logged out of order within a connection; keep the outer bounds.
+            let gap_ms = (start - connection.last_end) * 1_000.0;
+            if gap_ms >= 0.0 {
+                state
+                    .connections
+                    .gaps_ms
+                    .entry((bucket, node.to_owned()))
+                    .or_default()
+                    .push(gap_ms);
+            }
+            connection.first_start = connection.first_start.min(start);
+            connection.last_end = connection.last_end.max(end);
+            connection.requests += 1;
+        }
+        None => {
+            state.connections.open.insert(
+                (node.to_owned(), (*id).to_owned()),
+                Connection {
+                    first_start: start,
+                    last_end: end,
+                    requests: 1,
+                },
+            );
+            *state
+                .connections
+                .opened
+                .entry((bucket, node.to_owned()))
+                .or_default() += 1;
+        }
+    }
+}
+
+fn bucket_start(epoch_seconds: f64) -> Option<DateTime<Utc>> {
+    let seconds = epoch_seconds as i64;
+    DateTime::from_timestamp(seconds.div_euclid(BUCKET_SECONDS) * BUCKET_SECONDS, 0)
 }
 
 fn emit_bucket_metrics(
@@ -446,6 +630,7 @@ fn read_log(
         if options.series_only && !within_interval(at, state.interval) {
             continue;
         }
+        record_connection(&fields, node, options, state, at);
         if options.series_only {
             let Some(at) = at else { continue };
             let Some(bucket_at) = DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) else {
@@ -722,14 +907,18 @@ mod tests {
             upstream_time_field: "apptime",
             bytes_field: "size",
             connection_requests_field: "connreqs",
+            connection_field: "conn",
+            end_time_field: "msec",
             series_only: false,
         };
         let mut route_stats = BTreeMap::new();
         let mut bucket_stats = BTreeMap::new();
+        let mut connections = ConnectionStats::default();
         let mut state = ReadState {
             sessions: &mut sessions,
             route_stats: &mut route_stats,
             bucket_stats: &mut bucket_stats,
+            connections: &mut connections,
             interval: None,
         };
         read_log(
@@ -754,10 +943,12 @@ mod tests {
         let mut bounded_sessions = BTreeMap::new();
         let mut bounded_routes = BTreeMap::new();
         let mut bounded_buckets = BTreeMap::new();
+        let mut bounded_connections = ConnectionStats::default();
         let mut bounded_state = ReadState {
             sessions: &mut bounded_sessions,
             route_stats: &mut bounded_routes,
             bucket_stats: &mut bounded_buckets,
+            connections: &mut bounded_connections,
             interval: Some((
                 "2026-08-26T01:00:01Z".parse().unwrap(),
                 "2026-08-26T01:00:01Z".parse().unwrap(),
@@ -777,6 +968,84 @@ mod tests {
         assert!(bounded_sessions.is_empty());
         assert!(bounded_routes.is_empty());
         assert_eq!(bounded_buckets.len(), 1);
+    }
+
+    #[test]
+    fn connection_stats_follow_each_connection_through_the_log() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let output = fs::File::create(logs.join("nginx-isu1.zst")).unwrap();
+        let mut encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
+        // Connection 1 carries two requests 20 ms apart; connection 2 carries one.
+        for (conn, msec, reqtime) in [
+            ("1", "1800000000.100", "0.010"),
+            ("1", "1800000000.140", "0.020"),
+            ("2", "1800000000.200", "0.010"),
+        ] {
+            writeln!(
+                encoder,
+                "time:2026-08-26T10:00:00+09:00\tsession:a\tmethod:GET\turi:/api/livestream/42\tstatus:200\treqtime:{reqtime}\tconn:{conn}\tmsec:{msec}"
+            )
+            .unwrap();
+        }
+        encoder.finish().unwrap();
+        let options = TransitionOptions {
+            run_dir: dir.path(),
+            prefix: "nginx-",
+            rules: None,
+            time_field: "time",
+            session_field: "session",
+            method_field: "method",
+            uri_field: "uri",
+            status_field: "status",
+            request_time_field: "reqtime",
+            upstream_time_field: "apptime",
+            bytes_field: "size",
+            connection_requests_field: "connreqs",
+            connection_field: "conn",
+            end_time_field: "msec",
+            series_only: true,
+        };
+        let mut sessions = BTreeMap::new();
+        let mut route_stats = BTreeMap::new();
+        let mut bucket_stats = BTreeMap::new();
+        let mut connections = ConnectionStats::default();
+        let mut state = ReadState {
+            sessions: &mut sessions,
+            route_stats: &mut route_stats,
+            bucket_stats: &mut bucket_stats,
+            connections: &mut connections,
+            interval: None,
+        };
+        read_log(
+            &logs.join("nginx-isu1.zst"),
+            "isu1",
+            &options,
+            &RouteNormalizer { rules: vec![] },
+            &mut state,
+        )
+        .unwrap();
+
+        let first = &connections.open[&("isu1".into(), "1".into())];
+        assert_eq!(first.requests, 2);
+        assert!((first.first_start - 1_800_000_000.090).abs() < 1e-6);
+        assert!((first.last_end - 1_800_000_000.140).abs() < 1e-6);
+        // 140 ms - 20 ms of service time - the 100 ms the first response ended at = 20 ms idle.
+        let gaps = connections.gaps_ms.values().next().unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert!((gaps[0] - 20.0).abs() < 1e-3, "{gaps:?}");
+        // Both connections were opened in the same five second bucket.
+        assert_eq!(
+            connections.opened.values().copied().collect::<Vec<_>>(),
+            [2]
+        );
+        assert!(
+            connections
+                .opened
+                .keys()
+                .all(|(at, _)| at.timestamp() % BUCKET_SECONDS == 0)
+        );
     }
 
     #[test]

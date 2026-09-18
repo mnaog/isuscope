@@ -237,6 +237,10 @@ enum Commands {
         bytes_field: String,
         #[arg(long, default_value = "connreqs")]
         connection_requests_field: String,
+        #[arg(long, default_value = "conn")]
+        connection_field: String,
+        #[arg(long, default_value = "msec")]
+        end_time_field: String,
         #[arg(long)]
         series_only: bool,
     },
@@ -482,6 +486,8 @@ async fn real_main(cli: Cli) -> Result<bool> {
         upstream_time_field,
         bytes_field,
         connection_requests_field,
+        connection_field,
+        end_time_field,
         series_only,
     } = &cli.command
     {
@@ -498,6 +504,8 @@ async fn real_main(cli: Cli) -> Result<bool> {
             upstream_time_field,
             bytes_field,
             connection_requests_field,
+            connection_field,
+            end_time_field,
             series_only: *series_only,
         })?;
         return Ok(true);

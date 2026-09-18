@@ -24,6 +24,8 @@ pub struct BriefOutput {
     pub omitted_alternative_database_rows: usize,
     pub cpu: BriefSection<CpuSummary>,
     pub host: BriefSection<HostSummary>,
+    /// Load-generator side, when the access log carries `$connection` and `$msec`.
+    pub client: BriefSection<HostSummary>,
     pub transitions: BriefSection<Transition>,
     pub artifact_issues: BriefSection<ProfileArtifact>,
     pub unavailable_artifact_count: usize,
@@ -118,6 +120,11 @@ pub fn build(
     let (mut database, omitted_alternative_database_rows) =
         preferred_database(diagnostics.database);
     database.iter_mut().for_each(query::round_database_summary);
+    let mut client = diagnostics.client;
+    client.iter_mut().for_each(|row| {
+        row.average = query::round_to(row.average, 3);
+        row.peak = query::round_to(row.peak, 3);
+    });
     let mut host = diagnostics.host;
     host.iter_mut().for_each(|row| {
         row.average = query::round_to(row.average, 3);
@@ -156,6 +163,7 @@ pub fn build(
         omitted_alternative_database_rows,
         cpu: section(diagnostics.cpu, limit),
         host: section(host, limit),
+        client: section(client, limit),
         transitions: section(diagnostics.transitions, limit),
         artifact_issues: section(
             diagnostics

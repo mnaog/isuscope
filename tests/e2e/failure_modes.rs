@@ -275,6 +275,10 @@ command = ["sh", "-c", "touch benchmark-ran; printf '%s\n' '{{\"type\":\"isuscop
 [ssh]
 known_hosts_file = ".local/known-hosts"
 
+# The fake ssh runs df on the test machine, whose / can be nearly full.
+[disk]
+paths = []
+
 [[nodes]]
 name = "app1"
 host = "{host}"

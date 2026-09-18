@@ -99,7 +99,12 @@ command = ["/bin/sh", "-c", "exit 75"]
     let output = String::from_utf8(doctor.stdout).unwrap();
     assert!(output.contains("profile `perf-flamegraph` local: ready:"));
     assert!(output.contains("profile `offcpu` local: ready:"));
-    assert!(output.contains("warnings  1"));
+    // The data-directory free space warning depends on the machine running the tests.
+    let warnings = output
+        .lines()
+        .filter(|line| line.starts_with("! ") && !line.contains("data filesystem"))
+        .collect::<Vec<_>>();
+    assert_eq!(warnings, ["! no SSH nodes are configured"], "{output}");
     assert!(output.contains("failures  0"));
 }
 

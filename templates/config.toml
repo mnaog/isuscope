@@ -74,19 +74,62 @@ transport = "ssh"
 command = ["sh", "-c", '''
 set -eu
 read_cpu() { awk '/^cpu / { total=0; for(i=2;i<=9;i++)total+=$i; print $2,$3,$4,$5,$6,$7,$8,$9,total }' /proc/stat; }
+# TCPのcounterは/proc/net/snmpと/proc/net/netstatのheader行とvalue行の組から引く。
+read_tcp() {
+  awk 'FNR%2==1 { split($0, head, /[ \t]+/); next }
+       { for (i=2; i<=NF; i++) v[$1 head[i]] = $i }
+       END { printf "%d %d %d %d %d %d %d\n",
+               v["Tcp:PassiveOpens"], v["Tcp:ActiveOpens"], v["Tcp:RetransSegs"],
+               v["TcpExt:ListenOverflows"], v["TcpExt:ListenDrops"],
+               v["TcpExt:SyncookiesSent"], v["TcpExt:TCPTimeWaitOverflow"] }' \
+    /proc/net/snmp /proc/net/netstat
+}
+# 保持中の接続数。ssを毎秒起動するより軽い。
+read_sockets() { awk '/^TCP:/ { print $3, $7 }' /proc/net/sockstat; }
+# 実際に通信しているNICだけ。仮想deviceの0行でmetricを埋めない。
+# /proc/net/devは行頭の空白の数がNIC名の長さで変わるので、空白を落としてから分割する。
+read_dev() { awk '{ sub(/^[ \t]+/, ""); n=split($0, f, /[: \t]+/); if (n >= 17 && f[1] != "lo" && f[2] ~ /^[0-9]+$/ && (f[2]+f[10]) > 0) print f[1], f[3], f[2], f[11], f[10] }' /proc/net/dev; }
+emit() { printf '{"type":"metric","name":"%s","value":%s,"unit":"%s","timestamp":"%s"}\n' "$1" "$2" "$3" "$ts"; }
+emit_dev() { printf '{"type":"metric","name":"%s","value":%s,"unit":"%s","labels":{"device":"%s"},"timestamp":"%s"}\n' "$1" "$2" "$3" "$4" "$ts"; }
 set -- $(read_cpu); pu=$1; pn=$2; ps=$3; pd=$4; pw=$5; pq=$6; pr=$7; pv=$8; pt=$9
+set -- $(read_tcp); ppo=$1; pao=$2; prs=$3; plo=$4; pld=$5; psc=$6; ptw=$7
+dev_previous=$(read_dev)
 while :; do
   sleep 1
   set -- $(read_cpu); u=$1; n=$2; s=$3; d=$4; w=$5; q=$6; r=$7; v=$8; t=$9
-  set -- $(awk -v dt=$((t-pt)) -v u=$((u-pu)) -v n=$((n-pn)) -v s=$((s-ps+q-pq+r-pr)) -v d=$((d-pd)) -v w=$((w-pw)) -v v=$((v-pv)) 'BEGIN { if(dt<=0)dt=1; printf "%.6f %.6f %.6f %.6f %.6f %.6f %.6f",100*u/dt,100*n/dt,100*s/dt,100*w/dt,100*v/dt,100*d/dt,100*(dt-d-w)/dt }')
-  user=$1; nice=$2; system=$3; iowait=$4; steal=$5; idle=$6; busy=$7
+  set -- $(awk -v dt=$((t-pt)) -v u=$((u-pu)) -v n=$((n-pn)) -v s=$((s-ps+q-pq+r-pr)) -v d=$((d-pd)) -v w=$((w-pw)) -v v=$((v-pv)) -v q=$((q-pq)) 'BEGIN { if(dt<=0)dt=1; printf "%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f",100*u/dt,100*n/dt,100*s/dt,100*w/dt,100*v/dt,100*d/dt,100*(dt-d-w)/dt,100*q/dt }')
+  user=$1; nice=$2; system=$3; iowait=$4; steal=$5; idle=$6; busy=$7; softirq=$8
   mem=$(awk '/MemTotal:/{t=$2}/MemAvailable:/{a=$2}END{print (t-a)*1024}' /proc/meminfo)
   load=$(awk '{print $1}' /proc/loadavg); ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  for item in host.cpu_user_percent:$user host.cpu_nice_percent:$nice host.cpu_system_percent:$system host.cpu_iowait_percent:$iowait host.cpu_steal_percent:$steal host.cpu_idle_percent:$idle host.cpu_busy_percent:$busy host.cpu_percent:$busy; do
-    name=${item%%:*}; value=${item#*:}; printf '{"type":"metric","name":"%s","value":%s,"unit":"percent","timestamp":"%s"}\n' "$name" "$value" "$ts"
+  for item in host.cpu_user_percent:$user host.cpu_nice_percent:$nice host.cpu_system_percent:$system host.cpu_iowait_percent:$iowait host.cpu_steal_percent:$steal host.cpu_idle_percent:$idle host.cpu_busy_percent:$busy host.cpu_percent:$busy host.cpu_softirq_percent:$softirq; do
+    name=${item%%:*}; value=${item#*:}; emit "$name" "$value" percent
   done
-  printf '{"type":"metric","name":"host.memory_used_bytes","value":%s,"unit":"bytes","timestamp":"%s"}\n' "$mem" "$ts"
-  printf '{"type":"metric","name":"host.load1","value":%s,"unit":"load","timestamp":"%s"}\n' "$load" "$ts"
+  emit host.memory_used_bytes "$mem" bytes
+  emit host.load1 "$load" load
+  # 接続の受け付けと保持。0が続くなら、接続の取りこぼしはサーバー側ではない。
+  set -- $(read_tcp); po=$1; ao=$2; rs=$3; lo=$4; ld=$5; sc=$6; tw=$7
+  emit host.tcp_passive_opens_per_second $((po-ppo)) connections
+  emit host.tcp_active_opens_per_second $((ao-pao)) connections
+  emit host.tcp_retransmit_segments_per_second $((rs-prs)) segments
+  emit host.tcp_listen_overflows_per_second $((lo-plo)) connections
+  emit host.tcp_listen_drops_per_second $((ld-pld)) connections
+  emit host.tcp_syn_cookies_sent_per_second $((sc-psc)) connections
+  emit host.tcp_time_wait_overflow_per_second $((tw-ptw)) connections
+  ppo=$po; pao=$ao; prs=$rs; plo=$lo; pld=$ld; psc=$sc; ptw=$tw
+  set -- $(read_sockets)
+  if [ $# -ge 2 ]; then emit host.tcp_established "$1" connections; emit host.tcp_time_wait "$2" connections; fi
+  dev_current=$(read_dev)
+  printf '%s\n' "$dev_current" | while read -r nic rxp rxb txp txb; do
+    [ -n "${nic:-}" ] || continue
+    previous=$(printf '%s\n' "$dev_previous" | awk -v nic="$nic" '$1==nic { print $2, $3, $4, $5 }')
+    set -- ${previous:-}
+    [ $# -eq 4 ] || continue
+    emit_dev host.net_rx_packets_per_second $((rxp-$1)) packets "$nic"
+    emit_dev host.net_rx_bytes_per_second $((rxb-$2)) bytes "$nic"
+    emit_dev host.net_tx_packets_per_second $((txp-$3)) packets "$nic"
+    emit_dev host.net_tx_bytes_per_second $((txb-$4)) bytes "$nic"
+  done
+  dev_previous=$dev_current
   pu=$u; pn=$n; ps=$s; pd=$d; pw=$w; pq=$q; pr=$r; pv=$v; pt=$t
 done
 ''']

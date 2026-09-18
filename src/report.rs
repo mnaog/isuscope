@@ -17,6 +17,8 @@ pub struct RunDiagnostics {
     pub database: Vec<DatabaseSummary>,
     pub cpu: Vec<CpuSummary>,
     pub host: Vec<HostSummary>,
+    /// Load-generator side: connections held and opened, and the wait between requests.
+    pub client: Vec<HostSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: Vec<Transition>,
     pub run_logs: PathBuf,
@@ -33,6 +35,7 @@ pub struct RunReport {
     pub database: ReportSection<DatabaseSummary>,
     pub cpu: ReportSection<CpuSummary>,
     pub host: ReportSection<HostSummary>,
+    pub client: ReportSection<HostSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: ReportSection<Transition>,
     pub run_logs: PathBuf,
@@ -130,6 +133,7 @@ pub fn diagnose(
     let database = database_queries(&summary_metrics);
     let cpu = cpu_symbols(&summary_metrics);
     let host = host_metrics(&summary_metrics, &series_metrics);
+    let client = client_metrics(&summary_metrics, &series_metrics);
     let artifacts = profile_artifacts(&run.collectors, &run_logs, latest_logs.as_deref());
     RunDiagnostics {
         run,
@@ -138,6 +142,7 @@ pub fn diagnose(
         database,
         cpu,
         host,
+        client,
         artifacts,
         transitions,
         run_logs,
@@ -156,6 +161,7 @@ impl RunDiagnostics {
             database: section(self.database),
             cpu: section(self.cpu),
             host: section(self.host),
+            client: section(self.client),
             artifacts: self.artifacts,
             transitions: section(self.transitions),
             run_logs: self.run_logs,
@@ -596,17 +602,26 @@ pub fn cpu_symbols(metrics: &[Metric]) -> Vec<CpuSummary> {
 }
 
 pub fn host_metrics(summary: &[Metric], series: &[Metric]) -> Vec<HostSummary> {
+    summarize_metrics(summary, series, is_host_metric)
+}
+
+/// Shared by host and client summaries: average and peak per node, metric and target.
+fn summarize_metrics(
+    summary: &[Metric],
+    series: &[Metric],
+    keep: fn(&Metric) -> bool,
+) -> Vec<HostSummary> {
     let mut values =
         BTreeMap::<(String, String, String, String), (String, f64, usize, f64, Option<_>)>::new();
     let series_keys = series
         .iter()
-        .filter(|metric| is_host_metric(metric))
+        .filter(|metric| keep(metric))
         .map(host_key)
         .collect::<BTreeSet<_>>();
-    for metric in series.iter().filter(|metric| is_host_metric(metric)).chain(
+    for metric in series.iter().filter(|metric| keep(metric)).chain(
         summary
             .iter()
-            .filter(|metric| is_host_metric(metric) && !series_keys.contains(&host_key(metric))),
+            .filter(|metric| keep(metric) && !series_keys.contains(&host_key(metric))),
     ) {
         let target = metric
             .labels
@@ -813,6 +828,16 @@ fn divide(numerator: f64, denominator: f64) -> Option<f64> {
 }
 fn is_host_metric(metric: &Metric) -> bool {
     metric.name.starts_with("host.") || metric.name.starts_with("service.")
+}
+
+/// How the load generator drove the system: connections it held and opened, requests per
+/// connection, and the gap between a response and that connection's next request.
+fn is_client_metric(metric: &Metric) -> bool {
+    metric.name.starts_with("client.")
+}
+
+pub fn client_metrics(summary: &[Metric], series: &[Metric]) -> Vec<HostSummary> {
+    summarize_metrics(summary, series, is_client_metric)
 }
 
 #[cfg(test)]

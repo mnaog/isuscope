@@ -62,7 +62,8 @@ fn is_quantile(metric: &Metric) -> bool {
 fn is_additive(name: &str) -> bool {
     matches!(
         name,
-        "http.requests"
+        "client.connections_opened"
+            | "http.requests"
             | "http.errors"
             | "http.response_bytes"
             | "http.connection_reused_requests"
