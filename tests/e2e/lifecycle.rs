@@ -67,6 +67,52 @@ command = ["sh", "-c", "printf cleaned > cleanup-ran"]
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn interruption_does_not_wait_for_a_grandchild_holding_the_pipes() {
+    use std::{thread, time::Duration, time::Instant};
+
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    // ベンチが孫processを残し、それがstdout/stderrを握ったまま長く生きる場合。
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "sh -c 'trap \"\" TERM; sleep 600' & touch benchmark-started; sleep 600"]
+"#,
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "an interrupted run must return"])
+        .current_dir(project.path())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if project.path().join("benchmark-started").is_file() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(project.path().join("benchmark-started").is_file());
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let interrupted_at = Instant::now();
+    assert_eq!(child.wait().unwrap().code(), Some(1));
+    assert!(
+        interrupted_at.elapsed() < Duration::from_secs(20),
+        "interruption took {:?}",
+        interrupted_at.elapsed()
+    );
+}
+
 #[test]
 fn list_since_filters_runs_by_start_time() {
     let project = tempdir().unwrap();

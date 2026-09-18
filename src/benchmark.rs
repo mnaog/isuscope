@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -167,8 +168,9 @@ async fn execute_command(
             (status, true)
         }
     };
-    stdout_task.await.context("stdout capture task failed")??;
-    stderr_task.await.context("stderr capture task failed")??;
+    // 中断後にpipeを握ったままの相手が残っていても、取り込みを待ち続けて止まらないようにする。
+    finish_capture(stdout_task, "stdout").await?;
+    finish_capture(stderr_task, "stderr").await?;
 
     let mut logs = Vec::new();
     compress_log(&stdout_raw, &run_dir.join("logs/benchmark-stdout.zst"))?;
@@ -241,6 +243,23 @@ async fn execute_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 取り込みtaskの完了を待つ。pipeの書き手が残って閉じない場合は打ち切り、
+/// そこまでに書けたlogで先へ進む。
+async fn finish_capture(task: tokio::task::JoinHandle<Result<()>>, stream: &str) -> Result<()> {
+    const CAPTURE_DEADLINE: Duration = Duration::from_secs(10);
+    match tokio::time::timeout(CAPTURE_DEADLINE, task).await {
+        Ok(joined) => joined.with_context(|| format!("{stream} capture task failed"))?,
+        Err(_) => {
+            eprintln!(
+                "warning: benchmark {stream} stayed open for {}s after the process ended; \
+                 the saved log may be incomplete",
+                CAPTURE_DEADLINE.as_secs()
+            );
+            Ok(())
+        }
+    }
+}
+
 async fn capture_lines<R>(
     reader: R,
     path: PathBuf,
