@@ -75,7 +75,7 @@ cargo install --path . --locked
 isuscope --version
 ```
 
-競技用bundleは`./scripts/build-release-bundle.sh`で作れます。生成物にはbinary、SHA-256、README、当日ランブック、LICENSEが含まれます。
+競技用bundleは`./scripts/build-release-bundle.sh`で作れます。生成物にはbinary、SHA-256、README、LICENSEが含まれます。
 
 ## プロジェクトへ導入する
 
@@ -143,29 +143,30 @@ isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metri
 
 ```console
 isuscope brief latest
-isuscope query latest --metric-prefix benchmark.scenario. --group-by scenario
-isuscope query latest --base previous --view database --source mysql-log-delta --label-contains digest=reservation_slots --group-by sql-shape
-isuscope query latest --base previous --view http --label-contains route=reservation
+isuscope query latest --metric benchmark.error --group-by error
+isuscope query latest --base BASE_RUN --view database --source mysql-log-delta --label-contains digest=reservation_slots --group-by sql-shape
+isuscope query latest --base BASE_RUN --view http --label-contains route=reservation
 ```
 
-`query --base`は同じselectorを両runへ適用し、全件をfull outer joinしてから`--limit`を適用します。base/candidate/delta/delta percentとadded/removed/bothを返すため、対象を絞った比較で上位項目の入れ替わりを失いません。SQL shapeは可変長`IN`と複数行`VALUES`をまとめ、長いdigest exampleは短縮します。SQLiteとstructured snapshotの値は変更せず、query/briefの表示値だけを単位に応じて丸めます。
+`query --base`は同じselectorを両runへ適用し、全件をfull outer joinしてから`--limit`を適用します。metric viewの行は、metric名ごとに値の大きい順に並べてから切ります。base/candidate/delta/delta percentとadded/removed/bothを返すため、対象を絞った比較で上位項目の入れ替わりを失いません。SQL shapeは可変長`IN`と複数行`VALUES`をまとめ、長いdigest exampleは短縮します。SQLiteとstructured snapshotの値は変更せず、query/briefの表示値だけを単位に応じて丸めます。
 
 collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope init`はそれを実環境の値で`.isuscope/config.toml`へ書き出し、独自の生成処理を持つprojectは`isuscope init --print config --no-scaffold --data-dir ... --nginx-access-log ... --service-units "..."`で同じ内容を取り込み、`[lock]`・`[ssh]`・`[[nodes]]`を自分で追記します。collectorを増やすときにprojectごとの写しを直して回らずに済みます。
 
 ## 保存されるデータ
 
-既定では`.isuscope/data/`を使います。保存先は`config.toml`の`data_dir`で変更できます。
+`isuscope init`は保存先を`.isuscope/data/`にします（`config.toml`の`data_dir`で変更でき、`data_dir`を書かなければ`.isuscope/`直下です）。
 
 ```text
 .isuscope/data/
 ├── isuscope.sqlite3
-├── runs/<run-id>/
-│   ├── run.json
-│   ├── source/
-│   ├── tooling/
-│   ├── logs/
-│   └── structured.json.zst
-└── .incomplete/
+└── runs/
+    ├── <run-id>/
+    │   ├── run.json
+    │   ├── source/
+    │   ├── tooling/
+    │   ├── logs/
+    │   └── structured.json.zst
+    └── .incomplete/          # 実行中のrun（<run-id>/と、実行中の印<run-id>.running）
 ```
 
 各runにはスコアと成否、仮説と分析、Git commit・dirty patch・未追跡file hash、実行時のisuscope設定、collector出力と構造化metricを保存します。SQLiteは検索用の索引で、run directoryが記録の正本です。索引を失っても`isuscope list`の起動時に再構築されます。
@@ -188,7 +189,7 @@ parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","catego
 
 模型が合っても分かるのは**今の得点の内訳**だけで、「このrouteを速くすると何点増える」ではありません。増分は、そのrouteが実際に上限になっている場合にしか出ません。上限が別（他のroute、CPU、ベンチ側の並列数）なら、得点の44%を占めるrouteを2倍速くしてもscoreは動きません。内訳は候補を絞る材料として使い、増えるかどうかは1回のベンチで確かめます。実際、ISUCON12本選の練習では全routeのサーバー時間を2.07 msから0.41 msにしても処理量は+3.6%で、上限はベンチ側にありました。
 
-access logに`conn:$connection`と`msec:$msec`があると、`nginx-series` collectorがベンチ側の接続の使い方も出します。`client.connections_in_use`（最初の要求から最後の応答までを積んだ同時接続数）、`client.connections_opened`（毎bucketの新規接続）、`client.request_gap`（応答を返してから同じ接続に次の要求が来るまでの時間。分位と平均）、`client.connection_requests_mean`／`_max`です。briefの`client` sectionに出ます。
+access logに`conn:$connection`と`msec:$msec`があると、`nginx-series` collectorがベンチ側の接続の使い方も出します。`client.connections_in_use`（最初の要求から最後の応答までを積んだ同時接続数）、`client.connections_opened`（毎bucketの新規接続）、`client.request_gap`（応答を返してから同じ接続に次の要求が来るまでの時間。分位と平均）、`client.connection_requests_mean`／`_max`です。briefの`clients`にnodeごとに1行（同時接続数の平均とピーク、毎秒の新規接続、`request_gap`の分位、接続あたりの要求数）で出ます。
 
 `client.connections_in_use`は**保持している接続数ではありません**。最後の応答の後にkeepaliveで開いたままの時間はaccess logに出ないので入りません。保持中の接続はkernelから取る`host.tcp_established`（`/proc/net/snmp`の`Tcp:CurrEstab`）で見て、2つを分けて扱います。`keepalive_timeout`のような「遊休接続を減らす」変更の効果は後者に出ます。サーバーの処理時間が短いのに`client.request_gap`が伸び、`client.connections_in_use`が並列数と一緒に増えるだけなら、上限はサーバーの外にある可能性が高くなります（サーバー側の計測だけでは確定できません）。
 
@@ -206,7 +207,9 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 
-`[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockは`mkdir`で作るdirectoryで、`owner`のpidが既に存在しなければ回収し、生きた所有者がいれば終了code 75で止まります。
+`[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockはdirectoryの中の`lock` fileを`flock`で握るもので、kernelが所有processの終了時に外すため、落ちたprocessのlockは残りません。`owner`は誰が握っているかの説明だけで、生きた所有者がいれば終了code 75で止まります。lock fileは消さずに残ります。
+
+`[lock]`が無くても、同じdata directoryで2つの`run`は重なりません。実行中のrunは`runs/.incomplete/<run-id>.running`を`flock`で握り、後から始めた`run`はそれを見て開始を拒みます。握られていない`.incomplete`のrunだけを、中断されたrunとして`aborted`で確定します。
 
 `[ssh] known_hosts_file`を指定すると、全SSH呼び出しがprojectのknown_hostsを`StrictHostKeyChecking=accept-new`で使います。ベンチ前のSSH collectorがあるnodeで、そのすべてがSSH接続自体の失敗（exit 255）になった場合は、計測のないrunを残さないようベンチを開始せずに失敗させます。
 
@@ -215,7 +218,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 ## 観測の考え方
 
-標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。
+標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。briefの`hosts`と`clients`は、initializeの終わりが分かるrunでは負荷区間だけで要約し、どちらで要約したかを`hosts_window`（`load`か`whole`）に出します。
 
 ALPはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。標準collectorを最初から全部入れる理由と、その受け入れ基準は[標準observability](docs/standard-observability.md)にあります。
 

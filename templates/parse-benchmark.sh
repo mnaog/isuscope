@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # 出力例:
 #   printf '%s\n' \
-#     '{"type":"metric","name":"benchmark.scenario.success","value":123,"unit":"runs","labels":{"scenario":"viewer"}}'
+#     '{"type":"metric","name":"benchmark.error","value":12,"unit":"errors","labels":{"error":"timeout"}}'
 #
 # FAILの理由とエラーの実例は、行の本文をmessageとして残します（件数はmetricで出します）。
 # FAIL runは分析不要なので、ここで残した理由が`list`と`brief`での唯一の記録になります。

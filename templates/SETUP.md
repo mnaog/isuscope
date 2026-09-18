@@ -19,7 +19,7 @@ remote変更を行う場合は、既存ファイルのbackup、設定検証、at
 
 標準log collectorは`sha256sum`、`gzip`、`tail`、`wc`を使い、`.1`〜`.5`と各`.gz`から開始時のlogを照合します。保持世代を越えたrotationや中間世代の欠落は、壊れた差分を返さず終了コード75で`unavailable`になります。非空logをalp/slpが1件も解析できなかった場合は設定不一致として`failed`になります。
 
-`benchmark.sh`、`parse-benchmark.sh`、`setup.sh`、`config.toml`、`routes.toml`、`setup-state.json`およびisuscopeのversionは各runの`tooling/`へsnapshotされます。序盤の`survey-run`完了後は、仮説付きの`run`、結果を残す`analyze`、`enrich`、一覧JSONの`list`、小さい判断用JSONの`brief`、詳細JSONの`report`、対象metricを絞る`query`、比較JSONの`diff`、人間向けHTMLの`ui`を使います。
+`benchmark.sh`、`parse-benchmark.sh`、`setup.sh`、`config.toml`、`routes.toml`、`setup-state.json`およびisuscopeのversionは各runの`tooling/`へsnapshotされます。序盤の`survey-run`完了後は、仮説付きの`run`、結果を残す`analyze`、`enrich`、一覧JSONの`list`、小さい判断用JSONの`brief`、対象metricを絞る`query`（`--base`で2 runの比較）、briefとqueryで足りない問いに使う読み取り専用の`sql`、人間向けHTMLの`ui`を使います。
 
 改善前後の対象を絞った比較には`isuscope query CANDIDATE --base BASE ...`を使います。両runへ同じfilterを適用し、全件比較後にlimitされます。
 

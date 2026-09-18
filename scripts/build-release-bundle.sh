@@ -16,9 +16,9 @@ trap 'rm -rf -- "${temporary}" "${verification}"' EXIT
 install -m 0755 target/release/isuscope "${temporary}/isuscope"
 mkdir -p "${temporary}/docs"
 cp README.md LICENSE "${temporary}/"
-cp docs/contest-day.md "${temporary}/docs/contest-day.md"
+cp docs/standard-observability.md "${temporary}/docs/standard-observability.md"
 mkdir -p "${DIST_DIR}"
-tar -C "${temporary}" -czf "${DIST_DIR}/${bundle}.tar.gz" isuscope README.md LICENSE docs/contest-day.md
+tar -C "${temporary}" -czf "${DIST_DIR}/${bundle}.tar.gz" isuscope README.md LICENSE docs/standard-observability.md
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "${DIST_DIR}" && sha256sum "${bundle}.tar.gz" >"${bundle}.tar.gz.sha256")
   (cd "${DIST_DIR}" && sha256sum -c "${bundle}.tar.gz.sha256")
@@ -30,6 +30,6 @@ tar -C "${verification}" -xzf "${DIST_DIR}/${bundle}.tar.gz"
 test "$("${verification}/isuscope" --version)" = "isuscope ${version}"
 test -f "${verification}/README.md"
 test -f "${verification}/LICENSE"
-test -f "${verification}/docs/contest-day.md"
+test -f "${verification}/docs/standard-observability.md"
 echo "created ${DIST_DIR}/${bundle}.tar.gz"
 echo "verified ${bundle} (binary and documentation)"
