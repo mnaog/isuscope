@@ -75,6 +75,7 @@ fn is_additive(name: &str) -> bool {
             | "db.query.rows_sent"
             | "db.query.rows_examined"
             | "cpu.sample_count"
+            | "benchmark.error"
             | "benchmark.dns.failed"
             | "benchmark.dns.resolved"
             | "benchmark.scenario.failure"

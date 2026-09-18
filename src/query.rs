@@ -156,6 +156,18 @@ pub fn metric_query(
             }
         })
         .collect::<Vec<_>>();
+    // `--limit`で切る前に、同じmetricの中では値の大きい順にする。名前順のまま切ると、
+    // 大きい値がlabelの綴りだけで落ちる。
+    rows.sort_by(|a, b| {
+        a.metric
+            .cmp(&b.metric)
+            .then_with(|| {
+                b.value
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .total_cmp(&a.value.unwrap_or(f64::NEG_INFINITY))
+            })
+            .then_with(|| a.labels.cmp(&b.labels))
+    });
     let warnings = (non_mergeable_groups > 0)
         .then(|| {
             format!(
@@ -1150,6 +1162,44 @@ mod tests {
             sql_shape("insert into t (a,b) values (?,?),(?,?),(?,?"),
             "insert into t (a,b) values (?tuple+)"
         );
+    }
+
+    #[test]
+    fn metric_query_keeps_the_largest_rows_when_it_truncates() {
+        // 名前順で切ると、件数の多い`timeout`が`a-rare`より後ろへ回って落ちる。
+        let metrics = [("a-rare", 1.0), ("timeout", 90.0), ("m-mid", 5.0)]
+            .into_iter()
+            .map(|(error, value)| Metric {
+                name: "benchmark.error".into(),
+                value,
+                unit: "errors".into(),
+                timestamp: None,
+                labels: BTreeMap::from([("error".into(), error.into())]),
+            })
+            .collect();
+        let output = metric_query(
+            "run".into(),
+            metrics,
+            MetricQueryOptions {
+                scope: QueryScope::Run,
+                window: None,
+                metrics: Vec::new(),
+                metric_prefix: Some("benchmark.".into()),
+                node: None,
+                source: None,
+                labels: Vec::new(),
+                label_contains: Vec::new(),
+                group_by: Vec::new(),
+                limit: 2,
+            },
+        );
+        let kept = output
+            .rows
+            .iter()
+            .map(|row| row.labels["error"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, ["timeout", "m-mid"]);
+        assert!(output.truncated);
     }
 
     #[test]

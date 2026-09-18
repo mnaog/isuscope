@@ -128,3 +128,91 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
     // fingerprintを取っていないrunは「同じ」ではなく「不明」。
     assert_eq!(state("environment"), "unknown");
 }
+
+/// hostの要約はinitializeを除いた負荷区間で行い、localのcollectorがnode別に出したmetricで
+/// coverageが「欠けている」と誤判定しない。clientの行には`request_gap`が必ず出る。
+#[test]
+fn brief_summarizes_the_load_window_and_trusts_node_labelled_local_metrics() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", """
+printf '%s\n' '{"type":"isuscope.event","name":"initialize-started"}'
+sleep 3
+printf '%s\n' '{"type":"isuscope.event","name":"initialize-finished"}'
+sleep 3
+printf '%s\n' '{"type":"isuscope.result","score":1,"pass":true}'
+"""]
+
+[[collectors]]
+name = "probe-host"
+phase = "during"
+transport = "local"
+command = ["sh", "-c", """
+emit() { printf '{"type":"metric","name":"host.cpu_busy_percent","value":%s,"unit":"percent","labels":{"node":"app1"},"timestamp":%s}\n' "$1" "$(date +%s)"; }
+sleep 1.5; emit 90
+sleep 3; emit 10
+sleep 30
+"""]
+
+[[collectors]]
+name = "nginx-series"
+phase = "after"
+transport = "local"
+command = ["sh", "-c", """
+printf '%s\n' \
+  '{"type":"metric","name":"http.requests","value":10,"unit":"requests","labels":{"node":"app1","method":"GET","route":"/"}}' \
+  '{"type":"metric","name":"http.request_duration","value":1,"unit":"ms","labels":{"node":"app1","method":"GET","route":"/","quantile":"0.95"}}'
+for m in client.connection_requests_max client.connection_requests_mean client.connections_opened_total; do
+  printf '{"type":"metric","name":"%s","value":5,"unit":"x","labels":{"node":"app1"}}\n' "$m"
+done
+printf '{"type":"metric","name":"client.request_gap","value":3,"unit":"ms","labels":{"node":"app1","quantile":"0.95"}}\n'
+"""]
+"#,
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "負荷区間だけで要約する"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["brief", "latest"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let brief: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(brief["hosts_window"], "load");
+    // initialize中の90%は混ざらない。
+    assert_eq!(
+        brief["hosts"][0]["cpu_busy_percent"], 10.0,
+        "{}",
+        brief["hosts"]
+    );
+    assert_eq!(brief["hosts"][0]["cpu_busy_peak_percent"], 10.0);
+
+    let coverage = brief["coverage_issues"]["items"].as_array().unwrap();
+    assert!(
+        !coverage
+            .iter()
+            .any(|issue| issue["collector"] == "nginx-series"),
+        "{coverage:?}"
+    );
+
+    assert_eq!(
+        brief["clients"][0]["request_gap_ms"]["p95"], 3.0,
+        "{}",
+        brief["clients"]
+    );
+}

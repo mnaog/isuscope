@@ -26,10 +26,13 @@ pub struct BriefOutput {
     pub database: BriefSection<DatabaseSummary>,
     pub omitted_alternative_database_rows: usize,
     pub cpu: BriefSection<CpuSummary>,
+    /// `hosts`と`clients`を要約した区間。initializeの終わりが分かるrunは`load`、
+    /// 分からないrunは`whole`（initializeを含む）。
+    pub hosts_window: &'static str,
     /// 1 node 1行。詳細は`query --scope series --window load`で掘ります。
     pub hosts: Vec<BriefHostNode>,
-    /// Load-generator side, when the access log carries `$connection` and `$msec`.
-    pub client: BriefSection<HostSummary>,
+    /// ベンチ側の接続の使い方。access logに`$connection`と`$msec`があるとき、1 node 1行。
+    pub clients: Vec<BriefClientNode>,
     /// Per backend, when the access log carries `$upstream_addr` and the upstream times.
     pub upstreams: BriefSection<UpstreamSummary>,
     pub transitions: BriefSection<Transition>,
@@ -66,6 +69,24 @@ pub struct BriefHostNode {
     pub top_services: Vec<BriefService>,
     /// このnodeの詳細行数。`query`で何件に当たるかの目安。
     pub detail_rows: usize,
+}
+
+/// ベンチ側がそのnodeへの接続をどう使ったか。
+#[derive(Debug, Serialize)]
+pub struct BriefClientNode {
+    pub node: String,
+    /// 最初の要求から最後の応答までを積んだ同時接続数（遊休中の保持は含まない）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connections_in_use: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connections_in_use_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connections_opened_per_second: Option<f64>,
+    /// 応答を返してから同じ接続に次の要求が来るまで（ms）。5秒ごとの分位のうち最も大きい値。
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_gap_ms: BTreeMap<String, f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requests_per_connection: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,12 +190,9 @@ pub fn build(
     let (mut database, omitted_alternative_database_rows) =
         preferred_database(diagnostics.database);
     database.iter_mut().for_each(query::round_database_summary);
-    let mut client = diagnostics.client;
-    client.iter_mut().for_each(|row| {
-        row.value = row.value.map(|value| query::round_to(value, 3));
-        row.peak = query::round_to(row.peak, 3);
-    });
+    let clients = client_nodes(&diagnostics.client);
     let hosts = host_nodes(&diagnostics.host);
+    let hosts_window = diagnostics.host_window;
     let benchmark_messages = benchmark_messages(&run);
     let unavailable_artifact_count = diagnostics
         .artifacts
@@ -201,15 +219,16 @@ pub fn build(
         },
         coverage_issues: section(coverage_issues, limit),
         coverage_info_count,
-        benchmark: section(benchmark.rows, limit),
+        benchmark: section(by_metric_then_magnitude(benchmark.rows), limit),
         score_inputs: section(score_inputs.rows, limit),
         benchmark_messages,
         http: section(http, limit),
         database: section(database, limit),
         omitted_alternative_database_rows,
         cpu: section(diagnostics.cpu, limit),
+        hosts_window,
         hosts,
-        client: section(client, limit),
+        clients,
         upstreams: section(diagnostics.upstreams, limit),
         transitions: section(diagnostics.transitions, limit),
         artifact_issues: section(
@@ -302,6 +321,61 @@ fn preferred_database(database: Vec<DatabaseSummary>) -> (Vec<DatabaseSummary>, 
         .collect::<Vec<_>>();
     let omitted = total_count - database.len();
     (database, omitted)
+}
+
+/// 同じmetricの中では値の大きい順に並べる。名前順のまま切ると、件数の多いエラーより
+/// 名前が先のものが残ってしまう。
+fn by_metric_then_magnitude(mut rows: Vec<MetricQueryRow>) -> Vec<MetricQueryRow> {
+    rows.sort_by(|a, b| {
+        a.metric.cmp(&b.metric).then_with(|| {
+            b.value
+                .unwrap_or(f64::NEG_INFINITY)
+                .total_cmp(&a.value.unwrap_or(f64::NEG_INFINITY))
+        })
+    });
+    rows
+}
+
+/// clientの要約をnodeごとに1行へ畳む。名前順に5件だけ出すと、`request_gap`が必ず落ちる。
+fn client_nodes(rows: &[HostSummary]) -> Vec<BriefClientNode> {
+    let mut nodes: BTreeMap<&str, Vec<&HostSummary>> = BTreeMap::new();
+    for row in rows {
+        nodes.entry(row.node.as_str()).or_default().push(row);
+    }
+    nodes
+        .into_iter()
+        .map(|(node, rows)| {
+            let find = |name: &str| rows.iter().find(|row| row.metric == name);
+            let request_gap_ms = rows
+                .iter()
+                .filter(|row| row.metric == "client.request_gap")
+                .filter_map(|row| {
+                    let quantile = row.labels.get("quantile")?;
+                    Some((
+                        format!("p{}", quantile.trim_start_matches("0.")),
+                        query::round_to(row.peak, 3),
+                    ))
+                })
+                .collect();
+            BriefClientNode {
+                node: node.into(),
+                connections_in_use: find("client.connections_in_use")
+                    .and_then(|row| row.value)
+                    .map(|value| query::round_to(value, 1)),
+                connections_in_use_peak: find("client.connections_in_use")
+                    .map(|row| query::round_to(row.peak, 1)),
+                connections_opened_per_second: find("client.connections_opened")
+                    .and_then(|row| row.value)
+                    .map(|value| {
+                        query::round_to(value / crate::transition::BUCKET_SECONDS as f64, 1)
+                    }),
+                request_gap_ms,
+                requests_per_connection: find("client.connection_requests_mean")
+                    .and_then(|row| row.value)
+                    .map(|value| query::round_to(value, 2)),
+            }
+        })
+        .collect()
 }
 
 /// nodeごとに1行へ畳む。全体像を見る入口なので、件数ではなく網羅を優先する。

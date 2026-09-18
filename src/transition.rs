@@ -124,7 +124,7 @@ struct Connection {
     requests: u64,
 }
 
-const BUCKET_SECONDS: i64 = 5;
+pub(crate) const BUCKET_SECONDS: i64 = 5;
 
 const MAX_ROUTE_SERIES: usize = 1_024;
 

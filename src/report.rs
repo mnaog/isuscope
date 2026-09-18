@@ -19,6 +19,8 @@ pub struct RunDiagnostics {
     pub host: Vec<HostSummary>,
     /// Load-generator side: connections held and opened, and the wait between requests.
     pub client: Vec<HostSummary>,
+    /// hostとclientの時系列をどの区間で要約したか。initializeの終わりが分かるrunは`load`。
+    pub host_window: &'static str,
     pub upstreams: Vec<UpstreamSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: Vec<Transition>,
@@ -37,6 +39,7 @@ pub struct RunReport {
     pub cpu: ReportSection<CpuSummary>,
     pub host: ReportSection<HostSummary>,
     pub client: ReportSection<HostSummary>,
+    pub host_window: &'static str,
     pub upstreams: ReportSection<UpstreamSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: ReportSection<Transition>,
@@ -155,9 +158,27 @@ pub fn diagnose(
     let http = http_routes(&summary_metrics);
     let database = database_queries(&summary_metrics);
     let cpu = cpu_symbols(&summary_metrics);
-    let host = host_metrics(&summary_metrics, &series_metrics);
-    let client = client_metrics(&summary_metrics, &series_metrics);
-    let upstreams = upstream_summaries(&summary_metrics);
+    // initializeは負荷走行と別の負荷なので、hostとclientの要約には混ぜない。
+    // initializeの終わりが分からないrunだけ、全区間で要約する。
+    let (host_window, windowed_series) = match load_window(&run) {
+        Some((start, end)) => (
+            "load",
+            series_metrics
+                .iter()
+                .filter(|metric| metric.timestamp.is_some_and(|at| at >= start && at <= end))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        None => ("whole", series_metrics.clone()),
+    };
+    let host = host_metrics(&summary_metrics, &windowed_series);
+    let client = client_metrics(&summary_metrics, &windowed_series);
+    let mut upstreams = upstream_summaries(&summary_metrics);
+    upstreams.sort_by(|a, b| {
+        b.requests
+            .total_cmp(&a.requests)
+            .then_with(|| a.upstream.cmp(&b.upstream))
+    });
     let artifacts = profile_artifacts(&run.collectors, &run_logs, latest_logs.as_deref());
     RunDiagnostics {
         run,
@@ -167,12 +188,23 @@ pub fn diagnose(
         cpu,
         host,
         client,
+        host_window,
         upstreams,
         artifacts,
         transitions,
         run_logs,
         latest_logs,
     }
+}
+
+/// 負荷走行の区間。initializeの終わりからベンチの終わりまで。
+fn load_window(
+    run: &RunManifest,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    Some((
+        run.benchmark.initialize_finished_at?,
+        run.benchmark.finished_at?,
+    ))
 }
 
 impl RunDiagnostics {
@@ -187,6 +219,7 @@ impl RunDiagnostics {
             cpu: section(self.cpu),
             host: section(self.host),
             client: section(self.client),
+            host_window: self.host_window,
             upstreams: section(self.upstreams),
             artifacts: self.artifacts,
             transitions: section(self.transitions),
@@ -868,7 +901,9 @@ fn metric_matches_collector(metric: &Metric, collector: &CollectorResult) -> boo
     }
     match collector.node.as_deref() {
         Some(node) => metric.labels.get("node").map(String::as_str) == Some(node),
-        None => metric.labels.get("node").is_none_or(|node| node == "local"),
+        // localのcollector（nginx-seriesなど）は、nodeから持ち帰ったlogをnode別に集計するので、
+        // metricにはそのnodeの名前が付く。collector名が一致すれば、そのcollectorの出力である。
+        None => true,
     }
 }
 
