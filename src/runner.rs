@@ -14,7 +14,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use chrono::Utc;
-use std::{fs, path::Path};
+use std::fs;
 use uuid::Uuid;
 
 pub struct RunOutcome {
@@ -432,10 +432,6 @@ async fn check_node_disks(config: &LoadedConfig) -> Result<()> {
 pub fn short_id(id: &str) -> &str {
     let start = id.len().saturating_sub(8);
     &id[start..]
-}
-
-pub fn run_path(data_dir: &Path, id: &str) -> std::path::PathBuf {
-    data_dir.join("runs").join(id)
 }
 
 /// SSH exits with 255 when the connection itself fails. A node whose every SSH before

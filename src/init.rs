@@ -88,10 +88,6 @@ const FINGERPRINT: &str = include_str!("../templates/fingerprint.sh");
 const BENCHMARK: &str = include_str!("../templates/benchmark.sh");
 const BENCHMARK_PARSER: &str = include_str!("../templates/parse-benchmark.sh");
 
-pub fn scaffold(project_root: &Path) -> Result<()> {
-    scaffold_with(project_root, &ConfigOptions::default())
-}
-
 pub fn scaffold_with(project_root: &Path, options: &ConfigOptions) -> Result<()> {
     let directory = project_root.join(".isuscope");
     fs::create_dir_all(&directory)

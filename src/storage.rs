@@ -499,10 +499,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn data_dir(&self) -> &Path {
-        &self.data_dir
-    }
-
     pub fn tags(&self, id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -526,15 +522,6 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
-    }
-
-    pub fn append_analysis(
-        &mut self,
-        id: &str,
-        verdict: AnalysisVerdict,
-        body: String,
-    ) -> Result<RunManifest> {
-        self.append_analysis_with_base(id, verdict, body, None)
     }
 
     pub fn append_analysis_with_base(
