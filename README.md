@@ -185,6 +185,8 @@ parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","catego
 
 手順は4段階です。(1)当日マニュアルの得点計算を読み、項を書き出す。(2)重みで決まる型なら、access logのroute別成功数から模型scoreを出して実scoreと比べる。ISUCON12本選では差が0.04%で、present一覧と受取だけで得点の44%を占めると分かりました。(3)値の合計で決まる型なら`score-probe`でその値を読む。(4)どちらでも差が大きいなら、速さが次の負荷を呼ぶ型を疑い、1か所だけ遅らせてscoreの変化を見る実験へ切り替える。ここを飛ばすと、得点にならない経路を速くする作業に時間を使います。
 
+模型が合っても分かるのは**今の得点の内訳**だけで、「このrouteを速くすると何点増える」ではありません。増分は、そのrouteが実際に上限になっている場合にしか出ません。上限が別（他のroute、CPU、ベンチ側の並列数）なら、得点の44%を占めるrouteを2倍速くしてもscoreは動きません。内訳は候補を絞る材料として使い、増えるかどうかは1回のベンチで確かめます。実際、ISUCON12本選の練習では全routeのサーバー時間を2.07 msから0.41 msにしても処理量は+3.6%で、上限はベンチ側にありました。
+
 access logに`conn:$connection`と`msec:$msec`があると、`nginx-series` collectorがベンチ側の接続の使い方も出します。`client.connections_active`（同時に保持している接続数）、`client.connections_opened`（毎bucketの新規接続）、`client.request_gap`（応答を返してから同じ接続に次の要求が来るまでの時間。分位と平均）、`client.connection_requests_mean`／`_max`です。briefの`client` sectionに出ます。サーバーの処理時間が短いのに`client.request_gap`が伸び、`client.connections_active`だけが増えるときは、上限がサーバーの外にあります。
 
 `host-sampler`はコア別の使用率（`host.core_busy_percent`と、最も詰まっているコアの`host.core_busy_max_percent`）と、PSI（`host.psi_cpu_some_percent`など、CPU・memory・I/Oの不足でtaskが足止めされた時間の割合）も出します。全体のCPUに余裕があっても1コアだけ飽和している構成を見落とさないためです。`service-throttle`は、cgroupのCPU上限で止められた時間（`service.cpu_throttled_percent`、`service.cpu_throttled_periods_per_second`）と割当量（`service.cpu_quota_cores`）をunitごとに出します。

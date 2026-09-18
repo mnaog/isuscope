@@ -16,6 +16,8 @@ mod changes;
 mod discovery;
 #[path = "e2e/doctor.rs"]
 mod doctor;
+#[path = "e2e/documented_commands.rs"]
+mod documented_commands;
 #[path = "e2e/enrichment.rs"]
 mod enrichment;
 #[path = "e2e/failure_modes.rs"]
