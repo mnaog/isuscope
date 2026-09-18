@@ -3,7 +3,9 @@ use super::*;
 #[cfg(unix)]
 #[test]
 fn standard_log_delta_survives_common_rotation_strategies() {
-    let config: toml::Value = toml::from_str(include_str!("../../templates/config.toml")).unwrap();
+    // The shipped template carries placeholders; render it the way `init` does.
+    let rendered = isuscope::init::render_config(&isuscope::init::ConfigOptions::default());
+    let config: toml::Value = toml::from_str(&rendered).unwrap();
     let collectors = config["collectors"].as_array().unwrap();
     let script = |name: &str| {
         collectors

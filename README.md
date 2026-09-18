@@ -113,7 +113,7 @@ isuscope doctor
 
 | コマンド | 用途 |
 |---|---|
-| `init` | `.isuscope/`の雛形を生成する |
+| `init` | `.isuscope/`の雛形を生成する。`--print config`で、collector設定だけを実環境の値で標準出力へ出す（他のtoolが取り込む用） |
 | `doctor` | ベンチを起動せず、設定・command・SSH・時刻・diskを検査する |
 | `survey-run` | 序盤の全体調査を1回行い、行動遷移も収集する |
 | `run` | 標準collectorでベンチを実行する |
@@ -150,6 +150,8 @@ isuscope query latest --base previous --view http --label-contains route=reserva
 ```
 
 `query --base`は同じselectorを両runへ適用し、全件をfull outer joinしてから`--limit`を適用します。base/candidate/delta/delta percentとadded/removed/bothを返すため、対象を絞った比較で上位項目の入れ替わりを失いません。SQL shapeは可変長`IN`と複数行`VALUES`をまとめ、長いdigest exampleは短縮します。SQLiteとstructured snapshotの値は変更せず、query/briefの表示値だけを単位に応じて丸めます。
+
+collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope init`はそれを実環境の値で`.isuscope/config.toml`へ書き出し、独自の生成処理を持つprojectは`isuscope init --print config --no-scaffold --data-dir ... --nginx-access-log ... --service-units "..."`で同じ内容を取り込み、`[lock]`・`[ssh]`・`[[nodes]]`を自分で追記します。collectorを増やすときにprojectごとの写しを直して回らずに済みます。
 
 ## 保存されるデータ
 

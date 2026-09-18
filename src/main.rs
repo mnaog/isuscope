@@ -31,7 +31,29 @@ enum Commands {
         command: ChangeCommand,
     },
     /// プロジェクトへ一度だけ使う設定雛形を生成します。
-    Init,
+    Init {
+        /// 雛形を書かず、collector設定を標準出力へ出します（他のtoolから取り込む用）。
+        #[arg(long = "print", value_parser = ["config"])]
+        print: Option<String>,
+        /// 生成する設定の`data_dir`。
+        #[arg(long, default_value = ".isuscope/data")]
+        data_dir: String,
+        /// alpとnginx log collectorが読むaccess log。
+        #[arg(long, default_value = "/var/log/nginx/access.log")]
+        nginx_access_log: String,
+        /// slpとMySQL log collectorが読むslow log。
+        #[arg(long, default_value = "/var/log/mysql/mysql-slow.log")]
+        mysql_slow_log: String,
+        /// cgroupから追うsystemd unit。空白区切り。
+        #[arg(long, default_value = "")]
+        service_units: String,
+        /// `doctor`がparserを当てる、保存済みベンチ出力のpath。
+        #[arg(long)]
+        sample_output: Option<String>,
+        /// `[lock]`・`[ssh]`・`[[nodes]]`の例を付けません。自分で追記する場合に使います。
+        #[arg(long)]
+        no_scaffold: bool,
+    },
     /// 変更系操作の共通lockを取ってcommandを実行します。取得済みの子processでは再取得しません。
     Lock {
         /// lock directory。省略時は`[lock] path`を使います。
@@ -519,13 +541,37 @@ async fn real_main(cli: Cli) -> Result<bool> {
         return Ok(true);
     }
     let current = env::current_dir().context("cannot determine current directory")?;
-    if matches!(cli.command, Commands::Init) {
-        init::scaffold(&current)?;
+    if let Commands::Init {
+        print,
+        data_dir,
+        nginx_access_log,
+        mysql_slow_log,
+        service_units,
+        sample_output,
+        no_scaffold,
+    } = &cli.command
+    {
+        let options = isuscope::init::ConfigOptions {
+            data_dir: data_dir.clone(),
+            nginx_access_log: nginx_access_log.clone(),
+            mysql_slow_log: mysql_slow_log.clone(),
+            service_units: service_units
+                .split_whitespace()
+                .map(ToOwned::to_owned)
+                .collect(),
+            sample_output: sample_output.clone(),
+            scaffold: !no_scaffold,
+        };
+        match print.as_deref() {
+            // The starter template renders the same collectors and adds its own SSH and nodes.
+            Some("config") => print!("{}", isuscope::init::render_config(&options)),
+            _ => init::scaffold_with(&current, &options)?,
+        }
         return Ok(true);
     }
     let config = LoadedConfig::discover(&current)?;
     match cli.command {
-        Commands::Init | Commands::Lock { .. } => unreachable!(),
+        Commands::Init { .. } | Commands::Lock { .. } => unreachable!(),
         Commands::Pin { run } => {
             let id = isuscope::project_tools::pin(&config, &run)?;
             println!("staged run including raw logs: {id}");
