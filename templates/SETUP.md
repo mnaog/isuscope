@@ -13,7 +13,7 @@
 9. `bash -n benchmark.sh`、`bash -n parse-benchmark.sh`、`bash -n setup.sh`、`isuscope list`を実行してから、不足する場合だけ`setup.sh`の`apply_environment`へ冪等な導入処理を追加する
 10. ここで初めて`setup.sh`を実行し、`setup-state.json`が生成されることを確認する。標準ツールは自動installされない
 11. `isuscope doctor`を実行し、failureを解消する
-12. `isuscope survey-run --hypothesis "初期状態の負荷構造を記録する"`を一度実行し、`isuscope report latest`でcollector、metric、時系列とtransitionが0件でないことを確認する。必要な時間帯は`isuscope series latest`で掘り下げ、PASS後は出力されたIDを指定して`isuscope analyze RUN_ID VERDICT --analysis "結果"`で記録する
+12. `isuscope survey-run --hypothesis "初期状態の負荷構造を記録する"`を一度実行し、`isuscope brief latest`でcollector、metric、時系列とtransitionが0件でないことを確認する。必要な時間帯は`isuscope series latest`で掘り下げ、PASS後は出力されたIDを指定して`isuscope analyze RUN_ID VERDICT --analysis "結果"`で記録する
 
 remote変更を行う場合は、既存ファイルのbackup、設定検証、atomicな配置、必要最小限のreloadを行います。パッケージ導入やremote build、常駐agentは既存機能で代替できない場合だけ使用します。
 

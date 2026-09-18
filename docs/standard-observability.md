@@ -55,7 +55,7 @@ required = false
 
 ALP adapterと行動遷移helperは同じ`routes.toml`を使います。標準設定は各正規表現をALP 1.0.21の`--matching-groups`へ解析前に渡すため、正規化route単位のcount、status class、min/max/sum/avg、p50/p95/p99をALP自身が集計します。adapterはこれらを単位付きmetricへ変換し、`report`はrouteごとのHTTP表としてtotal時間順に返します。ALPの区切り文字と衝突するcommaをpatternへ含められず、置換後routeを一意に戻すため`replace`の`$1`などのcaptureも使用できません。該当routeは1規則ずつに分割し、固定のcanonical routeへ置換します。制約違反はcollector実行前に設定エラーとして拒否します。
 
-実環境では最初にlog path・formatを確定し、`isuscope report`の統合JSONでrun全体を確認してから、`isuscope metrics`で名前、`isuscope query`でrun集約値、`isuscope series`で時間帯を絞り込みます。
+実環境では最初にlog path・formatを確定し、`isuscope brief`でrun全体を確認してから、`isuscope sql`で名前、`isuscope query`でrun集約値、`isuscope series`で時間帯を絞り込みます。
 
 ## 時系列
 
@@ -68,7 +68,7 @@ isuscope query latest --scope series --window load --metric-prefix service. --gr
 isuscope series latest --window initialize --metric host.cpu_iowait_percent --bucket 1
 ```
 
-行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logはSQL literalを`?`へ正規化したdigestごとに、run集約のquery数・合計時間・p95と5秒bucketのquery数・合計時間を出します。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、`isuscope metrics`、filter可能な`isuscope series`またはSQLiteから参照できます。
+行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logはSQL literalを`?`へ正規化したdigestごとに、run集約のquery数・合計時間・p95と5秒bucketのquery数・合計時間を出します。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、filter可能な`isuscope series`、`isuscope query`、`isuscope sql`から参照できます。
 
 after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
 

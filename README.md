@@ -11,7 +11,7 @@ isuscopeは、ISUCONのベンチマークと観測結果を1つのrunとして�
 ```console
 isuscope doctor
 isuscope survey-run --hypothesis "初期状態の負荷構造を記録する"
-isuscope report latest
+isuscope brief latest
 isuscope analyze RUN_ID supported --analysis "初期状態を記録できた"
 ```
 
@@ -19,8 +19,8 @@ isuscope analyze RUN_ID supported --analysis "初期状態を記録できた"
 
 ```console
 isuscope run --hypothesis "postsの複合indexで一覧のDB時間を減らす"
-isuscope report latest
-isuscope diff BASE_RUN latest
+isuscope brief latest
+isuscope query latest --base BASE_RUN --view database --group-by sql-shape
 isuscope analyze RUN_ID supported --analysis "p95とDB時間が低下し、スコアも改善した"
 ```
 
@@ -107,8 +107,6 @@ bash -n .isuscope/setup.sh
 isuscope doctor
 ```
 
-当日の詳しい接続手順と受け入れ基準は[`docs/contest-day.md`](docs/contest-day.md)を参照してください。
-
 ## コマンド
 
 | コマンド | 用途 |
@@ -177,9 +175,15 @@ collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope ini
 
 parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例（categoryごとに最初の5件、最大20 category、各1000文字）で、runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure`、`brief`の`benchmark_messages`、`run`終了時の`failure`／`error`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
 
+### 最初のrunで確認すること
+
+`survey-run`を1回通したら、`brief`で次を確かめてから改善へ進みます。`coverage_issues`が空であること、HTTP routeに動的IDが残っていないこと（残っていれば`routes suggest`）、`perf`系collectorが対象nodeで`complete`であること、transitionが0件でないこと（sessionのfieldがある場合）、benchmark stdout/stderrが保存されていることです。collectorが失敗したときは、`isuscope sql "SELECT name, node, status, error FROM collector_runs WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) AND status!='"'"'complete'"'"'" --format tsv`で原因を見て、run directoryの`logs/`にある該当collectorのstderrを開きます。`degraded`はベンチがPASSでもcollectorが失敗した状態です。観測条件を変えたrunは、その前後のscore比較に使いません。
+
+### 得点が何でできているかを確定する
+
 `survey-run`は、負荷構造に加えて**得点が何でできているか**を確定するための1回です。得点の作られ方は問題ごとに違います。ISUCON12本選はエンドポイントごとの重み付き成功数（当日マニュアルの点数表とaccess logだけで再現できます）、ISUCON13は正常に投稿されたライブコメントのtip合計で、後者はaccess logからは出ません。要求の数ではなく要求に入っていた値だからです。そのため、雛形には`score-probe`をコメントで用意しています。負荷の後に自分のアプリやDBへ問い合わせ、得点の源になる値を`score.`で始まるmetricとして出す`survey-run`専用のcollectorです。値はbriefの`score_inputs`に並びます。ベンチ側には触れません。
 
-得点の理解が正しいかは、公開された点数表から計算した値と実scoreの差で確かめます。practice-12では差が0.04%で、present一覧と受取だけで得点の44%を占めることが分かりました。差が大きければ、理解が足りないか、速さが次の負荷を呼ぶ型の問題です。その場合は模型ではなく、1か所だけ遅らせてscoreの変化を見る実験へ進みます。
+手順は4段階です。(1)当日マニュアルの得点計算を読み、項を書き出す。(2)重みで決まる型なら、access logのroute別成功数から模型scoreを出して実scoreと比べる。ISUCON12本選では差が0.04%で、present一覧と受取だけで得点の44%を占めると分かりました。(3)値の合計で決まる型なら`score-probe`でその値を読む。(4)どちらでも差が大きいなら、速さが次の負荷を呼ぶ型を疑い、1か所だけ遅らせてscoreの変化を見る実験へ切り替える。ここを飛ばすと、得点にならない経路を速くする作業に時間を使います。
 
 access logに`conn:$connection`と`msec:$msec`があると、`nginx-series` collectorがベンチ側の接続の使い方も出します。`client.connections_active`（同時に保持している接続数）、`client.connections_opened`（毎bucketの新規接続）、`client.request_gap`（応答を返してから同じ接続に次の要求が来るまでの時間。分位と平均）、`client.connection_requests_mean`／`_max`です。briefの`client` sectionに出ます。サーバーの処理時間が短いのに`client.request_gap`が伸び、`client.connections_active`だけが増えるときは、上限がサーバーの外にあります。
 
@@ -206,12 +210,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。
 
-ALPはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。設計と検証の詳細は次を参照してください。
-
-- [標準observability](docs/standard-observability.md)
-- [Report / Diff architecture](docs/report-architecture.md)
-- [ISUCON13 profile collector受け入れ結果](docs/profile-acceptance-isucon13.md)
-- [検証履歴](docs/validation-history.md)
+ALPはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。標準collectorを最初から全部入れる理由と、その受け入れ基準は[標準observability](docs/standard-observability.md)にあります。
 
 ## License
 
