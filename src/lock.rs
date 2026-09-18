@@ -1,14 +1,19 @@
 //! Exclusive operation lock shared by benchmarks and project scripts.
 //!
-//! The lock is a directory created atomically with `mkdir`, holding an `owner` file with the
-//! holder's pid. A lock whose pid no longer exists is reclaimed. Processes started while the
-//! lock is held receive [`HELD_ENV`] so nested `isuscope lock` calls run without re-locking.
+//! The lock is a `lock` file inside the lock directory, held with `flock(LOCK_EX|LOCK_NB)`.
+//! The kernel releases it when the holder exits, so a crashed holder never leaves a lock behind
+//! and there is no stale-lock reclamation to race over. The `owner` file next to it is written
+//! after the lock is taken and only explains who holds it. The lock file itself is never removed:
+//! unlinking it would let one process hold the lock on an unlinked file while another takes a
+//! newly created one. Processes started while the lock is held receive [`HELD_ENV`] so nested
+//! `isuscope lock` calls run without re-locking.
 
 use anyhow::{Context, Result};
 use chrono::Local;
 use std::{
     env, fmt, fs,
     io::Write,
+    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -46,7 +51,8 @@ pub fn held_by_parent() -> bool {
 
 pub struct OperationLock {
     path: PathBuf,
-    pid: u32,
+    /// Held open for the lifetime of the lock: closing it releases the `flock`.
+    _file: fs::File,
 }
 
 impl OperationLock {
@@ -59,21 +65,26 @@ impl OperationLock {
             fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
-        if fs::create_dir(path).is_err() {
+        fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
+        let lock_path = path.join("lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("cannot open {}", lock_path.display()))?;
+        // SAFETY: the descriptor stays owned by `file`, and LOCK_NB never blocks.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(error).with_context(|| format!("cannot lock {}", lock_path.display()));
+            }
             let owner = fs::read_to_string(path.join("owner")).unwrap_or_default();
-            let stale = owner_pid(&owner).is_some_and(|pid| !process_alive(pid));
-            if stale {
-                let _ = fs::remove_file(path.join("owner"));
-                let _ = fs::remove_dir(path);
+            return Err(LockBusy {
+                path: path.to_path_buf(),
+                owner,
             }
-            if fs::create_dir(path).is_err() {
-                let owner = fs::read_to_string(path.join("owner")).unwrap_or_default();
-                return Err(LockBusy {
-                    path: path.to_path_buf(),
-                    owner,
-                }
-                .into());
-            }
+            .into());
         }
         let pid = std::process::id();
         let owner = format!(
@@ -81,40 +92,20 @@ impl OperationLock {
             Local::now().format("%Y-%m-%dT%H:%M:%S%z")
         );
         if let Err(error) = fs::write(path.join("owner"), owner) {
-            let _ = fs::remove_dir(path);
             return Err(error).with_context(|| format!("cannot write {}/owner", path.display()));
         }
         Ok(Some(Self {
             path: path.to_path_buf(),
-            pid,
+            _file: file,
         }))
     }
 }
 
 impl Drop for OperationLock {
     fn drop(&mut self) {
-        let owner = fs::read_to_string(self.path.join("owner")).unwrap_or_default();
-        if owner_pid(&owner) == Some(self.pid) {
-            let _ = fs::remove_file(self.path.join("owner"));
-            let _ = fs::remove_dir(&self.path);
-        }
+        // The `flock` is released when `_file` closes; drop the explanation with it.
+        let _ = fs::remove_file(self.path.join("owner"));
     }
-}
-
-fn owner_pid(owner: &str) -> Option<u32> {
-    owner
-        .lines()
-        .find_map(|line| line.strip_prefix("pid="))
-        .and_then(|value| value.trim().parse().ok())
-}
-
-fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks for existence and permission.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Runs `command` while holding the lock and returns its exit status code.
@@ -171,17 +162,4 @@ pub fn run_locked(path: &Path, command: &[String]) -> Result<i32> {
     }
     drop(guard);
     Ok(code)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn owner_pid_is_parsed_from_the_owner_file() {
-        assert_eq!(owner_pid("pid=42\nstarted_at=x\n"), Some(42));
-        assert_eq!(owner_pid("operation=x\n"), None);
-        assert!(process_alive(std::process::id()));
-        assert!(!process_alive(99_999_999));
-    }
 }

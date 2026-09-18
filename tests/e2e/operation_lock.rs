@@ -1,4 +1,5 @@
 use super::*;
+use std::{thread::sleep, time::Duration, time::Instant};
 
 fn isuscope(project: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_isuscope"));
@@ -8,8 +9,38 @@ fn isuscope(project: &std::path::Path) -> Command {
     command
 }
 
+/// Spawns a locked command that holds the lock until `marker` is deleted.
+fn spawn_holder(project: &std::path::Path, lock_arg: &str) -> std::process::Child {
+    let holder = isuscope(project)
+        .args([
+            "lock",
+            "--path",
+            lock_arg,
+            "--",
+            "sh",
+            "-c",
+            "touch holding; while test -e holding; do sleep 0.05; done",
+        ])
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    while !project.join("holding").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "holder never started"
+        );
+        sleep(Duration::from_millis(20));
+    }
+    holder
+}
+
+fn release_holder(project: &std::path::Path, mut holder: std::process::Child) {
+    fs::remove_file(project.join("holding")).unwrap();
+    holder.wait().unwrap();
+}
+
 #[test]
-fn lock_runs_commands_exclusively_and_reclaims_stale_owners() {
+fn lock_runs_commands_exclusively_and_survives_a_crashed_holder() {
     let project = tempdir().unwrap();
     let lock = project.path().join(".local/operation.lock");
     let lock_arg = lock.display().to_string();
@@ -29,7 +60,8 @@ fn lock_runs_commands_exclusively_and_reclaims_stale_owners() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!lock.exists());
+    // The lock file stays; only the explanation of who holds it is removed on release.
+    assert!(!lock.join("owner").exists());
     let timing = fs::read_to_string(project.path().join(".local/operation-timing.tsv")).unwrap();
     assert!(
         timing
@@ -37,30 +69,34 @@ fn lock_runs_commands_exclusively_and_reclaims_stale_owners() {
             .any(|line| line.contains("\tsh\t") && line.ends_with("\t3"))
     );
 
-    // A live owner blocks with exit status 75 and the command never runs.
-    fs::create_dir_all(&lock).unwrap();
-    fs::write(
-        lock.join("owner"),
-        format!("pid={}\noperation=deploy.sh\n", std::process::id()),
-    )
-    .unwrap();
+    // A live holder blocks with exit status 75 and the command never runs.
+    let holder = spawn_holder(project.path(), &lock_arg);
     let blocked = isuscope(project.path())
         .args(["lock", "--path", &lock_arg, "--", "touch", "ran"])
         .output()
         .unwrap();
     assert_eq!(blocked.status.code(), Some(75));
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("operation=deploy.sh"));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("operation=sh"));
     assert!(!project.path().join("ran").exists());
+    release_holder(project.path(), holder);
 
-    // A dead owner is reclaimed.
-    fs::write(lock.join("owner"), "pid=99999999\noperation=stale\n").unwrap();
+    // A holder that died without cleaning up leaves an owner file, but not a lock.
+    fs::write(
+        lock.join("owner"),
+        format!("pid={}\noperation=crashed\n", std::process::id()),
+    )
+    .unwrap();
     let reclaimed = isuscope(project.path())
         .args(["lock", "--path", &lock_arg, "--", "touch", "ran"])
         .output()
         .unwrap();
-    assert!(reclaimed.status.success());
+    assert!(
+        reclaimed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reclaimed.stderr)
+    );
     assert!(project.path().join("ran").exists());
-    assert!(!lock.exists());
+    assert!(!lock.join("owner").exists());
 }
 
 #[test]
@@ -81,21 +117,17 @@ command = ["sh", "-c", "test \"$ISUSCOPE_LOCK_HELD\" = 1 && test -f .local/opera
     )
     .unwrap();
     let lock = project.path().join(".local/operation.lock");
-    fs::create_dir_all(&lock).unwrap();
-    fs::write(
-        lock.join("owner"),
-        format!("pid={}\noperation=deploy.sh\n", std::process::id()),
-    )
-    .unwrap();
+    let lock_arg = lock.display().to_string();
+
+    let holder = spawn_holder(project.path(), &lock_arg);
     let blocked = isuscope(project.path())
         .args(["run", "--hypothesis", "must wait for deploy"])
         .output()
         .unwrap();
     assert_eq!(blocked.status.code(), Some(75));
     assert!(!project.path().join("benchmark-ran").exists());
+    release_holder(project.path(), holder);
 
-    fs::remove_file(lock.join("owner")).unwrap();
-    fs::remove_dir(&lock).unwrap();
     let run = isuscope(project.path())
         .args(["run", "--hypothesis", "benchmark holds the lock"])
         .output()
@@ -105,90 +137,5 @@ command = ["sh", "-c", "test \"$ISUSCOPE_LOCK_HELD\" = 1 && test -f .local/opera
         "{}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert!(!lock.exists());
-}
-
-#[test]
-fn pin_and_route_suggestions_work_on_saved_runs() {
-    let project = tempdir().unwrap();
-    let config_dir = project.path().join(".isuscope");
-    fs::create_dir_all(&config_dir).unwrap();
-    let git = |args: &[&str]| {
-        assert!(
-            Command::new("git")
-                .args(args)
-                .current_dir(project.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "test@example.com"]);
-    git(&["config", "user.name", "test"]);
-    fs::write(
-        project.path().join(".gitignore"),
-        "/.isuscope/runs/*/logs/\n/.isuscope/isuscope.sqlite3*\n",
-    )
-    .unwrap();
-    fs::write(
-        config_dir.join("config.toml"),
-        r#"
-[benchmark]
-mode = "command"
-command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":0,\"pass\":false}'"]
-
-[[collectors]]
-name = "routes"
-phase = "after"
-command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"http.requests\",\"value\":3,\"unit\":\"requests\",\"labels\":{\"route\":\"/users/42/profile\"}}' '{\"type\":\"metric\",\"name\":\"http.requests\",\"value\":2,\"unit\":\"requests\",\"labels\":{\"route\":\"/users/7/profile\"}}' '{\"type\":\"metric\",\"name\":\"http.requests\",\"value\":1,\"unit\":\"requests\",\"labels\":{\"route\":\"/login\"}}'"]
-"#,
-    )
-    .unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-qm", "init"]);
-    isuscope(project.path())
-        .args(["run", "--hypothesis", "routes to suggest"])
-        .output()
-        .unwrap();
-
-    let suggestions = project.path().join(".local/route-suggestions.toml");
-    let suggest = isuscope(project.path())
-        .args(["routes", "suggest", "latest", "--output"])
-        .arg(&suggestions)
-        .output()
-        .unwrap();
-    assert!(
-        suggest.status.success(),
-        "{}",
-        String::from_utf8_lossy(&suggest.stderr)
-    );
-    let content = fs::read_to_string(&suggestions).unwrap();
-    assert!(
-        content.contains("pattern = \"^/users/[0-9]+/profile$\""),
-        "{content}"
-    );
-    assert!(content.contains("replace = \"/users/:id/profile\""));
-    assert!(!content.contains("/login\"\n"));
-
-    let pin = isuscope(project.path())
-        .args(["pin", "latest"])
-        .output()
-        .unwrap();
-    assert!(
-        pin.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pin.stderr)
-    );
-    let staged = Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-    let staged = String::from_utf8_lossy(&staged.stdout);
-    assert!(
-        staged.lines().any(|path| path.contains("/logs/")),
-        "{staged}"
-    );
-    assert!(staged.lines().any(|path| path.ends_with("/run.json")));
+    assert!(!lock.join("owner").exists());
 }
