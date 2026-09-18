@@ -262,23 +262,27 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert_eq!(series["rows"][0]["from_seconds"], 0);
     assert!(series["rows"][0]["cpu_percent_average"].is_null());
 
-    let metrics = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .args(["metrics", "latest"])
+    // What `metrics` used to print is one SQL query over the index.
+    let inventory = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "sql",
+            "SELECT m.name, COUNT(*) samples, SUM(m.observed_at IS NOT NULL) timestamped, \
+             j.key label, j.value example \
+             FROM metrics m, json_each(m.labels_json) j WHERE m.name='cpu' GROUP BY m.name, j.key",
+        ])
         .current_dir(project.path())
         .output()
         .unwrap();
-    assert!(metrics.status.success());
-    let metrics: serde_json::Value = serde_json::from_slice(&metrics.stdout).unwrap();
-    assert_eq!(metrics["schema_version"], 1);
-    let cpu = metrics["metrics"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|metric| metric["name"] == "cpu")
-        .unwrap();
-    assert_eq!(cpu["timestamped_rows"], 1);
-    assert_eq!(cpu["labels"][0]["key"], "collector");
-    assert_eq!(cpu["labels"][0]["examples"][0], "calculated");
+    assert!(
+        inventory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inventory.stderr)
+    );
+    let inventory: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    let cpu = &inventory["rows"][0];
+    assert_eq!(cpu["timestamped"], 1);
+    assert_eq!(cpu["label"], "collector");
+    assert_eq!(cpu["example"], "calculated");
 
     let filtered = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args([

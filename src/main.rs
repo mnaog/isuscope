@@ -96,12 +96,6 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
         format: isuscope::sql::SqlFormat,
     },
-    /// metric名、時刻範囲、label cardinalityをJSONで出力します。
-    Metrics {
-        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
-        #[arg(default_value = "latest")]
-        run: String,
-    },
     /// 時刻付きmetricをbucket化したJSONで出力します。
     Series {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
@@ -601,10 +595,6 @@ async fn real_main(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
-        Commands::Metrics { run } => {
-            show_metrics(&config, &run)?;
-            Ok(true)
-        }
         Commands::Series {
             run,
             metrics,
@@ -950,88 +940,6 @@ fn parse_label_filter(value: &str) -> std::result::Result<(String, String), Stri
         return Err("label key and value must not be empty".into());
     }
     Ok((key.into(), value.into()))
-}
-
-#[derive(Default)]
-struct MetricInventory {
-    rows: usize,
-    timestamped: usize,
-    units: BTreeSet<String>,
-    first: Option<chrono::DateTime<chrono::Utc>>,
-    last: Option<chrono::DateTime<chrono::Utc>>,
-    labels: BTreeMap<String, BTreeSet<String>>,
-}
-
-#[derive(serde::Serialize)]
-struct MetricsOutput {
-    schema_version: u32,
-    run_id: String,
-    metrics: Vec<MetricInventoryOutput>,
-}
-
-#[derive(serde::Serialize)]
-struct MetricInventoryOutput {
-    name: String,
-    rows: usize,
-    timestamped_rows: usize,
-    units: Vec<String>,
-    first_observed_at: Option<String>,
-    last_observed_at: Option<String>,
-    labels: Vec<LabelInventoryOutput>,
-}
-
-#[derive(serde::Serialize)]
-struct LabelInventoryOutput {
-    key: String,
-    cardinality: usize,
-    examples: Vec<String>,
-}
-
-fn show_metrics(config: &LoadedConfig, requested: &str) -> Result<()> {
-    let store = Store::open(&config.data_dir)?;
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run `{requested}` was not found"))?;
-    let mut inventory = BTreeMap::<String, MetricInventory>::new();
-    for metric in store.metrics(&id)? {
-        let entry = inventory.entry(metric.name).or_default();
-        entry.rows += 1;
-        entry.units.insert(metric.unit);
-        if let Some(at) = metric.timestamp {
-            entry.timestamped += 1;
-            entry.first = Some(entry.first.map_or(at, |current| current.min(at)));
-            entry.last = Some(entry.last.map_or(at, |current| current.max(at)));
-        }
-        for (key, value) in metric.labels {
-            entry.labels.entry(key).or_default().insert(value);
-        }
-    }
-    let metrics = inventory
-        .into_iter()
-        .map(|(name, item)| MetricInventoryOutput {
-            name,
-            rows: item.rows,
-            timestamped_rows: item.timestamped,
-            units: item.units.into_iter().collect(),
-            first_observed_at: item.first.map(|value| value.to_rfc3339()),
-            last_observed_at: item.last.map(|value| value.to_rfc3339()),
-            labels: item
-                .labels
-                .into_iter()
-                .map(|(key, values)| LabelInventoryOutput {
-                    key,
-                    cardinality: values.len(),
-                    examples: values.into_iter().take(4).collect(),
-                })
-                .collect(),
-        })
-        .collect();
-    write_stdout_json(&MetricsOutput {
-        schema_version: 1,
-        run_id: id,
-        metrics,
-    })?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

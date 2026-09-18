@@ -122,7 +122,6 @@ isuscope doctor
 | `pin <run>` | runを生ログ（`logs/`）ごとGitへstageする |
 | `routes suggest [run]` | 動的IDの残るHTTP routeから`[[routes]]`候補を作る。`--output`で書き出し先を指定する |
 | `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
-| `metrics` | metric名、時刻範囲、label cardinalityをJSONで調べる |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
@@ -130,7 +129,18 @@ isuscope doctor
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `ui` | 人間向けHTML UIをlocalhostで起動する |
 
-`list`、`brief`、`metrics`、`series`、`query`、`sql`は機械処理しやすいJSONを返します。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取れ、人が見る場合は`ui`に同じ表示が残っています。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+`list`、`brief`、`series`、`query`、`sql`は機械処理しやすいJSONを返します。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取れ、人が見る場合は`ui`に同じ表示が残っています。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+
+どのmetricがあるかは`sql`で調べます。runごとの件数・単位・時系列の有無と、labelの種類がこれで分かります。
+
+```console
+isuscope sql "SELECT name, COUNT(*) samples, SUM(observed_at IS NOT NULL) timestamped,
+  GROUP_CONCAT(DISTINCT unit) units FROM metrics
+  WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1)
+  GROUP BY name ORDER BY samples DESC" --format tsv
+isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metrics m, json_each(m.labels_json) j
+  WHERE m.run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) GROUP BY j.key" --format tsv
+```
 
 ```console
 isuscope brief latest
