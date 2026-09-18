@@ -92,6 +92,184 @@ pub struct ScoreComparison {
     pub candidate_run_id: String,
     pub score: crate::diff::ScoreDiff,
     pub sample_count_per_side: usize,
+    /// 2つのrunが同じ前提で比べられるか。差が出た理由の候補であって、採否の判定ではありません。
+    pub conditions: Vec<ComparisonCondition>,
+}
+
+/// 比較の前提1つ分。`unknown`を`same`に読み替えないための区別です。
+#[derive(Debug, Serialize)]
+pub struct ComparisonCondition {
+    pub name: &'static str,
+    pub state: ConditionState,
+    /// 何が違ったか（`changed`のとき）、または何が分からないか（`unknown`のとき）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub detail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionState {
+    Same,
+    Changed,
+    Unknown,
+}
+
+fn condition(
+    name: &'static str,
+    state: ConditionState,
+    detail: Vec<String>,
+) -> ComparisonCondition {
+    ComparisonCondition {
+        name,
+        state,
+        detail,
+    }
+}
+
+fn compare_hash(base: &str, candidate: &str) -> ConditionState {
+    if base.is_empty() || candidate.is_empty() {
+        ConditionState::Unknown
+    } else if base == candidate {
+        ConditionState::Same
+    } else {
+        ConditionState::Changed
+    }
+}
+
+/// 比較の前提を、既に保存しているhashとtagだけから組み立てます。
+/// ベンチ側の条件はこちらから観測できないため、`bench:`tagが無ければ`unknown`のままにします。
+fn comparison_conditions(
+    base: &crate::model::RunManifest,
+    candidate: &crate::model::RunManifest,
+    base_environment: Option<std::collections::BTreeMap<String, String>>,
+    candidate_environment: Option<std::collections::BTreeMap<String, String>>,
+) -> Vec<ComparisonCondition> {
+    let mut conditions = Vec::new();
+
+    let source_state = compare_hash(&base.source.state_sha256, &candidate.source.state_sha256);
+    let mut source_detail = Vec::new();
+    if source_state == ConditionState::Changed {
+        match (&base.source.commit_hash, &candidate.source.commit_hash) {
+            (Some(before), Some(after)) if before != after => {
+                source_detail.push(format!(
+                    "commit {} -> {}",
+                    &before[..12.min(before.len())],
+                    &after[..12.min(after.len())]
+                ));
+            }
+            _ => {}
+        }
+        if base.source.dirty || candidate.source.dirty {
+            source_detail.push("uncommitted changes".into());
+        }
+    }
+    conditions.push(condition("source", source_state, source_detail));
+
+    let mut observation_detail = Vec::new();
+    let mut observation_state = compare_hash(
+        &base.tooling.config_sha256,
+        &candidate.tooling.config_sha256,
+    );
+    if observation_state == ConditionState::Changed {
+        observation_detail.push("config.toml".into());
+    }
+    for (name, before, after) in [
+        (
+            "routes.toml",
+            base.tooling.routes_sha256.clone(),
+            candidate.tooling.routes_sha256.clone(),
+        ),
+        (
+            "setup script",
+            base.tooling.setup_script_sha256.clone(),
+            candidate.tooling.setup_script_sha256.clone(),
+        ),
+    ] {
+        if before != after {
+            observation_state = ConditionState::Changed;
+            observation_detail.push(name.into());
+        }
+    }
+    for name in base
+        .tooling
+        .extra_files_sha256
+        .keys()
+        .chain(candidate.tooling.extra_files_sha256.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if base.tooling.extra_files_sha256.get(name)
+            != candidate.tooling.extra_files_sha256.get(name)
+        {
+            observation_state = ConditionState::Changed;
+            observation_detail.push(name.clone());
+        }
+    }
+    if base.tooling.isuscope_version != candidate.tooling.isuscope_version {
+        observation_state = ConditionState::Changed;
+        observation_detail.push(format!(
+            "isuscope {} -> {}",
+            base.tooling.isuscope_version, candidate.tooling.isuscope_version
+        ));
+    }
+    conditions.push(condition(
+        "observation",
+        observation_state,
+        observation_detail,
+    ));
+
+    let environment = match (base_environment, candidate_environment) {
+        (Some(before), Some(after)) => {
+            let mut differences = before
+                .keys()
+                .chain(after.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter(|key| before.get(*key) != after.get(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            if differences.is_empty() {
+                condition("environment", ConditionState::Same, Vec::new())
+            } else {
+                let total = differences.len();
+                differences.truncate(5);
+                let shown = differences.len();
+                if total > shown {
+                    differences.push(format!("and {} more", total - shown));
+                }
+                condition("environment", ConditionState::Changed, differences)
+            }
+        }
+        _ => condition(
+            "environment",
+            ConditionState::Unknown,
+            vec!["no fingerprints recorded".into()],
+        ),
+    };
+    conditions.push(environment);
+
+    let bench_tag = |run: &crate::model::RunManifest| {
+        run.tags
+            .iter()
+            .find(|tag| tag.starts_with("bench:"))
+            .cloned()
+    };
+    let benchmark = match (bench_tag(base), bench_tag(candidate)) {
+        (Some(before), Some(after)) if before == after => {
+            condition("benchmark", ConditionState::Same, vec![before])
+        }
+        (Some(before), Some(after)) => condition(
+            "benchmark",
+            ConditionState::Changed,
+            vec![format!("{before} -> {after}")],
+        ),
+        _ => condition(
+            "benchmark",
+            ConditionState::Unknown,
+            vec!["tag the runs with `bench:<condition>` to compare".into()],
+        ),
+    };
+    conditions.push(benchmark);
+    conditions
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -136,11 +314,18 @@ impl Store {
             .and_then(|a| a.base_run_id.as_ref())
             .map(|id| -> Result<_> {
                 let base = self.load(id)?;
+                let conditions = comparison_conditions(
+                    &base,
+                    run,
+                    self.fingerprint_index(&base.id)?,
+                    self.fingerprint_index(&run.id)?,
+                );
                 Ok(ScoreComparison {
                     base_run_id: id.clone(),
                     candidate_run_id: run.id.clone(),
                     score: crate::diff::score_diff(base.benchmark.score, run.benchmark.score),
                     sample_count_per_side: 1,
+                    conditions,
                 })
             })
             .transpose()?;

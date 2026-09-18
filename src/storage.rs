@@ -398,6 +398,41 @@ impl Store {
         serde_json::from_slice(&raw).context("invalid run manifest")
     }
 
+    /// runの環境fingerprintを`名前 + labels -> 値`で返します。1つも記録していないrunは
+    /// `None`（「同じ」ではなく「不明」）を返します。
+    pub fn fingerprint_index(
+        &self,
+        id: &str,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>> {
+        let mut statement = self.connection.prepare(
+            "SELECT name, value, labels_json FROM fingerprints WHERE run_id=?1 ORDER BY name, labels_json",
+        )?;
+        let rows = statement.query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut index = std::collections::BTreeMap::new();
+        for row in rows {
+            let (name, value, labels) = row?;
+            let node = serde_json::from_str::<serde_json::Value>(&labels)
+                .ok()
+                .and_then(|labels| {
+                    labels
+                        .get("node")
+                        .and_then(|node| node.as_str().map(str::to_owned))
+                });
+            let key = match node {
+                Some(node) => format!("{name}@{node}"),
+                None => name,
+            };
+            index.insert(key, value);
+        }
+        Ok((!index.is_empty()).then_some(index))
+    }
+
     pub fn metrics(&self, id: &str) -> Result<Vec<Metric>> {
         let mut statement = self.connection.prepare(
             "SELECT name, value, unit, observed_at, labels_json FROM metrics WHERE run_id=?1 ORDER BY COALESCE(observed_at, ''), id",
