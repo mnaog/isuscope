@@ -3,7 +3,7 @@ use crate::{
     query::{self, MetricQueryOutput, MetricQueryRow},
     report::{
         CoverageSummary, CpuSummary, DatabaseSummary, HostSummary, HttpRouteSummary,
-        ProfileArtifact, RunDiagnostics,
+        ProfileArtifact, RunDiagnostics, UpstreamSummary,
     },
 };
 use serde::Serialize;
@@ -26,6 +26,8 @@ pub struct BriefOutput {
     pub host: BriefSection<HostSummary>,
     /// Load-generator side, when the access log carries `$connection` and `$msec`.
     pub client: BriefSection<HostSummary>,
+    /// Per backend, when the access log carries `$upstream_addr` and the upstream times.
+    pub upstreams: BriefSection<UpstreamSummary>,
     pub transitions: BriefSection<Transition>,
     pub artifact_issues: BriefSection<ProfileArtifact>,
     pub unavailable_artifact_count: usize,
@@ -164,6 +166,7 @@ pub fn build(
         cpu: section(diagnostics.cpu, limit),
         host: section(host, limit),
         client: section(client, limit),
+        upstreams: section(diagnostics.upstreams, limit),
         transitions: section(diagnostics.transitions, limit),
         artifact_issues: section(
             diagnostics

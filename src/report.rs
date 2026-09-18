@@ -19,6 +19,7 @@ pub struct RunDiagnostics {
     pub host: Vec<HostSummary>,
     /// Load-generator side: connections held and opened, and the wait between requests.
     pub client: Vec<HostSummary>,
+    pub upstreams: Vec<UpstreamSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: Vec<Transition>,
     pub run_logs: PathBuf,
@@ -36,6 +37,7 @@ pub struct RunReport {
     pub cpu: ReportSection<CpuSummary>,
     pub host: ReportSection<HostSummary>,
     pub client: ReportSection<HostSummary>,
+    pub upstreams: ReportSection<UpstreamSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: ReportSection<Transition>,
     pub run_logs: PathBuf,
@@ -86,6 +88,20 @@ pub struct CpuSummary {
     pub sample_percent: f64,
 }
 
+/// One upstream (backend) as seen by the edge: how many requests it served, how many were
+/// retried, and where their time went (connecting, generating headers, sending the response).
+#[derive(Debug, Default, Serialize, PartialEq)]
+pub struct UpstreamSummary {
+    pub node: String,
+    pub upstream: String,
+    pub requests: f64,
+    pub retried_requests: f64,
+    pub connect_p95_ms: Option<f64>,
+    pub header_p95_ms: Option<f64>,
+    pub response_mean_ms: Option<f64>,
+    pub response_p95_ms: Option<f64>,
+}
+
 #[derive(Debug, Default, Serialize, PartialEq)]
 pub struct HostSummary {
     pub node: String,
@@ -134,6 +150,7 @@ pub fn diagnose(
     let cpu = cpu_symbols(&summary_metrics);
     let host = host_metrics(&summary_metrics, &series_metrics);
     let client = client_metrics(&summary_metrics, &series_metrics);
+    let upstreams = upstream_summaries(&summary_metrics);
     let artifacts = profile_artifacts(&run.collectors, &run_logs, latest_logs.as_deref());
     RunDiagnostics {
         run,
@@ -143,6 +160,7 @@ pub fn diagnose(
         cpu,
         host,
         client,
+        upstreams,
         artifacts,
         transitions,
         run_logs,
@@ -162,6 +180,7 @@ impl RunDiagnostics {
             cpu: section(self.cpu),
             host: section(self.host),
             client: section(self.client),
+            upstreams: section(self.upstreams),
             artifacts: self.artifacts,
             transitions: section(self.transitions),
             run_logs: self.run_logs,
@@ -601,6 +620,42 @@ pub fn cpu_symbols(metrics: &[Metric]) -> Vec<CpuSummary> {
     values
 }
 
+pub fn upstream_summaries(summary: &[Metric]) -> Vec<UpstreamSummary> {
+    let mut rows = BTreeMap::<(String, String), UpstreamSummary>::new();
+    for metric in summary.iter().filter(|metric| metric.timestamp.is_none()) {
+        let Some(upstream) = metric.labels.get("upstream") else {
+            continue;
+        };
+        let node = label(metric, "node");
+        let row = rows
+            .entry((node.clone(), upstream.clone()))
+            .or_insert_with(|| UpstreamSummary {
+                node,
+                upstream: upstream.clone(),
+                ..Default::default()
+            });
+        let quantile = metric.labels.get("quantile").map(String::as_str);
+        match (metric.name.as_str(), quantile) {
+            ("http.upstream_requests", _) => row.requests = metric.value,
+            ("http.upstream_retried_requests", _) => row.retried_requests = metric.value,
+            ("http.upstream_connect_duration", Some("0.95")) => {
+                row.connect_p95_ms = Some(metric.value)
+            }
+            ("http.upstream_header_duration", Some("0.95")) => {
+                row.header_p95_ms = Some(metric.value)
+            }
+            ("http.upstream_response_duration", Some("0.95")) => {
+                row.response_p95_ms = Some(metric.value)
+            }
+            ("http.upstream_response_duration_mean", _) => {
+                row.response_mean_ms = Some(metric.value)
+            }
+            _ => {}
+        }
+    }
+    rows.into_values().collect()
+}
+
 pub fn host_metrics(summary: &[Metric], series: &[Metric]) -> Vec<HostSummary> {
     summarize_metrics(summary, series, is_host_metric)
 }
@@ -827,7 +882,9 @@ fn divide(numerator: f64, denominator: f64) -> Option<f64> {
     (denominator > 0.0).then(|| numerator / denominator)
 }
 fn is_host_metric(metric: &Metric) -> bool {
-    metric.name.starts_with("host.") || metric.name.starts_with("service.")
+    metric.name.starts_with("host.")
+        || metric.name.starts_with("service.")
+        || metric.name.starts_with("mysql.")
 }
 
 /// How the load generator drove the system: connections it held and opened, requests per
@@ -843,6 +900,84 @@ pub fn client_metrics(summary: &[Metric], series: &[Metric]) -> Vec<HostSummary>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_rows_keep_requests_retries_and_p95_per_backend() {
+        let labels = |upstream: &str, extra: &[(&str, &str)]| {
+            let mut labels = BTreeMap::from([
+                ("node".to_string(), "edge".to_string()),
+                ("upstream".to_string(), upstream.to_string()),
+            ]);
+            labels.extend(
+                extra
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string())),
+            );
+            labels
+        };
+        let metric = |name: &str, value: f64, labels: BTreeMap<String, String>| Metric {
+            name: name.into(),
+            value,
+            unit: "ms".into(),
+            timestamp: None,
+            labels,
+        };
+        let rows = upstream_summaries(&[
+            metric(
+                "http.upstream_requests",
+                120.0,
+                labels("10.0.0.2:8080", &[]),
+            ),
+            metric(
+                "http.upstream_retried_requests",
+                3.0,
+                labels("10.0.0.2:8080", &[]),
+            ),
+            metric(
+                "http.upstream_connect_duration",
+                2.5,
+                labels("10.0.0.2:8080", &[("quantile", "0.95")]),
+            ),
+            metric(
+                "http.upstream_response_duration",
+                40.0,
+                labels("10.0.0.2:8080", &[("quantile", "0.95")]),
+            ),
+            metric(
+                "http.upstream_response_duration_mean",
+                12.0,
+                labels("10.0.0.2:8080", &[]),
+            ),
+            metric("http.upstream_requests", 80.0, labels("10.0.0.3:8080", &[])),
+            // A per-route metric without an upstream label stays out of these rows.
+            metric(
+                "http.requests",
+                200.0,
+                BTreeMap::from([("route".to_string(), "/items".to_string())]),
+            ),
+        ]);
+        assert_eq!(
+            rows,
+            vec![
+                UpstreamSummary {
+                    node: "edge".into(),
+                    upstream: "10.0.0.2:8080".into(),
+                    requests: 120.0,
+                    retried_requests: 3.0,
+                    connect_p95_ms: Some(2.5),
+                    header_p95_ms: None,
+                    response_mean_ms: Some(12.0),
+                    response_p95_ms: Some(40.0),
+                },
+                UpstreamSummary {
+                    node: "edge".into(),
+                    upstream: "10.0.0.3:8080".into(),
+                    requests: 80.0,
+                    ..Default::default()
+                },
+            ]
+        );
+    }
 
     #[test]
     fn summarizes_http_metrics_without_inventing_cross_route_scores() {

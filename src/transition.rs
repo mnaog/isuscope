@@ -86,11 +86,23 @@ struct RouteStats {
     reused_requests: u64,
 }
 
+/// Per upstream address, from `$upstream_addr` and the upstream timings. Answers which
+/// backend was slow, and whether the time went into connecting, generating or transferring.
+#[derive(Default)]
+struct UpstreamStats {
+    requests: u64,
+    retried_requests: u64,
+    connect_ms: Vec<f64>,
+    header_ms: Vec<f64>,
+    response_ms: Vec<f64>,
+}
+
 struct ReadState<'a> {
     sessions: &'a mut BTreeMap<String, Vec<Event>>,
     route_stats: &'a mut BTreeMap<(String, String, String), RouteStats>,
     bucket_stats: &'a mut BTreeMap<(DateTime<Utc>, String, String, String), RouteStats>,
     connections: &'a mut ConnectionStats,
+    upstreams: &'a mut BTreeMap<(String, String), UpstreamStats>,
     interval: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
@@ -130,6 +142,9 @@ pub struct TransitionOptions<'a> {
     pub bytes_field: &'a str,
     pub connection_requests_field: &'a str,
     pub connection_field: &'a str,
+    pub upstream_field: &'a str,
+    pub upstream_connect_time_field: &'a str,
+    pub upstream_header_time_field: &'a str,
     /// Log field holding the response end as epoch seconds (nginx `$msec`).
     pub end_time_field: &'a str,
     pub series_only: bool,
@@ -144,6 +159,7 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
     let mut bucket_stats: BTreeMap<(DateTime<Utc>, String, String, String), RouteStats> =
         BTreeMap::new();
     let mut connections = ConnectionStats::default();
+    let mut upstreams: BTreeMap<(String, String), UpstreamStats> = BTreeMap::new();
     let interval = benchmark_interval(options.run_dir);
     for path in paths {
         let node = node_from_path(&path, options.prefix);
@@ -152,12 +168,14 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
             route_stats: &mut route_stats,
             bucket_stats: &mut bucket_stats,
             connections: &mut connections,
+            upstreams: &mut upstreams,
             interval,
         };
         read_log(&path, &node, &options, &rules, &mut state)?;
     }
 
     emit_connection_metrics(&mut connections)?;
+    emit_upstream_metrics(&mut upstreams)?;
     let mut edges: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     if options.series_only {
         emit_bucket_metrics(&mut bucket_stats)?;
@@ -345,6 +363,88 @@ fn record_connection(
                 .or_default() += 1;
         }
     }
+}
+
+/// Splits an nginx upstream field. Retries are comma separated, and a value can be `-`.
+fn upstream_values(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn record_upstream(
+    fields: &BTreeMap<&str, &str>,
+    node: &str,
+    options: &TransitionOptions<'_>,
+    state: &mut ReadState<'_>,
+) {
+    let Some(addresses) = fields
+        .get(options.upstream_field)
+        .map(|v| upstream_values(v))
+    else {
+        return;
+    };
+    // The last address is the one that served the response; earlier ones were retried.
+    let Some(address) = addresses.last().filter(|address| **address != "-") else {
+        return;
+    };
+    let stats = state
+        .upstreams
+        .entry((node.to_owned(), (*address).to_owned()))
+        .or_default();
+    stats.requests += 1;
+    if addresses.len() > 1 {
+        stats.retried_requests += 1;
+    }
+    // Times are per attempt; their total is what the request actually spent on that upstream.
+    for (field, values) in [
+        (options.upstream_connect_time_field, &mut stats.connect_ms),
+        (options.upstream_header_time_field, &mut stats.header_ms),
+        (options.upstream_time_field, &mut stats.response_ms),
+    ] {
+        let Some(raw) = fields.get(field) else {
+            continue;
+        };
+        let parts = upstream_values(raw);
+        if parts.iter().all(|part| *part == "-") {
+            continue;
+        }
+        values.push(parts.into_iter().filter_map(parse_seconds_ms).sum());
+    }
+}
+
+fn emit_upstream_metrics(upstreams: &mut BTreeMap<(String, String), UpstreamStats>) -> Result<()> {
+    for ((node, upstream), stats) in upstreams {
+        let labels = BTreeMap::from([
+            ("node".into(), node.clone()),
+            ("upstream".into(), upstream.clone()),
+        ]);
+        emit_metric(
+            "http.upstream_requests",
+            stats.requests as f64,
+            "requests",
+            labels.clone(),
+        )?;
+        if stats.retried_requests > 0 {
+            emit_metric(
+                "http.upstream_retried_requests",
+                stats.retried_requests as f64,
+                "requests",
+                labels.clone(),
+            )?;
+        }
+        for (name, values) in [
+            ("http.upstream_connect_duration", &mut stats.connect_ms),
+            ("http.upstream_header_duration", &mut stats.header_ms),
+            ("http.upstream_response_duration", &mut stats.response_ms),
+        ] {
+            emit_duration_summary(name, values, &labels)?;
+            emit_quantiles(name, values, &labels)?;
+        }
+    }
+    Ok(())
 }
 
 fn bucket_start(epoch_seconds: f64) -> Option<DateTime<Utc>> {
@@ -631,6 +731,9 @@ fn read_log(
             continue;
         }
         record_connection(&fields, node, options, state, at);
+        if !options.series_only || within_interval(at, state.interval) {
+            record_upstream(&fields, node, options, state);
+        }
         if options.series_only {
             let Some(at) = at else { continue };
             let Some(bucket_at) = DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) else {
@@ -908,17 +1011,22 @@ mod tests {
             bytes_field: "size",
             connection_requests_field: "connreqs",
             connection_field: "conn",
+            upstream_field: "upstream_addr",
+            upstream_connect_time_field: "upstream_connect",
+            upstream_header_time_field: "upstream_header",
             end_time_field: "msec",
             series_only: false,
         };
         let mut route_stats = BTreeMap::new();
         let mut bucket_stats = BTreeMap::new();
         let mut connections = ConnectionStats::default();
+        let mut upstreams = BTreeMap::new();
         let mut state = ReadState {
             sessions: &mut sessions,
             route_stats: &mut route_stats,
             bucket_stats: &mut bucket_stats,
             connections: &mut connections,
+            upstreams: &mut upstreams,
             interval: None,
         };
         read_log(
@@ -949,6 +1057,7 @@ mod tests {
             route_stats: &mut bounded_routes,
             bucket_stats: &mut bounded_buckets,
             connections: &mut bounded_connections,
+            upstreams: &mut upstreams,
             interval: Some((
                 "2026-08-26T01:00:01Z".parse().unwrap(),
                 "2026-08-26T01:00:01Z".parse().unwrap(),
@@ -1004,6 +1113,9 @@ mod tests {
             bytes_field: "size",
             connection_requests_field: "connreqs",
             connection_field: "conn",
+            upstream_field: "upstream_addr",
+            upstream_connect_time_field: "upstream_connect",
+            upstream_header_time_field: "upstream_header",
             end_time_field: "msec",
             series_only: true,
         };
@@ -1011,11 +1123,13 @@ mod tests {
         let mut route_stats = BTreeMap::new();
         let mut bucket_stats = BTreeMap::new();
         let mut connections = ConnectionStats::default();
+        let mut upstreams = BTreeMap::new();
         let mut state = ReadState {
             sessions: &mut sessions,
             route_stats: &mut route_stats,
             bucket_stats: &mut bucket_stats,
             connections: &mut connections,
+            upstreams: &mut upstreams,
             interval: None,
         };
         read_log(
@@ -1046,6 +1160,84 @@ mod tests {
                 .keys()
                 .all(|(at, _)| at.timestamp() % BUCKET_SECONDS == 0)
         );
+    }
+
+    #[test]
+    fn upstream_stats_follow_retries_and_missing_times() {
+        let dir = tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let output = fs::File::create(logs.join("nginx-isu1.zst")).unwrap();
+        let mut encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
+        // A retried request, a plain one, and a response nginx served without an upstream.
+        for (addr, connect, header, response) in [
+            (
+                "10.0.0.2:8080, 10.0.0.3:8080",
+                "0.001, 0.002",
+                "0.010, 0.020",
+                "0.010, 0.030",
+            ),
+            ("10.0.0.3:8080", "0.004", "0.040", "0.050"),
+            ("-", "-", "-", "-"),
+        ] {
+            writeln!(
+                encoder,
+                "time:2026-08-26T10:00:00+09:00\tmethod:GET\turi:/api/x\tstatus:200\treqtime:0.050\tapptime:{response}\tupstream_addr:{addr}\tupstream_connect:{connect}\tupstream_header:{header}"
+            )
+            .unwrap();
+        }
+        encoder.finish().unwrap();
+        let options = TransitionOptions {
+            run_dir: dir.path(),
+            prefix: "nginx-",
+            rules: None,
+            time_field: "time",
+            session_field: "session",
+            method_field: "method",
+            uri_field: "uri",
+            status_field: "status",
+            request_time_field: "reqtime",
+            upstream_time_field: "apptime",
+            bytes_field: "size",
+            connection_requests_field: "connreqs",
+            connection_field: "conn",
+            upstream_field: "upstream_addr",
+            upstream_connect_time_field: "upstream_connect",
+            upstream_header_time_field: "upstream_header",
+            end_time_field: "msec",
+            series_only: false,
+        };
+        let mut sessions = BTreeMap::new();
+        let mut route_stats = BTreeMap::new();
+        let mut bucket_stats = BTreeMap::new();
+        let mut connections = ConnectionStats::default();
+        let mut upstreams = BTreeMap::new();
+        let mut state = ReadState {
+            sessions: &mut sessions,
+            route_stats: &mut route_stats,
+            bucket_stats: &mut bucket_stats,
+            connections: &mut connections,
+            upstreams: &mut upstreams,
+            interval: None,
+        };
+        read_log(
+            &logs.join("nginx-isu1.zst"),
+            "isu1",
+            &options,
+            &RouteNormalizer { rules: vec![] },
+            &mut state,
+        )
+        .unwrap();
+
+        // Both requests were served by the last address; only one of them was retried.
+        assert_eq!(upstreams.len(), 1);
+        let stats = &upstreams[&("isu1".into(), "10.0.0.3:8080".into())];
+        assert_eq!(stats.requests, 2);
+        assert_eq!(stats.retried_requests, 1);
+        // The retried request spent 1 ms + 2 ms connecting.
+        assert_eq!(stats.connect_ms, vec![3.0, 4.0]);
+        assert_eq!(stats.header_ms, vec![30.0, 40.0]);
+        assert_eq!(stats.response_ms, vec![40.0, 50.0]);
     }
 
     #[test]

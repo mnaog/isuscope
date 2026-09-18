@@ -239,6 +239,12 @@ enum Commands {
         connection_requests_field: String,
         #[arg(long, default_value = "conn")]
         connection_field: String,
+        #[arg(long, default_value = "upstream_addr")]
+        upstream_field: String,
+        #[arg(long, default_value = "upstream_connect")]
+        upstream_connect_time_field: String,
+        #[arg(long, default_value = "upstream_header")]
+        upstream_header_time_field: String,
         #[arg(long, default_value = "msec")]
         end_time_field: String,
         #[arg(long)]
@@ -487,6 +493,9 @@ async fn real_main(cli: Cli) -> Result<bool> {
         bytes_field,
         connection_requests_field,
         connection_field,
+        upstream_field,
+        upstream_connect_time_field,
+        upstream_header_time_field,
         end_time_field,
         series_only,
     } = &cli.command
@@ -505,6 +514,9 @@ async fn real_main(cli: Cli) -> Result<bool> {
             bytes_field,
             connection_requests_field,
             connection_field,
+            upstream_field,
+            upstream_connect_time_field,
+            upstream_header_time_field,
             end_time_field,
             series_only: *series_only,
         })?;

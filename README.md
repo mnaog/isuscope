@@ -168,6 +168,12 @@ parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","catego
 
 access logに`conn:$connection`と`msec:$msec`があると、`nginx-series` collectorがベンチ側の接続の使い方も出します。`client.connections_active`（同時に保持している接続数）、`client.connections_opened`（毎bucketの新規接続）、`client.request_gap`（応答を返してから同じ接続に次の要求が来るまでの時間。分位と平均）、`client.connection_requests_mean`／`_max`です。briefの`client` sectionに出ます。サーバーの処理時間が短いのに`client.request_gap`が伸び、`client.connections_active`だけが増えるときは、上限がサーバーの外にあります。
 
+`host-sampler`はコア別の使用率（`host.core_busy_percent`と、最も詰まっているコアの`host.core_busy_max_percent`）と、PSI（`host.psi_cpu_some_percent`など、CPU・memory・I/Oの不足でtaskが足止めされた時間の割合）も出します。全体のCPUに余裕があっても1コアだけ飽和している構成を見落とさないためです。`service-throttle`は、cgroupのCPU上限で止められた時間（`service.cpu_throttled_percent`、`service.cpu_throttled_periods_per_second`）と割当量（`service.cpu_quota_cores`）をunitごとに出します。
+
+`mysql-status`は2秒ごとに`SHOW GLOBAL STATUS`から、実行中thread、行lock待ちの回数と時間、log flush待ち、buffer poolの読み込み、fsyncを出します（`mysql.threads_running`、`mysql.row_lock_waits_per_second`など）。SQLが遅い理由が実行そのものか、競合やI/Oかを分けるための最小限で、Performance Schemaは有効化しません（有効化すると測る対象が変わるため、必要なときだけ別に行います）。
+
+access logに`upstream_addr`と`upstream_connect`・`upstream_header`があると、接続先ごとに`http.upstream_requests`、`http.upstream_retried_requests`、`http.upstream_connect_duration`、`http.upstream_header_duration`、`http.upstream_response_duration`を出し、briefの`upstreams` sectionに要求数・再試行・p95を並べます。同じrouteでも特定のbackendだけ遅い、接続に時間がかかっている、ヘッダーは早いが応答完了が遅い、といった切り分けに使います。retryは値がcommaで並ぶので、合計を1要求の時間として扱います。
+
 `host-sampler`はCPU・memory・loadに加えて、接続とネットワークのcounterも1秒ごとに出します。`host.tcp_passive_opens_per_second`、`host.tcp_established`、`host.tcp_time_wait`、`host.tcp_listen_overflows_per_second`、`host.tcp_listen_drops_per_second`、`host.tcp_syn_cookies_sent_per_second`、`host.tcp_time_wait_overflow_per_second`、`host.tcp_retransmit_segments_per_second`、NICごとの`host.net_rx_packets_per_second`などと、`host.cpu_softirq_percent`です。取りこぼしのcounterが0のままなら、接続の失敗はサーバー側ではありません。読むのは`/proc`の小さなfileだけで、追加のtoolもroot権限も要りません。
 
 `[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
