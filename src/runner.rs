@@ -189,7 +189,7 @@ pub async fn execute(
         );
 
         println!("→ benchmark");
-        let execution = benchmark::execute(&config, &staging, shutdown.clone(), true).await;
+        let execution = benchmark::execute(&config, &staging, shutdown.clone(), true, mode).await;
         manifest.benchmark = execution.result;
         manifest.logs.extend(execution.logs);
         store.checkpoint(&manifest)?;

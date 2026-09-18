@@ -550,7 +550,9 @@ timeout_seconds = 30
 # unavailable_exit_codes = [75]
 
 # 最初のsurvey-runで通常HTTPのrequest/response bodyを全件保存したい場合だけ有効化します。
-# benchmarkの接続先を127.0.0.1:18080へ変更し、upstreamを実applicationへ合わせてください。
+# 得点が「どの値の和か」を実データから当てるためのもので、点数表が公開されていれば不要です。
+# benchmark.shが`ISUSCOPE_RUN_MODE=survey-run`のときだけ接続先を127.0.0.1:18080へ向け、
+# ここのupstreamを実applicationに合わせます（通常のrunは中継を通しません）。
 # SSE、WebSocket、HTTPS upstreamには対応せず、response bufferingによる観測負荷があります。
 # [[collectors]]
 # name = "discovery-http"

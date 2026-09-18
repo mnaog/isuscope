@@ -1,7 +1,7 @@
 use crate::{
     collector,
     config::{BenchmarkConfig, BenchmarkMode, LoadedConfig},
-    model::{BenchmarkResult, LogRef, Metric},
+    model::{BenchmarkResult, LogRef, Metric, RunMode},
     process,
     shutdown::Shutdown,
 };
@@ -43,11 +43,12 @@ pub async fn execute(
     run_dir: &Path,
     shutdown: Shutdown,
     collect_metrics: bool,
+    mode: RunMode,
 ) -> BenchmarkExecution {
     let started_at = Utc::now();
     let mut execution = match config.config.benchmark.mode {
         BenchmarkMode::Command => {
-            match execute_command(config, run_dir, shutdown, collect_metrics).await {
+            match execute_command(config, run_dir, shutdown, collect_metrics, mode).await {
                 Ok(execution) => execution,
                 Err(error) => BenchmarkExecution {
                     result: BenchmarkResult {
@@ -91,6 +92,7 @@ async fn execute_command(
     run_dir: &Path,
     mut shutdown: Shutdown,
     collect_metrics: bool,
+    mode: RunMode,
 ) -> Result<BenchmarkExecution> {
     let benchmark = &config.config.benchmark;
     let (program, args) = benchmark
@@ -105,6 +107,8 @@ async fn execute_command(
         .env("ISUSCOPE_BENCHMARK_PROTOCOL", "v1")
         .env("ISUSCOPE_PROJECT_ROOT", &config.project_root)
         .env("ISUSCOPE_RUN_DIR", run_dir)
+        // survey-runだけ接続先を変えるなど、adapterが調査走行を区別できるようにする。
+        .env("ISUSCOPE_RUN_MODE", mode.as_str())
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

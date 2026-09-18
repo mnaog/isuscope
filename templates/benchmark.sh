@@ -25,6 +25,12 @@ set -euo pipefail
 #   ISUSCOPE_BENCHMARK_PROTOCOL=v1
 #   ISUSCOPE_PROJECT_ROOT=<対象プロジェクトの絶対path>
 #   ISUSCOPE_RUN_DIR=<今回の一時run directoryの絶対path>
+#   ISUSCOPE_RUN_MODE=run|survey-run
+#
+# `survey-run`で`discovery-http`（HTTP中継でrequest/response bodyを記録するcollector）を使う場合は、
+# この値で接続先を切り替えます。通常のrunは実アプリへ、調査走行だけ中継へ向けます。
+#   target=http://10.0.0.1
+#   if [ "${ISUSCOPE_RUN_MODE:-run}" = survey-run ]; then target=http://10.0.0.1:18080; fi
 #
 # stdout/stderrはrunへ保存されます。token、cookieなどの秘密情報を表示しないでください。
 

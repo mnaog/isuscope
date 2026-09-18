@@ -69,3 +69,36 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"score.tip
     // The benchmark section keeps its own metrics.
     assert_eq!(brief["benchmark"]["total_count"], 0);
 }
+
+#[test]
+fn the_benchmark_adapter_learns_which_kind_of_run_it_is() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    // A survey-run may send the load through the capture proxy; a normal run must not.
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf 'mode=%s\n' \"$ISUSCOPE_RUN_MODE\" >> modes.log; printf '%s\n' '{\"type\":\"isuscope.result\",\"pass\":true,\"score\":1}'"]
+"#,
+    )
+    .unwrap();
+    assert!(
+        isuscope(project.path(), &["run", "--hypothesis", "normal run"])
+            .status
+            .success()
+    );
+    isuscope(
+        project.path(),
+        &["analyze", "latest", "skipped", "--reason", "fixture"],
+    );
+    assert!(
+        isuscope(project.path(), &["survey-run", "--hypothesis", "survey"])
+            .status
+            .success()
+    );
+    let modes = fs::read_to_string(project.path().join("modes.log")).unwrap();
+    assert_eq!(modes, "mode=run\nmode=survey-run\n", "{modes}");
+}
