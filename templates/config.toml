@@ -44,6 +44,8 @@ stream_output = false
 [ssh]
 user = "ubuntu"
 connect_timeout_seconds = 5
+# collectorが運ぶlog差分はtextで、ベンチ後のnodeは空いている。既定で圧縮する。
+# compression = true
 # projectのknown_hostsを使う場合に指定します。未登録hostは初回だけ受け入れて固定します。
 # known_hosts_file = ".local/known-hosts"
 

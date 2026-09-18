@@ -323,6 +323,8 @@ command = ["true"]
         "{logged}"
     );
     assert!(logged.contains("StrictHostKeyChecking=accept-new"));
+    // Collector output is text; compressing it is what keeps log deltas off the wire.
+    assert!(logged.contains("Compression=yes"), "{logged}");
 
     fs::write(config_dir.join("config.toml"), config("reachable")).unwrap();
     let allowed = Command::new(env!("CARGO_BIN_EXE_isuscope"))

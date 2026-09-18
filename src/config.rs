@@ -187,6 +187,14 @@ pub struct SshConfig {
     pub known_hosts_file: Option<PathBuf>,
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_seconds: u64,
+    /// Compress every SSH transfer. Collector output is text and the nodes are idle after
+    /// the benchmark, so this trades their spare CPU for much less time on the wire.
+    #[serde(default = "default_ssh_compression")]
+    pub compression: bool,
+}
+
+fn default_ssh_compression() -> bool {
+    true
 }
 
 impl Default for SshConfig {
@@ -196,6 +204,7 @@ impl Default for SshConfig {
             identity_file: None,
             known_hosts_file: None,
             connect_timeout_seconds: default_connect_timeout(),
+            compression: default_ssh_compression(),
         }
     }
 }
@@ -333,6 +342,13 @@ impl LoadedConfig {
             "-o".to_owned(),
             format!("ConnectTimeout={}", ssh.connect_timeout_seconds),
         ];
+        if ssh.compression {
+            // Log deltas are the bulk of what collectors move (practice-12 sent 292 MB of
+            // slow log per run). They compress about ten to one, and the nodes are idle by
+            // the time the after phase runs.
+            args.push("-o".into());
+            args.push("Compression=yes".into());
+        }
         if let Some(known_hosts) = &ssh.known_hosts_file {
             args.push("-o".into());
             args.push(format!(
