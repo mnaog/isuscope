@@ -340,3 +340,69 @@ command = ["true"]
         String::from_utf8_lossy(&allowed.stderr)
     );
 }
+
+/// finishはrun directoryを移してからSQLiteを確定する。その間に落ちると、manifestは確定済みなのに
+/// SQLiteの行はbeginで作ったrunningのまま（score・metric無し）で残る。次に開いたとき、
+/// 行があるだけで確定済みと見なさず、保存済みのrunから入れ直す。
+#[test]
+fn run_interrupted_between_finalizing_files_and_sqlite_is_reindexed() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":1234,\"pass\":true}'"]
+
+[[collectors]]
+name = "probe"
+phase = "after"
+transport = "local"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"host.cpu_busy_percent\",\"value\":42,\"unit\":\"percent\"}'"]
+"#,
+    )
+    .unwrap();
+    let isuscope = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    isuscope(&["run", "--hypothesis", "finish is interrupted"]);
+    let db = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    let metric_count = |db: &Connection| {
+        db.query_row("SELECT count(*) FROM metrics", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    let saved = metric_count(&db);
+    assert!(saved > 0);
+    // beginが作った行のまま、finishのtransactionが入らなかった状態。
+    db.execute_batch(
+        "UPDATE runs SET state='running', finished_at=NULL, score=NULL, passed=NULL;
+         DELETE FROM metrics; DELETE FROM collector_runs; DELETE FROM logs;",
+    )
+    .unwrap();
+    drop(db);
+
+    let list: serde_json::Value = serde_json::from_slice(&isuscope(&["list"])).unwrap();
+    assert_eq!(list["runs"][0]["state"], "complete", "{list}");
+    assert_eq!(list["runs"][0]["score"], 1234, "{list}");
+    let db = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    assert_eq!(metric_count(&db), saved);
+    // 入れ直した後は確定済みとして扱い、開き直しても重ねて入れない。
+    drop(db);
+    isuscope(&["list"]);
+    let db = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    assert_eq!(metric_count(&db), saved);
+}

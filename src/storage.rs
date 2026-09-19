@@ -238,6 +238,10 @@ impl Store {
         let staging = self.staging_dir(&manifest.id);
         write_manifest(&staging, manifest)?;
         write_structured_snapshot(&staging, metrics, fingerprints, transitions)?;
+        // directoryを移してからSQLiteを確定するまでの間に別processがStoreを開くと、runningの行を
+        // 途中で落ちたrunと取り違えて入れ直してしまう。directoryのlockは移しても保たれるので、
+        // 確定し終えるまで持つ（復旧側は同じlockを取ってから行の状態を見る）。
+        let _lock = AnalysisLock::acquire(&staging)?;
         let final_dir = self.final_dir(&manifest.id);
         fs::rename(&staging, &final_dir)
             .with_context(|| format!("cannot finalize run directory {}", final_dir.display()))?;
@@ -837,12 +841,19 @@ impl Store {
                     continue;
                 }
             };
-            let indexed = self
+            let indexed_state = self
                 .connection
-                .query_row("SELECT 1 FROM runs WHERE id=?1", [&manifest.id], |_| Ok(()))
-                .optional()?
-                .is_some();
-            if indexed {
+                .query_row(
+                    "SELECT state FROM runs WHERE id=?1",
+                    [&manifest.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            // runの行はbeginで作るので、finishがdirectoryを移した後、SQLiteを確定する前に落ちると
+            // runningのまま残る。その行はscoreもmetricも無いので、保存済みのrunから入れ直す。
+            let unfinished = indexed_state.as_deref() == Some(RunState::Running.as_str())
+                && manifest.state != RunState::Running;
+            if indexed_state.is_some() && !unfinished {
                 // A durable manifest may be newer than SQLite after interruption.
                 let tx = self.connection.transaction()?;
                 for a in &manifest.analyses {
@@ -900,6 +911,9 @@ impl Store {
         transitions: &[Transition],
     ) -> Result<()> {
         let transaction = self.connection.transaction()?;
+        // 途中まで入った行（runningのまま）があれば、子の行ごと消して入れ直す。1つの
+        // transactionなので、ここで止まっても次に開いたときに同じところからやり直せる。
+        transaction.execute("DELETE FROM runs WHERE id=?1", [&manifest.id])?;
         transaction.execute(
             "INSERT INTO runs (id, started_at, finished_at, mode, state, commit_hash, dirty, score, passed, exit_code, note, hypothesis, analysis_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
