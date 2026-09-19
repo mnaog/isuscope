@@ -347,20 +347,12 @@ timeout_seconds = 20
 unavailable_exit_codes = [75]
 
 [[collectors]]
-name = "perf-report"
-phase = "after"
-transport = "ssh"
-roles = ["app"]
-command = ["sh", "-c", "base=/tmp/isuscope-{run_id}.perf; command -v perf >/dev/null 2>&1 || exit 75; command -v sudo >/dev/null 2>&1 || exit 75; sudo -n true >/dev/null 2>&1 || exit 75; sudo -n test -s \"$base.data\" || exit 75; sudo -n env LC_ALL=C perf report --stdio --no-children --percent-limit 1 --sort comm,dso,symbol --fields overhead,comm,dso,symbol --field-separator ';' -i \"$base.data\" | awk -F';' '/^[ ]*[0-9]+[.][0-9]+%/ { pct=$1; sub(/%/,\"\",pct); gsub(/^[ ]+|[ ]+$/,\"\",pct); process=$2; binary=$3; symbol=$4; gsub(/^[ ]+|[ ]+$/,\"\",process); gsub(/^[ ]+|[ ]+$/,\"\",binary); gsub(/^[ ]+|[ ]+$/,\"\",symbol); gsub(/[\\\\\\\"]/,\"_\",process); gsub(/[\\\\\\\"]/,\"_\",binary); gsub(/[\\\\\\\"]/,\"_\",symbol); printf \"{\\\"type\\\":\\\"metric\\\",\\\"name\\\":\\\"cpu.sample_percent\\\",\\\"value\\\":%s,\\\"unit\\\":\\\"percent\\\",\\\"labels\\\":{\\\"process\\\":\\\"%s\\\",\\\"binary\\\":\\\"%s\\\",\\\"symbol\\\":\\\"%s\\\"}}\\n\",pct,process,binary,symbol }'"]
-timeout_seconds = 30
-unavailable_exit_codes = [75]
-
-[[collectors]]
 name = "perf-flamegraph"
 phase = "after"
 transport = "ssh"
 # perf.dataをもう一度読み直す2つ目のpassなので、通常のrunでは作らない。人が見る図で、
-# 数値としてはperf-reportとperf-seriesで足りる。必要なときはmodesへ"run"を足す。
+# 数値（run全体と5秒ごとのsymbol別の割合）はperf-seriesの1回の読み取りで足りる。
+# 必要なときはmodesへ"run"を足す。
 modes = ["survey-run"]
 roles = ["app"]
 command = ["sh", "-c", '''

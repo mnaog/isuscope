@@ -205,7 +205,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `host-sampler`はCPU・memory・loadに加えて、接続とネットワークのcounterも1秒ごとに出します。`host.tcp_passive_opens_per_second`、`host.tcp_established`、`host.tcp_time_wait`、`host.tcp_listen_overflows_per_second`、`host.tcp_listen_drops_per_second`、`host.tcp_syn_cookies_sent_per_second`、`host.tcp_time_wait_overflow_per_second`、`host.tcp_retransmit_segments_per_second`、NICごとの`host.net_rx_packets_per_second`などと、`host.cpu_softirq_percent`です。取りこぼしのcounterが0のままなら、少なくとも受け付けの取りこぼしとしては説明できません（接続の失敗がサーバー側にないことの証明にはなりません）。毎秒値は`/proc/uptime`で測った実際の間隔で割るので、samplerが1秒より遅れても率が水増しされません。読むのは`/proc`の小さなfileだけで、追加のtoolもroot権限も要りません。
 
-ベンチ前後のcollectorは**node単位で並列**に実行します。同じnode内では設定順を保つので、perf-stopの後にperf-report、log markの後にdeltaという受け渡しは崩れません。localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
+ベンチ前後のcollectorは**node単位で並列**に実行します。同じnode内では設定順を保つので、perf-stopの後にperf-series、log markの後にdeltaという受け渡しは崩れません。localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
 
 `[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 

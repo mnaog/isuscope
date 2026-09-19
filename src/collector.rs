@@ -788,6 +788,40 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
         *process_totals.entry(process.clone()).or_default() += count;
     }
     let all_samples = process_totals.values().sum::<u64>();
+    // run全体のsymbol別の割合（timestampなし）。`perf report --no-children --sort comm,dso,symbol`
+    // の自己時間と同じ切り方で、perf.dataをもう一度読まずにここで作る。
+    let mut symbol_totals = BTreeMap::<(String, String, String), u64>::new();
+    for ((_, process, binary, symbol), count) in &buckets {
+        *symbol_totals
+            .entry((process.clone(), binary.clone(), symbol.clone()))
+            .or_default() += count;
+    }
+    let symbol_metrics = symbol_totals
+        .into_iter()
+        .flat_map(|((process, binary, symbol), count)| {
+            let labels = BTreeMap::from([
+                ("process".into(), process),
+                ("binary".into(), binary),
+                ("symbol".into(), symbol),
+            ]);
+            [
+                Metric {
+                    name: "cpu.sample_count".into(),
+                    value: count as f64,
+                    unit: "samples".into(),
+                    timestamp: None,
+                    labels: labels.clone(),
+                },
+                Metric {
+                    name: "cpu.sample_percent".into(),
+                    value: count as f64 / all_samples as f64 * 100.0,
+                    unit: "percent".into(),
+                    timestamp: None,
+                    labels,
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
     // Per-symbol rows are too fine to show which process used the CPU, so also report the
     // process share per bucket and for the whole capture (the latter has no timestamp).
     let process_metrics = process_buckets
@@ -833,6 +867,7 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
                 },
             ]
         })
+        .chain(symbol_metrics)
         .chain(process_metrics)
         .collect())
 }
@@ -2193,7 +2228,7 @@ nginx 1200 [001] 1006.000000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
         let buckets = metrics
             .iter()
             .filter(|metric| metric.name == "cpu.sample_count")
-            .map(|metric| metric.timestamp.unwrap().to_rfc3339())
+            .filter_map(|metric| metric.timestamp.map(|at| at.to_rfc3339()))
             .collect::<std::collections::BTreeSet<_>>();
         // 1787827200.35 → 5秒bucketの1787827200、1787827206.0 → 1787827205。
         assert_eq!(
@@ -2447,6 +2482,24 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
     }
 
     #[test]
+    fn perf_script_also_reports_the_whole_capture_by_symbol() {
+        // perf reportを別に走らせず、同じperf scriptからrun全体の自己時間の割合を出す。
+        let metrics =
+            parse_perf_script(include_str!("../tests/fixtures/perf-script-series.txt")).unwrap();
+        let whole = metrics
+            .iter()
+            .filter(|metric| metric.name == "cpu.sample_percent" && metric.timestamp.is_none())
+            .collect::<Vec<_>>();
+        assert!((whole.iter().map(|metric| metric.value).sum::<f64>() - 100.0).abs() < 1e-9);
+        let nginx = whole
+            .iter()
+            .find(|metric| metric.labels["symbol"] == "ngx_http_handler")
+            .unwrap();
+        assert!((nginx.value - 200.0 / 3.0).abs() < 1e-9);
+        assert_eq!(nginx.labels["binary"], "nginx");
+    }
+
+    #[test]
     fn perf_script_with_hidden_call_graph_reads_right_aligned_headers() {
         let metrics = parse_perf_script(include_str!(
             "../tests/fixtures/perf-script-hidden-callchain.txt"
@@ -2454,7 +2507,7 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
         .unwrap();
         let counts = metrics
             .iter()
-            .filter(|metric| metric.name == "cpu.sample_count")
+            .filter(|metric| metric.name == "cpu.sample_count" && metric.timestamp.is_some())
             .collect::<Vec<_>>();
         assert_eq!(counts.iter().map(|metric| metric.value).sum::<f64>(), 3.0);
         assert!(counts.iter().any(|metric| {
@@ -2477,7 +2530,7 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
             parse_perf_script(include_str!("../tests/fixtures/perf-script-callchain.txt")).unwrap();
         let counts = metrics
             .iter()
-            .filter(|metric| metric.name == "cpu.sample_count")
+            .filter(|metric| metric.name == "cpu.sample_count" && metric.timestamp.is_some())
             .collect::<Vec<_>>();
         assert_eq!(counts.iter().map(|metric| metric.value).sum::<f64>(), 4.0);
         let label =

@@ -32,7 +32,6 @@ fn init_is_non_interactive_and_preserves_existing_files() {
     for name in [
         "perf-start",
         "perf-stop",
-        "perf-report",
         "perf-flamegraph",
         "perf-series",
         "offcpu",
@@ -60,7 +59,6 @@ fn init_is_non_interactive_and_preserves_existing_files() {
         "sysstat",
         "perf-start",
         "perf-stop",
-        "perf-report",
         "perf-flamegraph",
         "perf-series",
         "offcpu",
@@ -75,6 +73,15 @@ fn init_is_non_interactive_and_preserves_existing_files() {
             collectors
                 .iter()
                 .any(|collector| collector["name"].as_str() == Some(name))
+        );
+    }
+    // perf.dataはperf-seriesが1回だけ読む。
+    for name in ["perf-report"] {
+        assert!(
+            !collectors
+                .iter()
+                .any(|collector| collector["name"].as_str() == Some(name)),
+            "{name} reads the same input a second time"
         );
     }
     assert!(
