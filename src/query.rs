@@ -987,10 +987,18 @@ pub fn round_to(value: f64, decimals: u32) -> f64 {
 }
 
 fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<DatabaseQueryRow> {
-    type Key = (String, String, String, Option<String>, String);
+    type Key = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
     let mut groups = BTreeMap::<Key, Vec<report::DatabaseSummary>>::new();
     for summary in summaries {
         let shape = sql_shape(&summary.digest);
+        // 切った文（`digest_id`あり）は、切った後の文字列が同じでも別の文なので、shapeにまとめない。
         groups
             .entry((
                 summary.node.clone(),
@@ -998,65 +1006,68 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
                 summary.source.clone(),
                 summary.window.clone(),
                 shape,
+                summary.digest_id.clone(),
             ))
             .or_default()
             .push(summary);
     }
     groups
         .into_iter()
-        .map(|((node, engine, source, window, shape), values)| {
-            let calls = values.iter().map(|value| value.calls).sum::<f64>();
-            let total_ms = values.iter().map(|value| value.total_ms).sum::<f64>();
-            let lock_ms = values.iter().map(|value| value.lock_ms).sum::<f64>();
-            let rows_sent = values.iter().map(|value| value.rows_sent).sum::<f64>();
-            let rows_examined = values.iter().map(|value| value.rows_examined).sum::<f64>();
-            let digests = values
-                .iter()
-                .map(|value| (value.digest.clone(), value.digest_id.clone()))
-                .collect::<BTreeSet<_>>();
-            let p95_ms = (digests.len() == 1).then(|| values[0].p95_ms).flatten();
-            let p99_ms = (digests.len() == 1).then(|| values[0].p99_ms).flatten();
-            // 最大は文をまたいでも最大のまま合わせられる。
-            let max_ms = values
-                .iter()
-                .filter_map(|value| value.max_ms)
-                .reduce(f64::max);
-            let mut unavailable = BTreeMap::new();
-            if digests.len() > 1 {
-                for field in ["p95_ms", "p99_ms"] {
-                    unavailable.insert(
-                        field.into(),
-                        "scalar quantiles cannot be merged across digests".into(),
-                    );
+        .map(
+            |((node, engine, source, window, shape, digest_id), values)| {
+                let calls = values.iter().map(|value| value.calls).sum::<f64>();
+                let total_ms = values.iter().map(|value| value.total_ms).sum::<f64>();
+                let lock_ms = values.iter().map(|value| value.lock_ms).sum::<f64>();
+                let rows_sent = values.iter().map(|value| value.rows_sent).sum::<f64>();
+                let rows_examined = values.iter().map(|value| value.rows_examined).sum::<f64>();
+                let digests = values
+                    .iter()
+                    .map(|value| (value.digest.clone(), value.digest_id.clone()))
+                    .collect::<BTreeSet<_>>();
+                let p95_ms = (digests.len() == 1).then(|| values[0].p95_ms).flatten();
+                let p99_ms = (digests.len() == 1).then(|| values[0].p99_ms).flatten();
+                // 最大は文をまたいでも最大のまま合わせられる。
+                let max_ms = values
+                    .iter()
+                    .filter_map(|value| value.max_ms)
+                    .reduce(f64::max);
+                let mut unavailable = BTreeMap::new();
+                if digests.len() > 1 {
+                    for field in ["p95_ms", "p99_ms"] {
+                        unavailable.insert(
+                            field.into(),
+                            "scalar quantiles cannot be merged across digests".into(),
+                        );
+                    }
                 }
-            }
-            DatabaseQueryRow {
-                node,
-                engine,
-                source,
-                window,
-                digest: shape.clone(),
-                digest_id: None,
-                sql_shape: Some(shape),
-                digest_count: digests.len(),
-                digest_examples: digests
-                    .into_iter()
-                    .take(3)
-                    .map(|(digest, _)| digest_example(&digest))
-                    .collect(),
-                calls,
-                total_ms,
-                avg_ms: divide(total_ms, calls),
-                p95_ms,
-                p99_ms,
-                max_ms,
-                lock_ms,
-                rows_sent,
-                rows_examined,
-                rows_examined_per_call: divide(rows_examined, calls),
-                unavailable,
-            }
-        })
+                DatabaseQueryRow {
+                    node,
+                    engine,
+                    source,
+                    window,
+                    digest: shape.clone(),
+                    digest_id,
+                    sql_shape: Some(shape),
+                    digest_count: digests.len(),
+                    digest_examples: digests
+                        .into_iter()
+                        .take(3)
+                        .map(|(digest, _)| digest_example(&digest))
+                        .collect(),
+                    calls,
+                    total_ms,
+                    avg_ms: divide(total_ms, calls),
+                    p95_ms,
+                    p99_ms,
+                    max_ms,
+                    lock_ms,
+                    rows_sent,
+                    rows_examined,
+                    rows_examined_per_call: divide(rows_examined, calls),
+                    unavailable,
+                }
+            },
+        )
         .collect()
 }
 
@@ -1243,6 +1254,40 @@ fn is_identifier(value: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_shape_keeps_truncated_statements_apart() {
+        // 列の並びが長く表だけが違う2文は、切ると同じ文字列になる。shapeにまとめると、構造の
+        // 違う文を同じ形として数える。
+        let summary = |digest: &str, digest_id: Option<&str>, calls: f64| report::DatabaseSummary {
+            node: "db1".into(),
+            engine: "mysql".into(),
+            digest: digest.into(),
+            digest_id: digest_id.map(str::to_owned),
+            source: "slp".into(),
+            window: Some("load".into()),
+            calls,
+            ..Default::default()
+        };
+        let rows = group_database_shapes(vec![
+            summary("SELECT a, b, c …", Some("1111"), 10.0),
+            summary("SELECT a, b, c …", Some("2222"), 20.0),
+            summary("SELECT * FROM t WHERE id IN (?, ?)", None, 1.0),
+            summary("SELECT * FROM t WHERE id IN (?)", None, 2.0),
+        ]);
+        assert_eq!(rows.len(), 3);
+        let truncated = rows
+            .iter()
+            .filter(|row| row.digest_id.is_some())
+            .map(|row| row.calls)
+            .collect::<Vec<_>>();
+        assert_eq!(truncated, [10.0, 20.0]);
+        // 切っていない文は従来どおりshapeでまとめる。
+        assert!(
+            rows.iter()
+                .any(|row| row.digest_id.is_none() && row.calls == 3.0)
+        );
+    }
 
     #[test]
     fn sql_shape_collapses_variable_length_in_lists() {
