@@ -2280,16 +2280,27 @@ mod tests {
             find("client.connections_opened", &[], Some(1_789_653_660)),
             Some(2.0)
         );
-        // retryした要求は最後のupstreamの分で、時間は試行の合計（`-`は数えない）。
+        // 10.0.0.9で失敗し10.0.0.1で返った要求は、時間を試行ごとの接続先へ付ける（`-`は数えない）。
+        // 合計を最後の接続先へ付けると、正常な10.0.0.1が遅く見え、失敗した10.0.0.9が消える。
+        let failed = [("upstream", "10.0.0.9:8080")];
+        assert_eq!(find("http.upstream_requests", &failed, None), Some(1.0));
+        assert_eq!(
+            find("http.upstream_retried_requests", &failed, None),
+            Some(1.0)
+        );
+        assert_eq!(
+            find("http.upstream_response_duration_max", &failed, None),
+            Some(2.0)
+        );
         let upstream = [("upstream", "10.0.0.1:8080")];
         assert_eq!(find("http.upstream_requests", &upstream, None), Some(3.0));
         assert_eq!(
             find("http.upstream_retried_requests", &upstream, None),
-            Some(1.0)
+            None
         );
         assert_eq!(
             find("http.upstream_connect_duration_max", &upstream, None),
-            Some(3.0)
+            Some(1.0)
         );
         assert_eq!(
             find(

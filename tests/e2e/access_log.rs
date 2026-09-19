@@ -69,8 +69,9 @@ fn alp_collector_aggregates_the_delta_on_the_node() {
     for expected in [
         r#""name":"client.connections_opened_total","value":3.000000"#,
         r#""name":"client.connection_requests_max","value":3.000000"#,
-        r#""name":"http.upstream_retried_requests","value":1.000000,"unit":"requests","labels":{"upstream":"10.0.0.1:8080"}"#,
-        r#""name":"http.upstream_connect_duration_max","value":3.000000,"unit":"ms","labels":{"upstream":"10.0.0.1:8080"}"#,
+        r#""name":"http.upstream_retried_requests","value":1.000000,"unit":"requests","labels":{"upstream":"10.0.0.9:8080"}"#,
+        r#""name":"http.upstream_response_duration_max","value":2.000000,"unit":"ms","labels":{"upstream":"10.0.0.9:8080"}"#,
+        r#""name":"http.upstream_connect_duration_max","value":1.000000,"unit":"ms","labels":{"upstream":"10.0.0.1:8080"}"#,
         r#""name":"client.request_gap","value":5360.000134,"unit":"ms","labels":{"quantile":"0.99"},"timestamp":1789653665"#,
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");

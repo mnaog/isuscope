@@ -586,6 +586,7 @@ unavailable_exit_codes = [75]
 # 時刻は`$msec`（応答を返し終えたepoch秒）、接続は`$connection`と`$connection_requests`、
 # upstreamは`$upstream_addr`、`$upstream_connect_time`、`$upstream_header_time`、
 # `$upstream_response_time`をLTSVのfieldとして読む。無いfieldの値は出さない。
+# upstream別の値は試行単位で、要求数は試行数、retryはその接続先で失敗して次へ回された試行。
 [[collectors]]
 name = "alp"
 phase = "after"
@@ -606,14 +607,13 @@ awk -F '\t' -v begin='{benchmark_started_at}' -v end='{benchmark_finished_at}' -
     if (at != "") printf ",\"timestamp\":%d", at
     printf "}\n"
   }
-  # nginxはretryした分を`, `で並べる。`-`だけなら値が無い。
-  function upstream_ms(raw,   parts, count, i, value, total, found) {
+  # nginxはupstreamへの試行を、addressと各時間の変数に同じ並びで記録する（retryは`, `、
+  # 別のupstreamへ回ったときは` : `で区切る）。値の無い試行は`-`。
+  function attempts(raw, parts,   count, i) {
+    gsub(/ : /, ",", raw)
     count = split(raw, parts, ",")
-    for (i = 1; i <= count; i++) {
-      value = parts[i]; gsub(/^[ :]+|[ :]+$/, "", value)
-      if (value ~ /^[0-9.]+$/) { total += value; found = 1 }
-    }
-    return found ? total * 1000 : ""
+    for (i = 1; i <= count; i++) gsub(/^ +| +$/, "", parts[i])
+    return count
   }
   function sample(key, value) { if (value != "") printf "%s\t%.6f\n", key, value > (dir "/samples") }
   /^[ \t]*$/ { next }
@@ -641,14 +641,21 @@ awk -F '\t' -v begin='{benchmark_started_at}' -v end='{benchmark_finished_at}' -
         first[id] = start; last[id] = at; requests[id] = 1; opened[bucket]++
       }
     }
-    count = split(field["upstream_addr"], addresses, ",")
-    address = addresses[count]; gsub(/^[ :]+|[ :]+$/, "", address); gsub(/["\\]/, "_", address)
-    if (address != "" && address != "-") {
+    # 時間は試行ごとにその接続先へ付ける。Aで1秒待って失敗しBで20 msで返ったなら、
+    # Aに1,000 ms、Bに20 ms（要求全体の時間はroute別の`http.request_duration`にある）。
+    count = attempts(field["upstream_addr"], addresses)
+    attempts(field["upstream_connect"], connects)
+    attempts(field["upstream_header"], headers)
+    attempts(field["apptime"], responses)
+    for (i = 1; i <= count; i++) {
+      address = addresses[i]; gsub(/["\\]/, "_", address)
+      if (address == "" || address == "-") continue
       upstreams[address]++
-      if (count > 1) retried[address]++
-      if ("upstream_connect" in field) sample("c" address, upstream_ms(field["upstream_connect"]))
-      if ("upstream_header" in field) sample("h" address, upstream_ms(field["upstream_header"]))
-      if ("apptime" in field) sample("r" address, upstream_ms(field["apptime"]))
+      # 最後でない試行は、その接続先で失敗して次へ回されたもの。
+      if (i < count) retried[address]++
+      if (connects[i] ~ /^[0-9.]+$/) sample("c" address, connects[i] * 1000)
+      if (headers[i] ~ /^[0-9.]+$/) sample("h" address, headers[i] * 1000)
+      if (responses[i] ~ /^[0-9.]+$/) sample("r" address, responses[i] * 1000)
     }
   }
   END {
