@@ -28,6 +28,7 @@ pub fn grouped_aggregation(metric: &Metric) -> MetricAggregation {
     if is_quantile(metric)
         || metric.name.ends_with("_mean")
         || metric.name == "db.query.p95_duration"
+        || metric.name == "db.query.p99_duration"
     {
         return MetricAggregation::NonMergeable;
     }
@@ -56,7 +57,9 @@ pub fn aggregate(values: &[f64], aggregation: MetricAggregation) -> Option<f64> 
 }
 
 fn is_quantile(metric: &Metric) -> bool {
-    metric.labels.contains_key("quantile") || metric.name.contains("p95")
+    metric.labels.contains_key("quantile")
+        || metric.name.contains("p95")
+        || metric.name.contains("p99")
 }
 
 fn is_additive(name: &str) -> bool {
@@ -69,6 +72,9 @@ fn is_additive(name: &str) -> bool {
             | "http.connection_reused_requests"
             | "http.request_duration_sum"
             | "http.upstream_duration_sum"
+            | "db.calls"
+            | "db.duration"
+            | "db.lock_duration"
             | "db.query.calls"
             | "db.query.total_duration"
             | "db.query.lock_duration"

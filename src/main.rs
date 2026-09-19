@@ -1017,7 +1017,11 @@ fn show_query(
         })
         .transpose()?;
     let query_limit = base_id.as_ref().map_or(limit, |_| usize::MAX);
-    if !matches!(scope, QueryScopeArg::Series) && window != SeriesWindowArg::Whole {
+    // database viewの区間はnode上で集計した行のlabelなので、`--scope run`のまま選べる。
+    if !matches!(scope, QueryScopeArg::Series)
+        && window != SeriesWindowArg::Whole
+        && !matches!(view, QueryViewArg::Database)
+    {
         bail!("--window initialize/load requires `--scope series`");
     }
     match view {
@@ -1084,6 +1088,19 @@ fn show_query(
             }
             let candidate_metrics =
                 store.query_metrics(&id, &[], Some("db.query."), Some(false))?;
+            let mut labels = labels;
+            if window != SeriesWindowArg::Whole {
+                if !candidate_metrics
+                    .iter()
+                    .any(|metric| metric.labels.contains_key("window"))
+                {
+                    bail!(
+                        "run {} has no per-window database rows (it predates the windowed slp collector); use --window whole",
+                        runner::short_id(&id)
+                    );
+                }
+                labels.push(("window".into(), window.as_str().into()));
+            }
             let options = DatabaseQueryOptions {
                 node,
                 source,
@@ -1096,6 +1113,16 @@ fn show_query(
             if let Some(base_id) = base_id {
                 let base_metrics =
                     store.query_metrics(&base_id, &[], Some("db.query."), Some(false))?;
+                if window != SeriesWindowArg::Whole
+                    && !base_metrics
+                        .iter()
+                        .any(|metric| metric.labels.contains_key("window"))
+                {
+                    bail!(
+                        "base run {} has no per-window database rows; compare with --window whole",
+                        runner::short_id(&base_id)
+                    );
+                }
                 let base = query::database_query(base_id, base_metrics, options);
                 write_stdout_json(&query::database_query_diff(base, candidate, limit))?;
             } else {

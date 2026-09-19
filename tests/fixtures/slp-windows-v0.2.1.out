@@ -1,0 +1,19 @@
+{"type":"metric","name":"db.calls","value":5,"unit":"queries","labels":{"engine":"mysql"},"timestamp":1789296730}
+{"type":"metric","name":"db.duration","value":465.216,"unit":"ms","labels":{"engine":"mysql"},"timestamp":1789296730}
+{"type":"metric","name":"db.lock_duration","value":0.000,"unit":"ms","labels":{"engine":"mysql"},"timestamp":1789296730}
+{"type":"metric","name":"db.calls","value":10,"unit":"queries","labels":{"engine":"mysql"},"timestamp":1789296780}
+{"type":"metric","name":"db.duration","value":77.173,"unit":"ms","labels":{"engine":"mysql"},"timestamp":1789296780}
+{"type":"metric","name":"db.lock_duration","value":26.820,"unit":"ms","labels":{"engine":"mysql"},"timestamp":1789296780}
+{"type":"metric","name":"db.calls","value":2,"unit":"queries","labels":{"engine":"mysql"},"timestamp":1789296810}
+{"type":"metric","name":"db.duration","value":164.125,"unit":"ms","labels":{"engine":"mysql"},"timestamp":1789296810}
+{"type":"metric","name":"db.lock_duration","value":149.432,"unit":"ms","labels":{"engine":"mysql"},"timestamp":1789296810}
+initialize	1	SELECT @@`version_comment` LIMIT N	0.000089	0.000089	0.000089	0.000089	0.000000	1	1
+initialize	1	USE `isucon`	0.000043	0.000043	0.000043	0.000043	0.000000	0	0
+initialize	1	INSERT INTO `user_cards` VALUES ('S','S','S','S','S','S','S','S',NULL)	0.465014	0.465014	0.465014	0.465014	0.000000	0	0
+initialize	2	SELECT DATABASE()	0.000070	0.000041	0.000041	0.000041	0.000000	2	2
+load	1	SELECT * FROM `user_presents` WHERE `user_id` = N AND `deleted_at` IS NULL ORDER BY `created_at` DESC,`id` LIMIT N,N	0.017916	0.017916	0.017916	0.017916	0.000001	22	645
+load	1	SELECT COUNT(N) FROM `user_presents` WHERE `user_id` = N AND `deleted_at` IS NULL	0.002179	0.002179	0.002179	0.002179	0.000001	1	623
+load	1	SELECT * FROM `user_presents` WHERE `id` IN ('S') AND `deleted_at` IS NULL	0.000282	0.000282	0.000282	0.000282	0.000001	22	22
+load	1	UPDATE `user_sessions` SET `deleted_at`=N WHERE `user_id` = N AND `deleted_at` IS NULL	0.000158	0.000158	0.000158	0.000158	0.000001	0	0
+load	1	INSERT INTO `user_sessions` (`id`,`user_id`,`session_id`,`created_at`,`updated_at`,`expired_at`) VALUES ('S','S','S','S','S','S')	0.000189	0.000189	0.000189	0.000189	0.000001	0	0
+load	7	UPDATE `id_generator` SET `id`=LAST_INSERT_ID(`id` + N)	0.220574	0.082950	0.082950	0.082950	0.176247	0	14

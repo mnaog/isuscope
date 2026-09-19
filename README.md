@@ -197,6 +197,8 @@ access logに`conn:$connection`と`msec:$msec`があると、`nginx-series` coll
 
 `host-sampler`はコア別の使用率（`host.core_busy_percent`と、最も詰まっているコアの`host.core_busy_max_percent`）と、PSI（`host.psi_cpu_some_percent`など、CPU・memory・I/Oの不足でtaskが足止めされた時間の割合）も出します。全体のCPUに余裕があっても1コアだけ飽和している構成を見落とさないためです。`service-throttle`は、cgroupのCPU上限で止められた時間（`service.cpu_throttled_percent`、`service.cpu_throttled_periods_per_second`）と割当量（`service.cpu_quota_cores`）をunitごとに出します。
 
+slow logは、`mysql-log-delta`がベンチ中の差分をDB node上に用意し、`slp`がその場でinitializeと負荷区間に分けて集計します。区間は各文の`SET timestamp=`（開始時刻のepoch秒）で決めるのでtimezoneに依存せず、一括INSERTの`VALUES`と`IN`の並びは`--bundle-values --bundle-where-in`で1つの文にまとめます。文ごとに回数・合計・最大・p95・p99・lock・rowsを`window` label付きで出し、DB全体の5秒ごとの回数と時間（`db.calls`、`db.duration`）も出します。briefのDB欄は負荷区間（`database_window`）の行だけで順位を付けるので、initializeの一括投入が上位を占めません。区間は`isuscope query latest --view database --window load`で選べます。生のslow logは通常のrunでは運ばず、`survey-run`でだけ`mysql-log-raw`が持ち帰ります（DB 1台あたり1 runで数十MBになるため）。slpはAnsibleのobservability roleが入れる前提で、無いnodeでは`doctor`と`slp` collectorが失敗します。
+
 `mysql-status`は2秒ごとに`SHOW GLOBAL STATUS`から、実行中thread、行lock待ちの回数と時間、log flush待ち、buffer poolの読み込み、fsyncを出します（`mysql.threads_running`、`mysql.row_lock_waits_per_second`など）。SQLが遅い理由が実行そのものか、競合やI/Oかを分けるための最小限で、Performance Schemaは有効化しません（有効化すると測る対象が変わるため、必要なときだけ別に行います）。
 
 access logに`upstream_addr`と`upstream_connect`・`upstream_header`があると、接続先ごとに`http.upstream_requests`、`http.upstream_retried_requests`、`http.upstream_connect_duration`、`http.upstream_header_duration`、`http.upstream_response_duration`を出し、briefの`upstreams` sectionに要求数・再試行・p95を並べます。同じrouteでも特定のbackendだけ遅い、接続に時間がかかっている、ヘッダーは早いが応答完了が遅い、といった切り分けに使います。retryは値がcommaで並ぶので、合計を1要求の時間として扱います。

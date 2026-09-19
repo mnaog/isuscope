@@ -216,3 +216,130 @@ printf '{"type":"metric","name":"client.request_gap","value":3,"unit":"ms","labe
         brief["clients"]
     );
 }
+
+/// DBの行はnode上で区間ごとに集計され、briefは負荷区間だけで順位を付ける。
+/// `query --view database --window`で区間を選べ、区間を持たないrunには選べないと伝える。
+#[test]
+fn database_rows_are_ranked_within_the_load_window() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/slp-windows-v0.2.1.out"
+    );
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{{\"type\":\"isuscope.result\",\"score\":1,\"pass\":true}}'"]
+
+[[collectors]]
+name = "slp"
+phase = "after"
+transport = "local"
+command = ["cat", "{fixture}"]
+parser = "slp-windows"
+"#
+        ),
+    )
+    .unwrap();
+    let isuscope = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    let run = isuscope(&["run", "--hypothesis", "区間ごとのDB集計"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let brief: serde_json::Value =
+        serde_json::from_slice(&isuscope(&["brief", "latest"]).stdout).unwrap();
+    assert_eq!(brief["database_window"], "load");
+    let top = &brief["database"]["items"][0];
+    assert_eq!(top["window"], "load");
+    assert!(
+        top["digest"].as_str().unwrap().contains("id_generator"),
+        "{top}"
+    );
+    assert!(
+        top["p99_ms"].is_number() && top["max_ms"].is_number(),
+        "{top}"
+    );
+    assert!(
+        !brief["database"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["window"] == "initialize"),
+        "{}",
+        brief["database"]
+    );
+    // DB全体の5秒ごとの合計も残る。
+    let series = isuscope(&["series", "latest", "--metric", "db.calls"]);
+    assert!(
+        series.status.success(),
+        "{}",
+        String::from_utf8_lossy(&series.stderr)
+    );
+
+    let initialize: serde_json::Value = serde_json::from_slice(
+        &isuscope(&[
+            "query",
+            "latest",
+            "--view",
+            "database",
+            "--window",
+            "initialize",
+        ])
+        .stdout,
+    )
+    .unwrap();
+    let rows = initialize["rows"].as_array().unwrap();
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter().all(|row| row["window"] == "initialize"),
+        "{rows:?}"
+    );
+}
+
+/// 区間を持たないrunで`--window load`を選ぶと、黙って空を返さずに理由を伝える。
+#[test]
+fn database_window_is_refused_for_runs_without_windows() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":1,\"pass\":true}'"]
+
+[[collectors]]
+name = "legacy-db"
+phase = "after"
+transport = "local"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"db.query.calls\",\"value\":3,\"unit\":\"queries\",\"labels\":{\"digest\":\"select 1\",\"engine\":\"mysql\"}}'"]
+"#,
+    )
+    .unwrap();
+    let isuscope = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    isuscope(&["run", "--hypothesis", "区間のない古いrun"]);
+    let refused = isuscope(&["query", "latest", "--view", "database", "--window", "load"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no per-window database rows"));
+}

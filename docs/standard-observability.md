@@ -14,7 +14,7 @@ perf、alp、slp、sysstatは「必要になってから有効化する追加機
 | service-sampler | during | 指定systemd unitのCPU、memory、disk I/O、PID数 | unit未指定、cgroup v2でない、unitが停止中 |
 | perf | before/after | detachしたsystem-wide sampleとhot symbol | `perf`がない、権限不足、kernelが非対応 |
 | alp | after | route別request数、p50/p95/p99、error、bytes | access logがない、alpがない |
-| slp | after | digest別query数、合計時間、p95、rows | MySQL slow logがない、slpがない、MySQLが退役済み |
+| slp | after | slow logの差分をnode上でinitializeと負荷区間に分け、文ごとの回数・合計・最大・p95・p99・lock・rowsと、DB全体の5秒ごとの回数・時間 | MySQL slow logがない、MySQLが退役済み（slpが無いのは`failed`。Ansibleのobservability roleが入れる） |
 | PostgreSQL | after | `pg_stat_statements`のquery別差分 | PostgreSQLがない、extensionが無効 |
 
 権限不足は環境上の意図した制約なら`unavailable`、設定ミスや途中で壊れた場合は`failed`にします。単に`required = false`にするだけでは失敗と不在を区別できないため、標準collectorは明示的に75を返します。
@@ -25,15 +25,12 @@ perf、alp、slp、sysstatは「必要になってから有効化する追加機
 
 ```toml
 [[collectors]]
-name = "mysql-slow-query"
-phase = "after"
+name = "sysstat"
+phase = "during"
 transport = "ssh"
-roles = ["db"]
-modes = ["run", "survey-run"]
-command = ["slp", "my", "--file", "/tmp/isuscope-{run_id}.mysql.log", "--format", "tsv", "--noheaders", "--output", "count,query,sum-query-time,p95-query-time", "--percentiles", "95"]
-parser = "slp-tsv"
+command = ["sh", "-c", "command -v sar >/dev/null 2>&1 || exit 75; exec env LC_ALL=C TZ=UTC sar -u -d 1"]
+parser = "sysstat"
 unavailable_exit_codes = [75]
-required = false
 ```
 
 ログ全体を毎回解析するとrun同士を比較できないため、before collectorでoffset・先頭最大64 KiBのSHA-256またはDB統計snapshotを保存し、after collectorで差分だけを処理します。perfはbeforeでSSHからdetachしてPIDを保存し、afterでSIGINT、process終了、非空`perf.data`の順に確認してからreportとseriesを作ります。これによりduring collectorのprocess group終了に巻き込まれて未flushになることを防ぎます。sysstatの値は終了後の1秒ではなく、ベンチ中に出力されたsampleから作ります。
@@ -45,7 +42,9 @@ required = false
 | source | metric | 必須label |
 |---|---|---|
 | alp | `http.requests`, `http.errors`, `http.request_duration_sum`, `http.request_duration_mean`, `http.request_duration_min`, `http.request_duration`, `http.request_duration_max`, `http.response_bytes` | `node`, `method`, `route`; status別requestsは`status_class`、percentileは`quantile` |
-| slp/pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration`, `db.query.lock_duration`, `db.query.rows_sent`, `db.query.rows_examined` | `node`, `engine`, `digest` |
+| slp（区間別） | `db.query.calls`, `db.query.total_duration`, `db.query.duration_max`, `db.query.p95_duration`, `db.query.p99_duration`, `db.query.lock_duration`, `db.query.rows_sent`, `db.query.rows_examined` | `node`, `engine`, `digest`, `window`（`initialize`、`load`、区間が分からなければ`whole`） |
+| slp（DB全体） | `db.calls`, `db.duration`, `db.lock_duration`（5秒bucket）、`db.slow_log_bytes`（差分の大きさ） | `node`, `engine` |
+| pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration`, `db.query.lock_duration`, `db.query.rows_sent`, `db.query.rows_examined` | `node`, `engine`, `digest` |
 | perf | `cpu.sample_percent`, `cpu.sample_count` | `node`, `process`, `symbol`, `binary` |
 | perf-series | `cpu.process_percent`（5秒bucketと取得全体） | `node`, `process` |
 | sysstat | `host.cpu_busy_percent`, `host.cpu_{user,system,iowait,steal,idle}_percent`, `host.disk_{iops,read_bytes_per_second,write_bytes_per_second,queue_depth,await,util_percent}` | `node`; diskは`device` |

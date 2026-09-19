@@ -801,29 +801,92 @@ else
   sudo -n cat "$log" >> "$temporary"
 fi
 mv "$temporary" "$output"
-cat "$output"
+# 差分はこのnodeに置いたまま、後のslpが区間ごとに集計する。ここでは大きさだけを残す。
+printf '{"type":"metric","name":"db.slow_log_bytes","value":%s,"unit":"bytes","labels":{"engine":"mysql"}}\n' "$(wc -c < "$output" | tr -d ' ')"
 ''']
-parser = "mysql-slow"
 unavailable_exit_codes = [75]
 
+# survey-runでは、区間ごとの集計に加えて生のslow logも持ち帰る。後から別の観点で掘り直すためで、
+# 通常のrunでは運ばない（DB 1台で1 runあたり数十MBになる）。
+[[collectors]]
+name = "mysql-log-raw"
+phase = "after"
+transport = "ssh"
+roles = ["db", "mysql"]
+modes = ["survey-run"]
+command = ["sh", "-c", "input=/tmp/isuscope-{run_id}.mysql.log; test -r \"$input\" || exit 75; cat \"$input\""]
+max_output_bytes = 1073741824
+unavailable_exit_codes = [75]
+
+# slow logの差分を、node上でinitializeと負荷区間に分けてslpで集計する。一括INSERTのVALUESと
+# INの並びは1つの文にまとめ、回数・合計・最大・p95・p99・lock・rowsを文ごとに出す。
+# 生のlogを運ばないので、DB 1台あたりの転送は数十KBで済む。slpはAnsibleのobservability roleが
+# 入れる前提で、無ければ失敗させる（黙ってDBの計測が欠けないように）。
 [[collectors]]
 name = "slp"
 phase = "after"
 transport = "ssh"
 roles = ["db", "mysql"]
+preflight = ["sh", "-c", "command -v slp >/dev/null 2>&1 || { echo 'slp is not installed; install it with the Ansible observability role'; exit 1; }; echo slp available"]
 command = ["sh", "-c", '''
 set -eu
 input=/tmp/isuscope-{run_id}.mysql.log
-result=/tmp/isuscope-{run_id}.slp.tsv
-trap 'rm -f "$input" "$result"' EXIT
-command -v slp >/dev/null 2>&1 || exit 75
+work=/tmp/isuscope-{run_id}.slp
+trap 'rm -rf "$input" "$work"' EXIT
 test -r "$input" || exit 75
-slp my --file "$input" --format tsv --noheaders --output count,query,sum-query-time,p95-query-time --percentiles 95 > "$result"
-if test -s "$input" && ! test -s "$result"; then
+command -v slp >/dev/null 2>&1 || { echo 'slp is not installed on this DB node; install it with the Ansible observability role' >&2; exit 1; }
+mkdir -p "$work"
+# 各文を`SET timestamp=`（文の開始時刻、epoch秒）で区間へ振り分ける。timezoneに依存しない。
+# initializeの終わりが分からないrunは、全体を1つの区間（whole）にする。
+# 同じ処理で、DB全体の5秒ごとの文の数と時間も出す。
+awk -v load='{load_started_at}' -v end='{benchmark_finished_at}' -v dir="$work" '
+  # prepared statementのPrepareや接続poolのPingは`# administrator command:`として記録される。
+  # 文ではないので、slpと同じく数えない。
+  function flush() {
+    if (window != "" && !administrative) {
+      printf "%s", entry > (dir "/" window ".log")
+      calls[bucket]++; seconds[bucket] += query_time; lock[bucket] += lock_time
+    }
+    entry = ""; window = ""; decided = 0; administrative = 0
+  }
+  /^# Time: / { flush() }
+  /^# User@Host: / && decided { flush() }
+  /^# Query_time: / { query_time = $3; lock_time = $5 }
+  /^# administrator command:/ { administrative = 1 }
+  /^SET timestamp=/ && !decided {
+    at = $0; sub(/^SET timestamp=/, "", at); sub(/;.*/, "", at); at += 0
+    decided = 1
+    if (end != "" && at > end + 0) window = ""
+    else if (load == "") window = "whole"
+    else if (at < load + 0) window = "initialize"
+    else window = "load"
+    bucket = int(at / 5) * 5
+  }
+  { entry = entry $0 "\n" }
+  END {
+    flush()
+    for (bucket in calls) {
+      printf "{\"type\":\"metric\",\"name\":\"db.calls\",\"value\":%d,\"unit\":\"queries\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%d}\n", calls[bucket], bucket
+      printf "{\"type\":\"metric\",\"name\":\"db.duration\",\"value\":%.3f,\"unit\":\"ms\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%d}\n", seconds[bucket] * 1000, bucket
+      printf "{\"type\":\"metric\",\"name\":\"db.lock_duration\",\"value\":%.3f,\"unit\":\"ms\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%d}\n", lock[bucket] * 1000, bucket
+    }
+  }' "$input"
+# 区間ごとに文の種類別へ集計する。`--limit`は種類の上限（超えると失敗）なので大きくしておく。
+parsed=0
+for window in initialize load whole; do
+  test -s "$work/$window.log" || continue
+  slp my --file "$work/$window.log" --format tsv --noheaders --bundle-values --bundle-where-in \
+    --output count,query,sum-query-time,max-query-time,p95-query-time,p99-query-time,sum-lock-time,sum-rows-sent,sum-rows-examined \
+    --percentiles 95,99 --limit 1000000 > "$work/$window.tsv"
+  test -s "$work/$window.tsv" && parsed=1
+  awk -v window="$window" '{ print window "\t" $0 }' "$work/$window.tsv"
+done
+# 文があったのに1件も集計できなければ、slow logの形式とslpが合っていない。
+if [ "$parsed" = 0 ] && ls "$work"/*.log >/dev/null 2>&1; then
   echo 'slp parsed no records from a non-empty slow-log delta' >&2
   exit 65
 fi
-cat "$result"
 ''']
-parser = "slp-tsv"
+parser = "slp-windows"
+timeout_seconds = 120
 unavailable_exit_codes = [75]

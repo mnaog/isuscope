@@ -69,12 +69,20 @@ pub struct CoverageSummary {
 pub struct DatabaseSummary {
     pub node: String,
     pub engine: String,
+    #[serde(serialize_with = "crate::query::serialize_capped")]
     pub digest: String,
     pub source: String,
+    /// node上で区間ごとに集計したsource（slp）の区間。`initialize`、`load`、`whole`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
     pub calls: f64,
     pub total_ms: f64,
     pub avg_ms: Option<f64>,
     pub p95_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p99_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ms: Option<f64>,
     pub lock_ms: f64,
     pub rows_sent: f64,
     pub rows_examined: f64,
@@ -599,7 +607,8 @@ fn http_source_quality(summary: &HttpRouteSummary) -> (bool, bool, bool, bool, u
 }
 
 pub fn database_queries(metrics: &[Metric]) -> Vec<DatabaseSummary> {
-    let mut values = BTreeMap::<(String, String, String, String), DatabaseSummary>::new();
+    type Key = (String, String, String, String, Option<String>);
+    let mut values = BTreeMap::<Key, DatabaseSummary>::new();
     for metric in metrics {
         let Some(digest) = metric.labels.get("digest") else {
             continue;
@@ -607,19 +616,29 @@ pub fn database_queries(metrics: &[Metric]) -> Vec<DatabaseSummary> {
         let node = label(metric, "node");
         let engine = label(metric, "engine");
         let source = label(metric, "collector");
+        let window = metric.labels.get("window").cloned();
         let value = values
-            .entry((node.clone(), engine.clone(), digest.clone(), source.clone()))
+            .entry((
+                node.clone(),
+                engine.clone(),
+                digest.clone(),
+                source.clone(),
+                window.clone(),
+            ))
             .or_insert_with(|| DatabaseSummary {
                 node,
                 engine,
                 digest: digest.clone(),
                 source,
+                window,
                 ..Default::default()
             });
         match metric.name.as_str() {
             "db.query.calls" => value.calls = metric.value,
             "db.query.total_duration" => value.total_ms = metric.value,
             "db.query.p95_duration" => value.p95_ms = Some(metric.value),
+            "db.query.p99_duration" => value.p99_ms = Some(metric.value),
+            "db.query.duration_max" => value.max_ms = Some(metric.value),
             "db.query.lock_duration" => value.lock_ms = metric.value,
             "db.query.rows_sent" => value.rows_sent = metric.value,
             "db.query.rows_examined" => value.rows_examined = metric.value,
@@ -884,9 +903,8 @@ fn expected_metrics(section: &str) -> &'static [&'static str] {
 fn expected_collector_metrics(collector: &str) -> &'static [&'static str] {
     match collector {
         "alp" | "nginx-series" => &["http.requests", "http.request_duration"],
-        "slp" | "mysql-log-delta" | "pg-stat-statements" => {
-            &["db.query.calls", "db.query.total_duration"]
-        }
+        // mysql-log-deltaはslow logの差分をnode上に用意するだけで、集計はslpが行う。
+        "slp" | "pg-stat-statements" => &["db.query.calls", "db.query.total_duration"],
         "perf-report" | "perf-series" => &["cpu.sample_percent"],
         "host-sampler" => &["host.cpu_percent", "host.memory_used_bytes"],
         "sysstat" => &["host.cpu_percent"],

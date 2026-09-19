@@ -631,12 +631,17 @@ pub(crate) fn parse_standard_output(
     use std::io::Read;
     let mut bytes = Vec::new();
     decoder.read_to_end(&mut bytes)?;
+    if matches!(parser, CollectorParser::SlpWindows) {
+        // SQLの文字列literalに任意のbyteが入り得るので、1行が壊れていても全体は読む。
+        return Ok(parse_slp_windows(&String::from_utf8_lossy(&bytes)));
+    }
     let raw = String::from_utf8(bytes).context("stream did not contain valid UTF-8")?;
     match parser {
         CollectorParser::AlpJson => parse_alp_json(&raw, routes),
         CollectorParser::MysqlSlow => unreachable!("handled by streaming parser"),
         CollectorParser::SlpJson => parse_slp_json(&raw),
         CollectorParser::SlpTsv => parse_slp_tsv(&raw),
+        CollectorParser::SlpWindows => unreachable!("handled before UTF-8 validation"),
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
         CollectorParser::ServiceCgroup => Ok(parse_service_cgroup(&raw, interval)),
         CollectorParser::PerfScript => parse_perf_script(&raw),
@@ -1457,6 +1462,81 @@ fn parse_slp_tsv(raw: &str) -> Result<Vec<Metric>> {
     Ok(metrics)
 }
 
+/// 表示とindexに載せる文の長さの上限。slpは一括INSERTをまとめるが、念のため切る。
+const DIGEST_LIMIT: usize = 1024;
+
+/// `window \t count \t query \t sum \t max \t p95 \t p99 \t lock \t rows_sent \t rows_examined`
+/// （時間は秒）。node上で区間（initialize、load、whole）ごとに集計したslpの出力で、
+/// `{`で始まる行は同じcollectorが出したDB全体の時系列なので、protocolとして別に読む。
+fn parse_slp_windows(raw: &str) -> Vec<Metric> {
+    let mut metrics = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() || line.starts_with('{') {
+            continue;
+        }
+        let mut head = line.splitn(3, '\t');
+        let (Some(window), Some(count), Some(rest)) = (head.next(), head.next(), head.next())
+        else {
+            continue;
+        };
+        // queryにtabが入っても崩れないよう、数値の列は右から取る。
+        let mut tail = rest.rsplitn(8, '\t');
+        let fields = (0..8).map(|_| tail.next()).collect::<Vec<_>>();
+        let [
+            Some(rows_examined),
+            Some(rows_sent),
+            Some(lock),
+            Some(p99),
+            Some(p95),
+            Some(max),
+            Some(sum),
+            Some(query),
+        ] = fields[..]
+        else {
+            continue;
+        };
+        let number = |value: &str| value.trim().parse::<f64>().ok();
+        let (Some(count), Some(sum)) = (number(count), number(sum)) else {
+            continue;
+        };
+        let mut digest = query.trim().to_owned();
+        if digest.len() > DIGEST_LIMIT {
+            let mut end = DIGEST_LIMIT;
+            while !digest.is_char_boundary(end) {
+                end -= 1;
+            }
+            digest.truncate(end);
+            digest.push('…');
+        }
+        let labels = BTreeMap::from([
+            ("digest".into(), digest),
+            ("engine".into(), "mysql".into()),
+            ("window".into(), window.to_owned()),
+        ]);
+        let mut push = |name: &str, value: Option<f64>, unit: &str| {
+            if let Some(value) = value {
+                metrics.push(Metric {
+                    name: name.into(),
+                    value,
+                    unit: unit.into(),
+                    timestamp: None,
+                    labels: labels.clone(),
+                });
+            }
+        };
+        let ms = |value: Option<f64>| value.map(|seconds| seconds * 1_000.0);
+        push("db.query.calls", Some(count), "queries");
+        push("db.query.total_duration", Some(sum * 1_000.0), "ms");
+        push("db.query.duration_max", ms(number(max)), "ms");
+        push("db.query.p95_duration", ms(number(p95)), "ms");
+        push("db.query.p99_duration", ms(number(p99)), "ms");
+        push("db.query.lock_duration", ms(number(lock)), "ms");
+        push("db.query.rows_sent", number(rows_sent), "rows");
+        push("db.query.rows_examined", number(rows_examined), "rows");
+    }
+    metrics
+}
+
 fn parse_sysstat(
     raw: &str,
     interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
@@ -1828,6 +1908,7 @@ fn make_spec(
     } else {
         None
     };
+    let windows = RunWindows::read(run_dir);
     let expanded = collector
         .command
         .iter()
@@ -1840,6 +1921,8 @@ fn make_spec(
                 route_matching_groups.as_deref(),
                 &config.config.observability.service_units,
             )
+            .replace("{load_started_at}", &windows.load_started_at)
+            .replace("{benchmark_finished_at}", &windows.finished_at)
         })
         .collect::<Vec<_>>();
     let (program, args) = expanded
@@ -1894,6 +1977,38 @@ fn self_program(program: &str) -> String {
         return current.display().to_string();
     }
     program.to_owned()
+}
+
+/// after phaseのcollectorへ渡す区間の境界（epoch秒）。分からなければ空文字列で、
+/// collectorは区間を分けずに全体（whole）として集計する。
+struct RunWindows {
+    load_started_at: String,
+    finished_at: String,
+}
+
+impl RunWindows {
+    fn read(run_dir: &Path) -> Self {
+        let manifest = fs::read(run_dir.join("run.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<crate::model::RunManifest>(&raw).ok());
+        let epoch = |value: Option<chrono::DateTime<Utc>>| {
+            value
+                .map(|at| format!("{:.3}", at.timestamp_micros() as f64 / 1_000_000.0))
+                .unwrap_or_default()
+        };
+        Self {
+            load_started_at: epoch(
+                manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.benchmark.initialize_finished_at),
+            ),
+            finished_at: epoch(
+                manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.benchmark.finished_at),
+            ),
+        }
+    }
 }
 
 fn replace_placeholders(
@@ -1970,6 +2085,73 @@ fn matches_phase(left: CollectorPhase, right: CollectorPhase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slp_windows_keep_initialize_and_load_apart() {
+        // 実際のcollectorとslp 0.2.1で、practice-12のslow logの抜粋を集計した出力。
+        let raw = include_str!("../tests/fixtures/slp-windows-v0.2.1.out");
+        let metrics = parse_slp_windows(raw);
+        let value = |window: &str, name: &str, digest: &str| {
+            metrics
+                .iter()
+                .find(|metric| {
+                    metric.name == name
+                        && metric.labels["window"] == window
+                        && metric.labels["digest"].contains(digest)
+                })
+                .map(|metric| metric.value)
+        };
+        // 負荷区間のid_generatorは7回（ベンチ終了後に流れた1回は区間外として捨てた）。
+        assert_eq!(value("load", "db.query.calls", "id_generator"), Some(7.0));
+        assert_eq!(
+            value("load", "db.query.total_duration", "id_generator").map(|ms| ms.round()),
+            Some(221.0)
+        );
+        assert!(value("load", "db.query.p99_duration", "id_generator").is_some());
+        assert!(value("load", "db.query.duration_max", "id_generator").is_some());
+        assert_eq!(
+            value("load", "db.query.rows_examined", "COUNT(N)"),
+            Some(623.0)
+        );
+        // 一括INSERTはVALUESが1つにまとまり、initializeの区間に入る。
+        assert_eq!(
+            value("initialize", "db.query.calls", "INSERT INTO `user_cards`"),
+            Some(1.0)
+        );
+        assert_eq!(
+            value("load", "db.query.calls", "INSERT INTO `user_cards`"),
+            None
+        );
+        // PingやPrepareはslpもawkも文として数えない。
+        assert!(
+            !metrics
+                .iter()
+                .any(|metric| metric.labels["digest"].contains("administrator"))
+        );
+        // DB全体の時系列（`{`の行）はprotocolとして別に読むので、ここには入らない。
+        assert!(!metrics.iter().any(|metric| metric.name == "db.calls"));
+    }
+
+    #[test]
+    fn slp_windows_cap_long_statements_and_survive_tabs_in_queries() {
+        let long = format!("SELECT '{}'", "x".repeat(4000));
+        let raw = format!(
+            "load\t3\t{long}\t0.3\t0.2\t0.2\t0.2\t0\t1\t1\nload\t1\tSELECT a\tb\t0.1\t0.1\t0.1\t0.1\t0\t2\t3\n"
+        );
+        let metrics = parse_slp_windows(&raw);
+        let digests = metrics
+            .iter()
+            .filter(|metric| metric.name == "db.query.calls")
+            .map(|metric| metric.labels["digest"].clone())
+            .collect::<Vec<_>>();
+        assert!(
+            digests[0].chars().count() <= DIGEST_LIMIT + 1,
+            "{}",
+            digests[0].len()
+        );
+        assert!(digests[0].ends_with('…'));
+        assert_eq!(digests[1], "SELECT a\tb");
+    }
 
     #[test]
     fn perf_samples_on_the_monotonic_clock_become_wall_time() {

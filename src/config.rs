@@ -255,6 +255,8 @@ pub enum CollectorParser {
     MysqlSlow,
     SlpJson,
     SlpTsv,
+    /// 区間名を先頭に付けたslpのTSV。node上で区間ごとに集計したもの。
+    SlpWindows,
     Sysstat,
     ServiceCgroup,
     PerfScript,

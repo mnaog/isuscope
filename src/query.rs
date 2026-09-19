@@ -365,8 +365,15 @@ pub struct DatabaseQueryRow {
     pub node: String,
     pub engine: String,
     pub source: String,
-    pub digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// 照合には全文を使い、出力だけを切る（古いslpの一括INSERTは1文で数十万文字ある）。
+    #[serde(serialize_with = "serialize_capped")]
+    pub digest: String,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_capped_option"
+    )]
     pub sql_shape: Option<String>,
     pub digest_count: usize,
     pub digest_examples: Vec<String>,
@@ -427,6 +434,7 @@ pub fn database_query(
                 node: summary.node,
                 engine: summary.engine,
                 source: summary.source,
+                window: summary.window,
                 digest: summary.digest.clone(),
                 sql_shape: None,
                 digest_count: 1,
@@ -484,7 +492,7 @@ pub fn database_query_diff(
     candidate: DatabaseQueryOutput,
     limit: usize,
 ) -> QueryDiffOutput<DatabaseQueryRow> {
-    type Key = (String, String, String, String);
+    type Key = (String, String, String, Option<String>, String);
     let grouping = candidate.grouping;
     let base_run_id = base.run_id;
     let candidate_run_id = candidate.run_id;
@@ -499,6 +507,7 @@ pub fn database_query_diff(
                     row.node.clone(),
                     row.engine.clone(),
                     row.source.clone(),
+                    row.window.clone(),
                     row.digest.clone(),
                 ),
                 row,
@@ -514,6 +523,7 @@ pub fn database_query_diff(
                     row.node.clone(),
                     row.engine.clone(),
                     row.source.clone(),
+                    row.window.clone(),
                     row.digest.clone(),
                 ),
                 row,
@@ -527,8 +537,14 @@ pub fn database_query_diff(
         .collect::<BTreeSet<_>>();
     let mut rows = keys
         .into_iter()
-        .map(|(node, engine, source, digest)| {
-            let key = (node.clone(), engine.clone(), source.clone(), digest.clone());
+        .map(|(node, engine, source, window, digest)| {
+            let key = (
+                node.clone(),
+                engine.clone(),
+                source.clone(),
+                window.clone(),
+                digest.clone(),
+            );
             let base = base.remove(&key);
             let candidate = candidate.remove(&key);
             let changes = database_changes(base.as_ref(), candidate.as_ref());
@@ -537,7 +553,8 @@ pub fn database_query_diff(
                     ("node".into(), node),
                     ("engine".into(), engine),
                     ("source".into(), source),
-                    (grouping.into(), digest),
+                    ("window".into(), window.unwrap_or_else(|| "-".into())),
+                    (grouping.into(), capped(&digest)),
                 ]),
                 presence: presence(&base, &candidate),
                 base,
@@ -932,7 +949,7 @@ pub fn round_to(value: f64, decimals: u32) -> f64 {
 }
 
 fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<DatabaseQueryRow> {
-    type Key = (String, String, String, String);
+    type Key = (String, String, String, Option<String>, String);
     let mut groups = BTreeMap::<Key, Vec<report::DatabaseSummary>>::new();
     for summary in summaries {
         let shape = sql_shape(&summary.digest);
@@ -941,6 +958,7 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
                 summary.node.clone(),
                 summary.engine.clone(),
                 summary.source.clone(),
+                summary.window.clone(),
                 shape,
             ))
             .or_default()
@@ -948,7 +966,7 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
     }
     groups
         .into_iter()
-        .map(|((node, engine, source, shape), values)| {
+        .map(|((node, engine, source, window, shape), values)| {
             let calls = values.iter().map(|value| value.calls).sum::<f64>();
             let total_ms = values.iter().map(|value| value.total_ms).sum::<f64>();
             let lock_ms = values.iter().map(|value| value.lock_ms).sum::<f64>();
@@ -970,6 +988,7 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
                 node,
                 engine,
                 source,
+                window,
                 digest: shape.clone(),
                 sql_shape: Some(shape),
                 digest_count: digests.len(),
@@ -1081,6 +1100,39 @@ fn placeholder_only_tail(chars: &[char]) -> bool {
         && chars
             .iter()
             .all(|value| value.is_whitespace() || matches!(value, '(' | ')' | ',' | '?'))
+}
+
+/// JSONへ出すSQLの長さの上限。
+const DISPLAY_DIGEST_LIMIT: usize = 512;
+
+pub(crate) fn capped(value: &str) -> String {
+    let mut chars = value.chars();
+    let prefix = chars
+        .by_ref()
+        .take(DISPLAY_DIGEST_LIMIT)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+pub(crate) fn serialize_capped<S: serde::Serializer>(
+    value: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&capped(value))
+}
+
+fn serialize_capped_option<S: serde::Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.serialize_str(&capped(value)),
+        None => serializer.serialize_none(),
+    }
 }
 
 fn digest_example(digest: &str) -> String {

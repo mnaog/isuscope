@@ -1,0 +1,108 @@
+# Time: 2026-09-13T10:52:12.050068Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    79
+# Query_time: 0.000089  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1789296732;
+select @@version_comment limit 1;
+# Time: 2026-09-13T10:52:12.050185Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    79
+# Query_time: 0.000043  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1789296732;
+USE `isucon`;
+# Time: 2026-09-13T10:52:12.050249Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    79
+# Query_time: 0.000041  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1789296732;
+SELECT DATABASE();
+# Time: 2026-09-13T10:52:12.050345Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    79
+# Query_time: 0.000029  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1
+SET timestamp=1789296732;
+SELECT DATABASE();
+# Time: 2026-09-13T10:52:14.027304Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    80
+# Query_time: 0.465014  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1789296733;
+INSERT INTO `user_cards` VALUES (1042148,9904038980,6,720,36,5336,1639932222,1639932222,NULL),(1244938,6377796084,2,37,37,6401,1587895275,1587895275,NULL),(1416794,6308985003,3,78,39,8936,1579495898,1579495898,NULL);
+# Time: 2026-09-13T10:53:03.015274Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    58
+# Query_time: 0.010886  Lock_time: 0.004889 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296783;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);
+# Time: 2026-09-13T10:53:03.020541Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    35
+# Query_time: 0.010873  Lock_time: 0.005657 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296783;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);
+# Time: 2026-09-13T10:53:03.027377Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    54
+# Query_time: 0.011694  Lock_time: 0.004845 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296783;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);
+# Time: 2026-09-13T10:53:03.033072Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    16
+# Query_time: 0.011953  Lock_time: 0.006019 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296783;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);
+# Time: 2026-09-13T10:53:03.038712Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    46
+# Query_time: 0.011043  Lock_time: 0.005405 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296783;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);
+# Time: 2026-09-13T10:53:03.152368Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    40
+# Query_time: 0.017916  Lock_time: 0.000001 Rows_sent: 22  Rows_examined: 645
+SET timestamp=1789296783;
+SELECT * FROM user_presents
+    WHERE user_id = 4937796125 AND deleted_at IS NULL
+    ORDER BY created_at DESC, id
+    LIMIT 100 OFFSET 0;
+# Time: 2026-09-13T10:53:03.155679Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    56
+# Query_time: 0.002179  Lock_time: 0.000001 Rows_sent: 1  Rows_examined: 623
+SET timestamp=1789296783;
+SELECT COUNT(*) FROM user_presents WHERE user_id = 4937796125 AND deleted_at IS NULL;
+# Time: 2026-09-13T10:53:03.158284Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    27
+# Query_time: 0.000282  Lock_time: 0.000001 Rows_sent: 22  Rows_examined: 22
+SET timestamp=1789296783;
+SELECT * FROM user_presents WHERE id IN (51696211832,69981609378,52671218117,3702798152,65451073106,65009280248,51572913019,24098678340,36246523562,23806868686,245620552,59771426515,87493797637,67198465714,61300933275,11677430945,42860181979,20572255358,5817224559,8712714219,5991916937,61398922620) AND deleted_at IS NULL;
+# Time: 2026-09-13T10:53:03.096380Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    45
+# Query_time: 0.000158  Lock_time: 0.000001 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1789296783;
+UPDATE user_sessions SET deleted_at=1661597583 WHERE user_id=4937796125 AND deleted_at IS NULL;
+# Time: 2026-09-13T10:53:03.104805Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    45
+# Query_time: 0.000189  Lock_time: 0.000001 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1789296783;
+INSERT INTO user_sessions(id, user_id, session_id, created_at, updated_at, expired_at) VALUES (31939, 4937796125, '09e96d21-6922-4783-ab13-2074533f91bb', 1661597583, 1661597583, 1661683983);
+# Time: 2026-09-13T10:53:03.004123Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    48
+# Query_time: 0.000023  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296783;
+# administrator command: Ping;
+# Time: 2026-09-13T10:53:03.004314Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    58
+# Query_time: 0.000017  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 5
+SET timestamp=1789296783;
+# administrator command: Ping;
+# Time: 2026-09-13T10:53:03.157949Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    27
+# Query_time: 0.000140  Lock_time: 0.000000 Rows_sent: 0  Rows_examined: 0
+SET timestamp=1789296783;
+# administrator command: Prepare;
+# Time: 2026-09-13T10:53:33.083965Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    45
+# Query_time: 0.081175  Lock_time: 0.074581 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296813;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);
+# Time: 2026-09-13T10:53:33.091855Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    37
+# Query_time: 0.082950  Lock_time: 0.074851 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296813;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);
+# Time: 2026-09-13T10:53:33.083965Z
+# User@Host: isucon[isucon] @ localhost [127.0.0.1]  Id:    45
+# Query_time: 0.081175  Lock_time: 0.074581 Rows_sent: 0  Rows_examined: 2
+SET timestamp=1789296900;
+UPDATE id_generator SET id=LAST_INSERT_ID(id+1);

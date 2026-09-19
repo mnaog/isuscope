@@ -23,6 +23,9 @@ pub struct BriefOutput {
     /// Parser-kept benchmark output lines: why it failed and what the errors were.
     pub benchmark_messages: BriefBenchmarkMessages,
     pub http: BriefSection<HttpRouteSummary>,
+    /// DBの行を要約した区間（`load`など）。区間を持たない古いrunでは出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_window: Option<String>,
     pub database: BriefSection<DatabaseSummary>,
     pub omitted_alternative_database_rows: usize,
     pub cpu: BriefSection<CpuSummary>,
@@ -187,7 +190,7 @@ pub fn build(
     let (coverage_issues, coverage_info_count) = coverage_issues(diagnostics.coverage);
     let mut http = diagnostics.http;
     http.iter_mut().for_each(query::round_http_summary);
-    let (mut database, omitted_alternative_database_rows) =
+    let (mut database, omitted_alternative_database_rows, database_window) =
         preferred_database(diagnostics.database);
     database.iter_mut().for_each(query::round_database_summary);
     let clients = client_nodes(&diagnostics.client);
@@ -223,6 +226,7 @@ pub fn build(
         score_inputs: section(score_inputs.rows, limit),
         benchmark_messages,
         http: section(http, limit),
+        database_window,
         database: section(database, limit),
         omitted_alternative_database_rows,
         cpu: section(diagnostics.cpu, limit),
@@ -310,17 +314,34 @@ fn severity_rank(value: &str) -> u8 {
     }
 }
 
-fn preferred_database(database: Vec<DatabaseSummary>) -> (Vec<DatabaseSummary>, usize) {
-    if !database.iter().any(|item| item.source == "mysql-log-delta") {
-        return (database, 0);
-    }
+/// DBの行を1つのsource・1つの区間へ絞る。区間ごとに集計されていれば負荷区間だけを使い、
+/// initializeの一括INSERTなどが上位を占めないようにする。
+fn preferred_database(
+    database: Vec<DatabaseSummary>,
+) -> (Vec<DatabaseSummary>, usize, Option<String>) {
     let total_count = database.len();
-    let database = database
+    let window = ["load", "whole"]
         .into_iter()
-        .filter(|item| item.source != "slp")
-        .collect::<Vec<_>>();
+        .find(|window| {
+            database
+                .iter()
+                .any(|item| item.window.as_deref() == Some(window))
+        })
+        .map(str::to_owned);
+    let database = match &window {
+        Some(window) => database
+            .into_iter()
+            .filter(|item| item.window.as_deref() == Some(window.as_str()))
+            .collect::<Vec<_>>(),
+        // 区間を持たない古いrun。slow logを手元で解析した行があればslpの行より優先する。
+        None if database.iter().any(|item| item.source == "mysql-log-delta") => database
+            .into_iter()
+            .filter(|item| item.source != "slp")
+            .collect(),
+        None => database,
+    };
     let omitted = total_count - database.len();
-    (database, omitted)
+    (database, omitted, window)
 }
 
 /// 同じmetricの中では値の大きい順に並べる。名前順のまま切ると、件数の多いエラーより
