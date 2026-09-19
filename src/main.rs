@@ -805,8 +805,28 @@ struct BucketRow {
     http_requests: f64,
     http_p95: Vec<f64>,
     http_errors: f64,
+    /// SQL別の5秒bucket（slp以前の自前解析）の合計。
     db_calls: f64,
     db_time: f64,
+    /// DB全体の5秒bucket（slp collectorの`db.calls`・`db.duration`）。あればこちらを使う。
+    db_total_calls: Option<f64>,
+    db_total_time: Option<f64>,
+}
+
+impl BucketRow {
+    /// DB全体の値があればそれを、無ければSQL別の値の合計を返す。両方を足すと二重に数える。
+    fn database(&self) -> (Option<f64>, Option<f64>) {
+        if self.db_total_calls.is_some() || self.db_total_time.is_some() {
+            return (
+                Some(self.db_total_calls.unwrap_or_default()),
+                Some(self.db_total_time.unwrap_or_default()),
+            );
+        }
+        (
+            observed_sum(self.db_calls, self.db_time != 0.0),
+            observed_sum(self.db_time, self.db_calls != 0.0),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -1228,6 +1248,8 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             }
             "db.query.calls" => row.db_calls += metric.value,
             "db.query.total_duration" => row.db_time += metric.value,
+            "db.calls" => *row.db_total_calls.get_or_insert(0.0) += metric.value,
+            "db.duration" => *row.db_total_time.get_or_insert(0.0) += metric.value,
             _ => {}
         }
     }
@@ -1259,8 +1281,8 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
                 ),
                 http_p95_ms_max_of_quantile: maximum_value(&row.http_p95),
                 http_errors: observed_sum(row.http_errors, row.http_requests != 0.0),
-                db_calls: observed_sum(row.db_calls, row.db_time != 0.0),
-                db_total_duration_ms: observed_sum(row.db_time, row.db_calls != 0.0),
+                db_calls: row.database().0,
+                db_total_duration_ms: row.database().1,
             }
         })
         .collect::<Vec<_>>();
@@ -1458,7 +1480,7 @@ fn preferred_cpu(row: &BucketRow) -> &[f64] {
 }
 
 fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<SeriesCoverage> {
-    const SERIES_COLLECTORS: [&str; 8] = [
+    const SERIES_COLLECTORS: [&str; 9] = [
         "host-sampler",
         "sysstat",
         "service-sampler",
@@ -1466,6 +1488,7 @@ fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<Serie
         "alp",
         "nginx-series",
         "mysql-log-delta",
+        "slp",
         "perf-series",
     ];
     collectors
@@ -1597,6 +1620,32 @@ mod series_tests {
             ..Default::default()
         };
         assert_eq!(preferred_cpu(&row), &[80.0]);
+    }
+
+    #[test]
+    fn overview_reads_the_database_totals_from_slp_before_per_statement_rows() {
+        // slp collectorはDB全体の5秒bucketを`db.calls`・`db.duration`で出す。
+        let slp = BucketRow {
+            db_total_calls: Some(42.0),
+            db_total_time: Some(840.0),
+            ..Default::default()
+        };
+        assert_eq!(slp.database(), (Some(42.0), Some(840.0)));
+        // 旧来のSQL別bucketしか無いrunは、その合計。
+        let legacy = BucketRow {
+            db_calls: 3.0,
+            db_time: 9.0,
+            ..Default::default()
+        };
+        assert_eq!(legacy.database(), (Some(3.0), Some(9.0)));
+        // 両方ある（新旧のcollectorが混ざった設定）なら、DB全体の値だけを使い二重に数えない。
+        let both = BucketRow {
+            db_calls: 3.0,
+            db_time: 9.0,
+            ..slp
+        };
+        assert_eq!(both.database(), (Some(42.0), Some(840.0)));
+        assert_eq!(BucketRow::default().database(), (None, None));
     }
 
     #[test]

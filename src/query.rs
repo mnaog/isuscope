@@ -384,6 +384,10 @@ pub struct DatabaseQueryRow {
     pub total_ms: f64,
     pub avg_ms: Option<f64>,
     pub p95_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p99_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ms: Option<f64>,
     pub lock_ms: f64,
     pub rows_sent: f64,
     pub rows_examined: f64,
@@ -447,6 +451,8 @@ pub fn database_query(
                 total_ms: summary.total_ms,
                 avg_ms: summary.avg_ms,
                 p95_ms: summary.p95_ms,
+                p99_ms: summary.p99_ms,
+                max_ms: summary.max_ms,
                 lock_ms: summary.lock_ms,
                 rows_sent: summary.rows_sent,
                 rows_examined: summary.rows_examined,
@@ -754,6 +760,16 @@ fn database_changes(
             candidate.and_then(|row| row.p95_ms),
         ),
         (
+            "p99_ms",
+            base.and_then(|row| row.p99_ms),
+            candidate.and_then(|row| row.p99_ms),
+        ),
+        (
+            "max_ms",
+            base.and_then(|row| row.max_ms),
+            candidate.and_then(|row| row.max_ms),
+        ),
+        (
             "lock_ms",
             base.map(|row| row.lock_ms),
             candidate.map(|row| row.lock_ms),
@@ -927,6 +943,8 @@ fn round_database_query_row(row: &mut DatabaseQueryRow) {
     row.total_ms = round_to(row.total_ms, 3);
     row.avg_ms = row.avg_ms.map(|value| round_to(value, 3));
     row.p95_ms = row.p95_ms.map(|value| round_to(value, 3));
+    row.p99_ms = row.p99_ms.map(|value| round_to(value, 3));
+    row.max_ms = row.max_ms.map(|value| round_to(value, 3));
     row.lock_ms = round_to(row.lock_ms, 3);
     row.rows_sent = round_to(row.rows_sent, 0);
     row.rows_examined = round_to(row.rows_examined, 0);
@@ -938,6 +956,8 @@ pub fn round_database_summary(row: &mut report::DatabaseSummary) {
     row.total_ms = round_to(row.total_ms, 3);
     row.avg_ms = row.avg_ms.map(|value| round_to(value, 3));
     row.p95_ms = row.p95_ms.map(|value| round_to(value, 3));
+    row.p99_ms = row.p99_ms.map(|value| round_to(value, 3));
+    row.max_ms = row.max_ms.map(|value| round_to(value, 3));
     row.lock_ms = round_to(row.lock_ms, 3);
     row.rows_sent = round_to(row.rows_sent, 0);
     row.rows_examined = round_to(row.rows_examined, 0);
@@ -995,12 +1015,20 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
                 .map(|value| (value.digest.clone(), value.digest_id.clone()))
                 .collect::<BTreeSet<_>>();
             let p95_ms = (digests.len() == 1).then(|| values[0].p95_ms).flatten();
+            let p99_ms = (digests.len() == 1).then(|| values[0].p99_ms).flatten();
+            // 最大は文をまたいでも最大のまま合わせられる。
+            let max_ms = values
+                .iter()
+                .filter_map(|value| value.max_ms)
+                .reduce(f64::max);
             let mut unavailable = BTreeMap::new();
             if digests.len() > 1 {
-                unavailable.insert(
-                    "p95_ms".into(),
-                    "scalar quantiles cannot be merged across digests".into(),
-                );
+                for field in ["p95_ms", "p99_ms"] {
+                    unavailable.insert(
+                        field.into(),
+                        "scalar quantiles cannot be merged across digests".into(),
+                    );
+                }
             }
             DatabaseQueryRow {
                 node,
@@ -1020,6 +1048,8 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
                 total_ms,
                 avg_ms: divide(total_ms, calls),
                 p95_ms,
+                p99_ms,
+                max_ms,
                 lock_ms,
                 rows_sent,
                 rows_examined,

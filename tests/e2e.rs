@@ -18,6 +18,8 @@ mod brief_shape;
 mod changes;
 #[path = "e2e/concurrency.rs"]
 mod concurrency;
+#[path = "e2e/database_views.rs"]
+mod database_views;
 #[path = "e2e/discovery.rs"]
 mod discovery;
 #[path = "e2e/doctor.rs"]

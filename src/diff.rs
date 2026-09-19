@@ -150,6 +150,8 @@ pub struct DatabaseDiff {
     pub total_ms: NumericDiff,
     pub avg_ms: NumericDiff,
     pub p95_ms: NumericDiff,
+    pub p99_ms: NumericDiff,
+    pub max_ms: NumericDiff,
     pub lock_ms: NumericDiff,
     pub rows_sent: NumericDiff,
     pub rows_examined: NumericDiff,
@@ -519,6 +521,14 @@ fn database_diff(
                 p95_ms: NumericDiff::new(
                     base.as_ref().and_then(|item| item.p95_ms),
                     candidate.as_ref().and_then(|item| item.p95_ms),
+                ),
+                p99_ms: NumericDiff::new(
+                    base.as_ref().and_then(|item| item.p99_ms),
+                    candidate.as_ref().and_then(|item| item.p99_ms),
+                ),
+                max_ms: NumericDiff::new(
+                    base.as_ref().and_then(|item| item.max_ms),
+                    candidate.as_ref().and_then(|item| item.max_ms),
                 ),
                 lock_ms: NumericDiff::new(
                     base.as_ref().map(|item| item.lock_ms),
