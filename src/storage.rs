@@ -247,7 +247,13 @@ impl Store {
     ) -> Result<PathBuf> {
         let staging = self.staging_dir(&manifest.id);
         write_manifest(&staging, manifest)?;
-        write_structured_snapshot(&staging, metrics, fingerprints, transitions)?;
+        write_structured_snapshot(
+            &staging,
+            DEFAULT_STRUCTURED_SNAPSHOT,
+            metrics,
+            fingerprints,
+            transitions,
+        )?;
         // directoryを移してからSQLiteを確定するまでの間に別processがStoreを開くと、runningの行を
         // 途中で落ちたrunと取り違えて入れ直してしまう。directoryのlockは移しても保たれるので、
         // 確定し終えるまで持つ（復旧側は同じlockを取ってから行の状態を見る）。
@@ -677,12 +683,36 @@ impl Store {
             params![analysis.id, analysis.base_run_id],
         )?;
         write_manifest(&final_dir, &manifest)?;
+        // 書いたrun.jsonをindexが確定した世代として記録する（次に開いたとき読み直さない）。
+        transaction.execute(
+            "UPDATE runs SET manifest_stamp=?2 WHERE id=?1",
+            params![manifest.id, manifest_stamp(&final_dir.join("run.json"))],
+        )?;
         transaction.commit()?;
         Ok(manifest)
     }
 
+    /// 保存済みのrunの読み書きを、analysisやenrichの間で1つずつにする。握っている間に
+    /// run.jsonを読み直し、それに変更を加えて書く（先に読んだrun.jsonを書き戻すと、その間に
+    /// 別processが加えたanalysisを消してしまう）。
+    pub fn lock_run(&self, id: &str) -> Result<RunLock> {
+        let final_dir = self.final_dir(id);
+        if !final_dir.is_dir() {
+            bail!("run `{id}` is not finalized");
+        }
+        Ok(RunLock(AnalysisLock::acquire(&final_dir)?))
+    }
+
+    /// benchmark parserの結果を置き換える。呼ぶ側は[`Self::lock_run`]を握ったまま、握った後に
+    /// 読んだ`manifest`を渡す。確定はrun.jsonを書いた時点で、順に
+    /// 1. 新しい世代のstructured snapshotを別名で書く
+    /// 2. それを指すrun.jsonを書く（ここより前に落ちれば、run.jsonもSQLiteも前の世代のまま）
+    /// 3. SQLiteを更新し、書いたrun.jsonの印を記録する（ここより前に落ちれば、次に開いたとき
+    ///    印が合わないので保存済みのrunから入れ直す）
+    /// 4. 前の世代のsnapshotを消す
     pub fn replace_enrichments(
         &mut self,
+        _lock: &RunLock,
         manifest: &mut RunManifest,
         outputs: Vec<EnrichmentOutput>,
     ) -> Result<()> {
@@ -698,6 +728,21 @@ impl Store {
         );
         names.sort();
         names.dedup();
+        let run_dir = self.final_dir(&manifest.id);
+        let mut snapshot = match read_structured_snapshot(&run_dir, manifest)? {
+            Some(snapshot) => snapshot,
+            None => self.structured_snapshot_from_database(&manifest.id)?,
+        };
+        snapshot.metrics.retain(|metric| {
+            metric
+                .labels
+                .get(PARSER_LABEL)
+                .is_none_or(|parser| !names.contains(parser))
+        });
+        for output in &outputs {
+            snapshot.metrics.extend(output.metrics.iter().cloned());
+        }
+
         manifest.enrichments.clear();
         manifest
             .logs
@@ -706,6 +751,21 @@ impl Store {
             manifest.enrichments.push(output.result.clone());
             manifest.logs.extend(output.logs.clone());
         }
+        manifest.metric_count = snapshot.metrics.len();
+        // parserの失敗・回復はrunの状態にも効く（初回の確定と同じ判定）。
+        manifest.settle_state();
+
+        let previous = structured_snapshot_path(&run_dir, manifest);
+        let name = format!("structured-{}.json.zst", Uuid::now_v7());
+        write_structured_snapshot(
+            &run_dir,
+            &name,
+            &snapshot.metrics,
+            &snapshot.fingerprints,
+            &snapshot.transitions,
+        )?;
+        manifest.structured_snapshot = Some(name);
+        write_manifest(&run_dir, manifest)?;
 
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -749,37 +809,25 @@ impl Store {
                 ],
             )?;
         }
-        let metric_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM metrics WHERE run_id=?1",
-            [&manifest.id],
-            |row| row.get(0),
+        transaction.execute(
+            "UPDATE runs SET state=?2, manifest_stamp=?3 WHERE id=?1",
+            params![
+                manifest.id,
+                manifest.state.as_str(),
+                manifest_stamp(&run_dir.join("run.json"))
+            ],
         )?;
         transaction.commit()?;
-        manifest.metric_count = metric_count as usize;
-        // Keep the recovery snapshot in lockstep with parser enrichment. This
-        // deliberately happens before run.json so a crash cannot advertise a
-        // metric count that its snapshot does not contain.
-        let run_dir = self.final_dir(&manifest.id);
-        let mut snapshot = match read_structured_snapshot(&run_dir)? {
-            Some(snapshot) => snapshot,
-            None => self.structured_snapshot_from_database(&manifest.id)?,
-        };
-        snapshot.metrics.retain(|metric| {
-            metric
-                .labels
-                .get(PARSER_LABEL)
-                .is_none_or(|parser| !names.contains(parser))
-        });
-        for output in outputs {
-            snapshot.metrics.extend(output.metrics);
+
+        // 前の世代と、途中で落ちた試みが残した世代を消す。
+        let current = structured_snapshot_path(&run_dir, manifest);
+        for entry in fs::read_dir(&run_dir)?.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path != current && (is_snapshot_name(&name) || path == previous) {
+                let _ = fs::remove_file(path);
+            }
         }
-        write_structured_snapshot(
-            &run_dir,
-            &snapshot.metrics,
-            &snapshot.fingerprints,
-            &snapshot.transitions,
-        )?;
-        write_manifest(&run_dir, manifest)?;
         Ok(())
     }
 
@@ -858,6 +906,20 @@ impl Store {
                 continue;
             }
             let _lock = AnalysisLock::acquire(&run_dir)?;
+            // lockを待つ間に、別processがこのrunを確定し終えていることがある。
+            let stamp = manifest_stamp(&manifest_path);
+            let recorded = self
+                .connection
+                .query_row(
+                    "SELECT manifest_stamp FROM runs WHERE id=?1",
+                    [entry.file_name().to_string_lossy()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            if stamp.is_some() && recorded == stamp {
+                continue;
+            }
             let manifest: RunManifest = match fs::read(&manifest_path)
                 .with_context(|| format!("cannot read {}", manifest_path.display()))
                 .and_then(|raw| {
@@ -882,7 +944,11 @@ impl Store {
             // runningのまま残る。その行はscoreもmetricも無いので、保存済みのrunから入れ直す。
             let unfinished = indexed_state.as_deref() == Some(RunState::Running.as_str())
                 && manifest.state != RunState::Running;
-            if indexed_state.is_some() && !unfinished {
+            // SQLiteに印があって一致しないなら、run.jsonを書き換えた後、SQLiteを確定する前に
+            // 落ちた（analysisやenrich）。どこまで入ったか分からないので、保存済みのrunから入れ直す。
+            // 印の無い行（印を残す前のversionで確定したrun）は、analysisだけを合わせる。
+            let stale = recorded.is_some();
+            if indexed_state.is_some() && !unfinished && !stale {
                 // A durable manifest may be newer than SQLite after interruption.
                 let tx = self.connection.transaction()?;
                 for a in &manifest.analyses {
@@ -898,7 +964,7 @@ impl Store {
             }
 
             let (metrics, fingerprints, transitions) =
-                if let Some(snapshot) = read_structured_snapshot(&run_dir)? {
+                if let Some(snapshot) = read_structured_snapshot(&run_dir, &manifest)? {
                     (
                         snapshot.metrics,
                         snapshot.fingerprints,
@@ -1043,8 +1109,25 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn structured_snapshot_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("structured.json.zst")
+const DEFAULT_STRUCTURED_SNAPSHOT: &str = "structured.json.zst";
+
+/// run.jsonが指すstructured snapshotの場所（[`RunManifest::structured_snapshot`]）。
+fn structured_snapshot_path(run_dir: &Path, manifest: &RunManifest) -> PathBuf {
+    run_dir.join(
+        manifest
+            .structured_snapshot
+            .as_deref()
+            .filter(|name| is_snapshot_name(name))
+            .unwrap_or(DEFAULT_STRUCTURED_SNAPSHOT),
+    )
+}
+
+/// run directoryの中のstructured snapshotのfile名か（run.jsonの値でdirectoryの外を指させない）。
+fn is_snapshot_name(name: &str) -> bool {
+    name.starts_with("structured")
+        && name.ends_with(".json.zst")
+        && !name.contains('/')
+        && !name.contains('\\')
 }
 
 fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) -> Result<()> {
@@ -1086,12 +1169,13 @@ fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) 
 
 fn write_structured_snapshot(
     run_dir: &Path,
+    name: &str,
     metrics: &[Metric],
     fingerprints: &[Fingerprint],
     transitions: &[Transition],
 ) -> Result<()> {
-    let path = structured_snapshot_path(run_dir);
-    let temporary = run_dir.join("structured.json.zst.tmp");
+    let path = run_dir.join(name);
+    let temporary = run_dir.join(format!("{name}.tmp"));
     let output = fs::File::create(&temporary)?;
     let mut encoder = zstd::stream::write::Encoder::new(output, 3)?;
     serde_json::to_writer(
@@ -1108,8 +1192,11 @@ fn write_structured_snapshot(
     Ok(())
 }
 
-fn read_structured_snapshot(run_dir: &Path) -> Result<Option<StructuredSnapshot>> {
-    let path = structured_snapshot_path(run_dir);
+fn read_structured_snapshot(
+    run_dir: &Path,
+    manifest: &RunManifest,
+) -> Result<Option<StructuredSnapshot>> {
+    let path = structured_snapshot_path(run_dir, manifest);
     if !path.is_file() {
         return Ok(None);
     }
@@ -1232,6 +1319,9 @@ pub(crate) fn write_manifest(run_dir: &Path, manifest: &RunManifest) -> Result<(
     fs::File::open(run_dir)?.sync_all()?;
     Ok(())
 }
+
+/// [`Store::lock_run`]で握るrunのlock。dropで外れる。
+pub struct RunLock(#[allow(dead_code)] AnalysisLock);
 
 struct AnalysisLock(fs::File);
 
@@ -1491,6 +1581,7 @@ mod tests {
             metric_count: 0,
             fingerprint_count: 0,
             transition_count: 0,
+            structured_snapshot: None,
         };
         store.begin(&manifest).unwrap();
         drop(store);

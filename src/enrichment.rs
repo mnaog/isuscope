@@ -49,11 +49,12 @@ pub async fn enrich_saved(config: &LoadedConfig, requested: &str) -> Result<Enri
     let id = store
         .resolve_id(requested)?
         .with_context(|| format!("run `{requested}` was not found"))?;
+    // parserを動かしてから確定するまでrunを握る。握った後に読んだrun.jsonへ変更を加えるので、
+    // その間にanalysisが加わって消えることも、enrichが重なってparserのlogを取り合うことも無い
+    // （analyzeは握れるまで待つ）。
+    let lock = store.lock_run(&id)?;
     let mut manifest = store.load(&id)?;
     let run_dir = store.final_dir(&id);
-    if !run_dir.is_dir() {
-        anyhow::bail!("run `{requested}` is not finalized");
-    }
     let enrichment_id = Uuid::now_v7().to_string();
     let relative_tooling = format!("tooling/enrichments/{enrichment_id}");
     if let Err(error) = tooling::capture(config, &run_dir.join(&relative_tooling)) {
@@ -67,7 +68,7 @@ pub async fn enrich_saved(config: &LoadedConfig, requested: &str) -> Result<Enri
         .iter()
         .any(|output| output.result.status == "failed");
     let parser_count = outputs.len();
-    store.replace_enrichments(&mut manifest, outputs)?;
+    store.replace_enrichments(&lock, &mut manifest, outputs)?;
     Ok(EnrichOutcome {
         run_id: id,
         parser_count,

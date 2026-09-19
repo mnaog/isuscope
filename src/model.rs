@@ -318,6 +318,25 @@ fn is_zero(value: &usize) -> bool {
 }
 
 impl RunManifest {
+    /// ベンチ、collector、benchmark parserの結果からrunの状態を決める。初回の確定とenrichの
+    /// 両方から呼ぶ（enrichでparserが失敗・回復したら、状態もそれに合わせる）。
+    pub fn settle_state(&mut self) {
+        let collector_degraded = self
+            .collectors
+            .iter()
+            .any(|collector| collector.status == "failed");
+        let enrichment_degraded = self
+            .enrichments
+            .iter()
+            .any(|enrichment| enrichment.status == "failed");
+        self.state = match self.benchmark.passed {
+            _ if self.benchmark.interrupted => RunState::Aborted,
+            Some(true) if collector_degraded || enrichment_degraded => RunState::Degraded,
+            Some(true) => RunState::Complete,
+            _ => RunState::Failed,
+        };
+    }
+
     /// Parser messages of one kind in parser order.
     pub fn benchmark_messages(
         &self,
@@ -379,6 +398,11 @@ pub struct RunManifest {
     #[serde(default)]
     pub fingerprint_count: usize,
     pub transition_count: usize,
+    /// このrun.jsonが指すstructured snapshotのfile名。enrichは新しい世代を別名で書いてから
+    /// run.jsonを書き換えるので、途中で落ちてもrun.jsonと同じ世代のsnapshotが残る。
+    /// 無ければ`structured.json.zst`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_snapshot: Option<String>,
 }
 
 #[cfg(test)]

@@ -138,6 +138,7 @@ pub async fn execute(
         metric_count: 0,
         fingerprint_count: 0,
         transition_count: 0,
+        structured_snapshot: None,
     };
     store.begin(&manifest)?;
 
@@ -251,20 +252,7 @@ pub async fn execute(
         });
     }
 
-    let collector_degraded = manifest
-        .collectors
-        .iter()
-        .any(|collector| collector.status == "failed");
-    let enrichment_degraded = manifest
-        .enrichments
-        .iter()
-        .any(|enrichment| enrichment.status == "failed");
-    manifest.state = match manifest.benchmark.passed {
-        _ if manifest.benchmark.interrupted => RunState::Aborted,
-        Some(true) if collector_degraded || enrichment_degraded => RunState::Degraded,
-        Some(true) => RunState::Complete,
-        _ => RunState::Failed,
-    };
+    manifest.settle_state();
     manifest.finished_at = Some(Utc::now());
     manifest.analysis_status = if manifest.benchmark.passed == Some(true) {
         AnalysisStatus::Pending
