@@ -1,0 +1,8 @@
+time:2026-09-17T14:00:59+00:00	method:POST	uri:/initialize	status:200	size:19	reqtime:0.500	apptime:0.500	conn:1	connreqs:1	msec:1789653659.900	upstream_addr:10.0.0.1:8080	upstream_connect:0.000	upstream_header:0.500
+time:2026-09-17T14:01:00+00:00	method:GET	uri:/user/1/home?x=1	status:200	size:100	reqtime:0.010	apptime:0.009	conn:2	connreqs:1	msec:1789653660.010	upstream_addr:10.0.0.1:8080	upstream_connect:0.001	upstream_header:0.009
+time:2026-09-17T14:01:00+00:00	method:GET	uri:/user/1/home	status:200	size:100	reqtime:0.020	apptime:0.019	conn:2	connreqs:2	msec:1789653660.100	upstream_addr:10.0.0.2:8080	upstream_connect:0.000	upstream_header:0.019
+time:2026-09-17T14:01:01+00:00	method:GET	uri:/user/2/home	status:200	size:100	reqtime:0.030	apptime:0.029	conn:3	connreqs:1	msec:1789653661.000	upstream_addr:10.0.0.9:8080, 10.0.0.1:8080	upstream_connect:0.002, 0.001	upstream_header:-, 0.028
+time:2026-09-17T14:01:02+00:00	method:POST	uri:/login	status:401	size:10	reqtime:0.005	apptime:0.005	conn:3	connreqs:2	msec:1789653662.000	upstream_addr:10.0.0.2:8080	upstream_connect:0.000	upstream_header:0.005
+time:2026-09-17T14:01:05+00:00	method:GET	uri:/user/1/home	status:200	size:100	reqtime:0.040	apptime:0.039	conn:2	connreqs:3	msec:1789653665.500	upstream_addr:10.0.0.1:8080	upstream_connect:0.000	upstream_header:0.039
+time:2026-09-17T14:01:06+00:00	method:POST	uri:/login	status:200	size:10	reqtime:0.006	apptime:0.006	conn:4	connreqs:1	msec:1789653666.000	upstream_addr:10.0.0.2:8080	upstream_connect:0.000	upstream_header:0.006
+time:2026-09-17T14:01:30+00:00	method:GET	uri:/health	status:200	size:2	reqtime:0.001	apptime:-	conn:5	connreqs:1	msec:1789653690.000	upstream_addr:-	upstream_connect:-	upstream_header:-

@@ -77,57 +77,11 @@ struct Event {
     route: String,
 }
 
-#[derive(Default)]
-struct RouteStats {
-    requests_by_status: BTreeMap<String, u64>,
-    request_durations_ms: Vec<f64>,
-    upstream_durations_ms: Vec<f64>,
-    response_bytes: u64,
-    reused_requests: u64,
-}
-
-/// Per upstream address, from `$upstream_addr` and the upstream timings. Answers which
-/// backend was slow, and whether the time went into connecting, generating or transferring.
-#[derive(Default)]
-struct UpstreamStats {
-    requests: u64,
-    retried_requests: u64,
-    connect_ms: Vec<f64>,
-    header_ms: Vec<f64>,
-    response_ms: Vec<f64>,
-}
-
-struct ReadState<'a> {
-    sessions: &'a mut BTreeMap<String, Vec<Event>>,
-    route_stats: &'a mut BTreeMap<(String, String, String), RouteStats>,
-    bucket_stats: &'a mut BTreeMap<(DateTime<Utc>, String, String, String), RouteStats>,
-    connections: &'a mut ConnectionStats,
-    upstreams: &'a mut BTreeMap<(String, String), UpstreamStats>,
-    interval: Option<(DateTime<Utc>, DateTime<Utc>)>,
-}
-
-/// How the load generator used its connections, from `$connection` and `$msec` in the log.
-/// Server time is one part of a client's cycle; the rest shows up as the gap between the
-/// response and that connection's next request, and as how many connections it keeps open.
-#[derive(Default)]
-struct ConnectionStats {
-    /// (node, connection id) -> first request start, last response end, request count.
-    open: BTreeMap<(String, String), Connection>,
-    /// Gaps between one response and the next request on the same connection.
-    gaps_ms: BTreeMap<(DateTime<Utc>, String), Vec<f64>>,
-    opened: BTreeMap<(DateTime<Utc>, String), u64>,
-}
-
-struct Connection {
-    first_start: f64,
-    last_end: f64,
-    requests: u64,
-}
-
+/// 5秒bucketの幅。node上の集計（alp、slp、perf-series）と同じ区切りで時系列を並べる。
 pub(crate) const BUCKET_SECONDS: i64 = 5;
 
-const MAX_ROUTE_SERIES: usize = 1_024;
-
+/// survey-runで持ち帰った生のaccess logから、session単位の遷移を作る。route別の集計、時系列、
+/// 接続とupstreamの値はnode上のalp collectorが作るので、ここでは遷移だけを扱う。
 pub struct TransitionOptions<'a> {
     pub run_dir: &'a Path,
     pub prefix: &'a str,
@@ -136,18 +90,6 @@ pub struct TransitionOptions<'a> {
     pub session_field: &'a str,
     pub method_field: &'a str,
     pub uri_field: &'a str,
-    pub status_field: &'a str,
-    pub request_time_field: &'a str,
-    pub upstream_time_field: &'a str,
-    pub bytes_field: &'a str,
-    pub connection_requests_field: &'a str,
-    pub connection_field: &'a str,
-    pub upstream_field: &'a str,
-    pub upstream_connect_time_field: &'a str,
-    pub upstream_header_time_field: &'a str,
-    /// Log field holding the response end as epoch seconds (nginx `$msec`).
-    pub end_time_field: &'a str,
-    pub series_only: bool,
 }
 
 pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
@@ -155,32 +97,10 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
     let mut paths = find_logs(options.run_dir, options.prefix)?;
     paths.sort();
     let mut sessions: BTreeMap<String, Vec<Event>> = BTreeMap::new();
-    let mut route_stats: BTreeMap<(String, String, String), RouteStats> = BTreeMap::new();
-    let mut bucket_stats: BTreeMap<(DateTime<Utc>, String, String, String), RouteStats> =
-        BTreeMap::new();
-    let mut connections = ConnectionStats::default();
-    let mut upstreams: BTreeMap<(String, String), UpstreamStats> = BTreeMap::new();
-    let interval = benchmark_interval(options.run_dir);
     for path in paths {
-        let node = node_from_path(&path, options.prefix);
-        let mut state = ReadState {
-            sessions: &mut sessions,
-            route_stats: &mut route_stats,
-            bucket_stats: &mut bucket_stats,
-            connections: &mut connections,
-            upstreams: &mut upstreams,
-            interval,
-        };
-        read_log(&path, &node, &options, &rules, &mut state)?;
+        read_log(&path, &options, &rules, &mut sessions)?;
     }
-
-    emit_connection_metrics(&mut connections)?;
-    emit_upstream_metrics(&mut upstreams)?;
     let mut edges: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
-    if options.series_only {
-        emit_bucket_metrics(&mut bucket_stats)?;
-        return Ok(0);
-    }
     for events in sessions.values_mut() {
         events.sort_by_key(|event| event.at);
         for pair in events.windows(2) {
@@ -208,463 +128,64 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
             }))?
         );
     }
-    emit_route_metrics(&mut route_stats)?;
-    emit_bucket_metrics(&mut bucket_stats)?;
     Ok(edges.len())
 }
 
-/// Emits per-bucket connection use and the run-level gap summary, per node.
-fn emit_connection_metrics(connections: &mut ConnectionStats) -> Result<()> {
-    if connections.open.is_empty() {
-        return Ok(());
-    }
-    // Average connections *in use* per bucket: each connection contributes the time between its
-    // first request and its last response. This is not how long the load generator held the
-    // socket: keepalive idle time after the last response is not in the access log, so it is not
-    // counted here. The number of sockets actually held is `host.tcp_established`, sampled from
-    // the kernel.
-    let mut busy_seconds: BTreeMap<(DateTime<Utc>, String), f64> = BTreeMap::new();
-    let mut requests_per_connection: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for ((node, _), connection) in &connections.open {
-        requests_per_connection
-            .entry(node.clone())
-            .or_default()
-            .push(connection.requests as f64);
-        let mut start = connection.first_start;
-        while start <= connection.last_end {
-            let Some(bucket) = bucket_start(start) else {
-                break;
-            };
-            let bucket_end = bucket.timestamp() as f64 + BUCKET_SECONDS as f64;
-            let end = connection.last_end.min(bucket_end);
-            *busy_seconds.entry((bucket, node.clone())).or_insert(0.0) += (end - start).max(0.0);
-            if end >= connection.last_end {
-                break;
-            }
-            start = end;
+fn read_log(
+    path: &Path,
+    options: &TransitionOptions<'_>,
+    rules: &RouteNormalizer,
+    sessions: &mut BTreeMap<String, Vec<Event>>,
+) -> Result<()> {
+    let input = fs::File::open(path)?;
+    let decoder = zstd::stream::read::Decoder::new(input)?;
+    let reader = BufReader::new(decoder);
+    // 行はあるのにmethodとuriを1件も取れなければ、log formatと設定が合っていない。
+    let mut lines = 0_u64;
+    let mut parsed = 0_u64;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
         }
-    }
-    for ((bucket, node), seconds) in &busy_seconds {
-        emit_metric_at(
-            "client.connections_in_use",
-            seconds / BUCKET_SECONDS as f64,
-            "connections",
-            BTreeMap::from([("node".into(), node.clone())]),
-            *bucket,
-        )?;
-    }
-    for ((bucket, node), opened) in &connections.opened {
-        emit_metric_at(
-            "client.connections_opened",
-            *opened as f64,
-            "connections",
-            BTreeMap::from([("node".into(), node.clone())]),
-            *bucket,
-        )?;
-    }
-    let mut run_gaps: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for ((bucket, node), gaps) in &mut connections.gaps_ms {
-        let labels = BTreeMap::from([("node".into(), node.clone())]);
-        emit_quantiles_at("client.request_gap", gaps, &labels, *bucket)?;
-        run_gaps
-            .entry(node.clone())
-            .or_default()
-            .extend(gaps.iter());
-    }
-    for (node, gaps) in &mut run_gaps {
-        let labels = BTreeMap::from([("node".into(), node.clone())]);
-        emit_duration_summary("client.request_gap", gaps, &labels)?;
-        emit_quantiles("client.request_gap", gaps, &labels)?;
-    }
-    for (node, requests) in &mut requests_per_connection {
-        let labels = BTreeMap::from([("node".into(), node.clone())]);
-        let Some(summary) = duration_summary(requests) else {
+        lines += 1;
+        let fields = parse_ltsv(&line);
+        let (Some(method), Some(uri)) = (
+            fields.get(options.method_field),
+            fields.get(options.uri_field),
+        ) else {
             continue;
         };
-        emit_metric(
-            "client.connection_requests_mean",
-            summary.mean,
-            "requests",
-            labels.clone(),
-        )?;
-        emit_metric(
-            "client.connection_requests_max",
-            summary.max,
-            "requests",
-            labels.clone(),
-        )?;
-        emit_metric(
-            "client.connections_opened_total",
-            requests.len() as f64,
-            "connections",
-            labels,
-        )?;
-    }
-    Ok(())
-}
-
-/// Follows one connection through the log: when it was opened, how many requests it carried
-/// and how long the load generator waited before sending the next one on it.
-fn record_connection(
-    fields: &BTreeMap<&str, &str>,
-    node: &str,
-    options: &TransitionOptions<'_>,
-    state: &mut ReadState<'_>,
-    at: Option<DateTime<Utc>>,
-) {
-    let (Some(id), Some(end), Some(duration_ms)) = (
-        fields.get(options.connection_field),
-        fields
-            .get(options.end_time_field)
-            .and_then(|value| value.parse::<f64>().ok()),
-        fields
-            .get(options.request_time_field)
-            .and_then(|value| parse_seconds_ms(value)),
-    ) else {
-        return;
-    };
-    if !within_interval(at, state.interval) {
-        return;
-    }
-    let start = end - duration_ms / 1_000.0;
-    let Some(bucket) = bucket_start(end) else {
-        return;
-    };
-    match state
-        .connections
-        .open
-        .get_mut(&(node.to_owned(), (*id).to_owned()))
-    {
-        Some(connection) => {
-            // Requests can be logged out of order within a connection; keep the outer bounds.
-            let gap_ms = (start - connection.last_end) * 1_000.0;
-            if gap_ms >= 0.0 {
-                state
-                    .connections
-                    .gaps_ms
-                    .entry((bucket, node.to_owned()))
-                    .or_default()
-                    .push(gap_ms);
-            }
-            connection.first_start = connection.first_start.min(start);
-            connection.last_end = connection.last_end.max(end);
-            connection.requests += 1;
-        }
-        None => {
-            state.connections.open.insert(
-                (node.to_owned(), (*id).to_owned()),
-                Connection {
-                    first_start: start,
-                    last_end: end,
-                    requests: 1,
-                },
-            );
-            *state
-                .connections
-                .opened
-                .entry((bucket, node.to_owned()))
-                .or_default() += 1;
-        }
-    }
-}
-
-/// Splits an nginx upstream field. Retries are comma separated, and a value can be `-`.
-fn upstream_values(value: &str) -> Vec<&str> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn record_upstream(
-    fields: &BTreeMap<&str, &str>,
-    node: &str,
-    options: &TransitionOptions<'_>,
-    state: &mut ReadState<'_>,
-) {
-    let Some(addresses) = fields
-        .get(options.upstream_field)
-        .map(|v| upstream_values(v))
-    else {
-        return;
-    };
-    // The last address is the one that served the response; earlier ones were retried.
-    let Some(address) = addresses.last().filter(|address| **address != "-") else {
-        return;
-    };
-    let stats = state
-        .upstreams
-        .entry((node.to_owned(), (*address).to_owned()))
-        .or_default();
-    stats.requests += 1;
-    if addresses.len() > 1 {
-        stats.retried_requests += 1;
-    }
-    // Times are per attempt; their total is what the request actually spent on that upstream.
-    for (field, values) in [
-        (options.upstream_connect_time_field, &mut stats.connect_ms),
-        (options.upstream_header_time_field, &mut stats.header_ms),
-        (options.upstream_time_field, &mut stats.response_ms),
-    ] {
-        let Some(raw) = fields.get(field) else {
+        parsed += 1;
+        let Some(session) = fields
+            .get(options.session_field)
+            .filter(|session| !session.is_empty() && **session != "-")
+        else {
             continue;
         };
-        let parts = upstream_values(raw);
-        if parts.iter().all(|part| *part == "-") {
+        let Some(at) = fields
+            .get(options.time_field)
+            .and_then(|value| parse_timestamp(value))
+        else {
             continue;
-        }
-        values.push(parts.into_iter().filter_map(parse_seconds_ms).sum());
+        };
+        let route = rules.normalize(uri.split('?').next().unwrap_or(uri));
+        sessions
+            .entry((*session).to_owned())
+            .or_default()
+            .push(Event {
+                at,
+                route: format!("{method} {route}"),
+            });
     }
-}
-
-fn emit_upstream_metrics(upstreams: &mut BTreeMap<(String, String), UpstreamStats>) -> Result<()> {
-    for ((node, upstream), stats) in upstreams {
-        let labels = BTreeMap::from([
-            ("node".into(), node.clone()),
-            ("upstream".into(), upstream.clone()),
-        ]);
-        emit_metric(
-            "http.upstream_requests",
-            stats.requests as f64,
-            "requests",
-            labels.clone(),
-        )?;
-        if stats.retried_requests > 0 {
-            emit_metric(
-                "http.upstream_retried_requests",
-                stats.retried_requests as f64,
-                "requests",
-                labels.clone(),
-            )?;
-        }
-        for (name, values) in [
-            ("http.upstream_connect_duration", &mut stats.connect_ms),
-            ("http.upstream_header_duration", &mut stats.header_ms),
-            ("http.upstream_response_duration", &mut stats.response_ms),
-        ] {
-            emit_duration_summary(name, values, &labels)?;
-            emit_quantiles(name, values, &labels)?;
-        }
+    if lines > 0 && parsed == 0 {
+        anyhow::bail!(
+            "{}: none of {lines} access-log lines had the `{}` and `{}` fields",
+            path.display(),
+            options.method_field,
+            options.uri_field
+        );
     }
-    Ok(())
-}
-
-fn bucket_start(epoch_seconds: f64) -> Option<DateTime<Utc>> {
-    let seconds = epoch_seconds as i64;
-    DateTime::from_timestamp(seconds.div_euclid(BUCKET_SECONDS) * BUCKET_SECONDS, 0)
-}
-
-fn emit_bucket_metrics(
-    bucket_stats: &mut BTreeMap<(DateTime<Utc>, String, String, String), RouteStats>,
-) -> Result<()> {
-    for ((timestamp, node, method, route), stats) in bucket_stats {
-        let labels = BTreeMap::from([
-            ("node".into(), node.clone()),
-            ("method".into(), method.clone()),
-            ("route".into(), route.clone()),
-        ]);
-        emit_metric_at(
-            "http.requests",
-            stats.requests_by_status.values().sum::<u64>() as f64,
-            "requests",
-            labels.clone(),
-            *timestamp,
-        )?;
-        let errors = stats
-            .requests_by_status
-            .iter()
-            .filter(|(class, _)| matches!(class.as_str(), "4xx" | "5xx"))
-            .map(|(_, count)| count)
-            .sum::<u64>();
-        emit_metric_at(
-            "http.errors",
-            errors as f64,
-            "requests",
-            labels.clone(),
-            *timestamp,
-        )?;
-        emit_quantiles_at(
-            "http.request_duration",
-            &mut stats.request_durations_ms,
-            &labels,
-            *timestamp,
-        )?;
-        emit_quantiles_at(
-            "http.upstream_duration",
-            &mut stats.upstream_durations_ms,
-            &labels,
-            *timestamp,
-        )?;
-    }
-    Ok(())
-}
-
-fn emit_quantiles_at(
-    name: &str,
-    values: &mut [f64],
-    labels: &BTreeMap<String, String>,
-    timestamp: DateTime<Utc>,
-) -> Result<()> {
-    values.sort_by(f64::total_cmp);
-    for (quantile, label) in [(0.50, "0.50"), (0.95, "0.95"), (0.99, "0.99")] {
-        if let Some(value) = percentile(values, quantile) {
-            let mut labels = labels.clone();
-            labels.insert("quantile".into(), label.into());
-            emit_metric_at(name, value, "ms", labels, timestamp)?;
-        }
-    }
-    Ok(())
-}
-
-fn emit_route_metrics(
-    route_stats: &mut BTreeMap<(String, String, String), RouteStats>,
-) -> Result<()> {
-    for ((node, method, route), stats) in route_stats {
-        let base_labels: BTreeMap<String, String> = BTreeMap::from([
-            ("node".into(), node.clone()),
-            ("method".into(), method.clone()),
-            ("route".into(), route.clone()),
-        ]);
-        let mut errors = 0_u64;
-        emit_metric(
-            "http.requests",
-            stats.requests_by_status.values().sum::<u64>() as f64,
-            "requests",
-            base_labels.clone(),
-        )?;
-        for (status_class, count) in &stats.requests_by_status {
-            let mut labels = base_labels.clone();
-            labels.insert("status_class".into(), status_class.clone());
-            emit_metric("http.requests", *count as f64, "requests", labels)?;
-            if matches!(status_class.as_str(), "4xx" | "5xx") {
-                errors += count;
-            }
-        }
-        emit_metric(
-            "http.errors",
-            errors as f64,
-            "requests",
-            base_labels.clone(),
-        )?;
-        emit_metric(
-            "http.response_bytes",
-            stats.response_bytes as f64,
-            "bytes",
-            base_labels.clone(),
-        )?;
-        emit_metric(
-            "http.connection_reused_requests",
-            stats.reused_requests as f64,
-            "requests",
-            base_labels.clone(),
-        )?;
-        emit_duration_summary(
-            "http.request_duration",
-            &stats.request_durations_ms,
-            &base_labels,
-        )?;
-        emit_quantiles(
-            "http.request_duration",
-            &mut stats.request_durations_ms,
-            &base_labels,
-        )?;
-        emit_duration_summary(
-            "http.upstream_duration",
-            &stats.upstream_durations_ms,
-            &base_labels,
-        )?;
-        emit_quantiles(
-            "http.upstream_duration",
-            &mut stats.upstream_durations_ms,
-            &base_labels,
-        )?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, PartialEq)]
-struct DurationSummary {
-    sum: f64,
-    mean: f64,
-    min: f64,
-    max: f64,
-}
-
-fn duration_summary(values: &[f64]) -> Option<DurationSummary> {
-    let (&first, rest) = values.split_first()?;
-    let (sum, min, max) = rest
-        .iter()
-        .fold((first, first, first), |(sum, min, max), value| {
-            (sum + value, min.min(*value), max.max(*value))
-        });
-    Some(DurationSummary {
-        sum,
-        mean: sum / values.len() as f64,
-        min,
-        max,
-    })
-}
-
-fn emit_duration_summary(
-    name: &str,
-    values: &[f64],
-    labels: &BTreeMap<String, String>,
-) -> Result<()> {
-    let Some(summary) = duration_summary(values) else {
-        return Ok(());
-    };
-    for (suffix, value) in [
-        ("sum", summary.sum),
-        ("mean", summary.mean),
-        ("min", summary.min),
-        ("max", summary.max),
-    ] {
-        emit_metric(&format!("{name}_{suffix}"), value, "ms", labels.clone())?;
-    }
-    Ok(())
-}
-
-fn emit_quantiles(name: &str, values: &mut [f64], labels: &BTreeMap<String, String>) -> Result<()> {
-    values.sort_by(f64::total_cmp);
-    for (quantile, label) in [(0.50, "0.50"), (0.95, "0.95"), (0.99, "0.99")] {
-        if let Some(value) = percentile(values, quantile) {
-            let mut labels = labels.clone();
-            labels.insert("quantile".into(), label.into());
-            emit_metric(name, value, "ms", labels)?;
-        }
-    }
-    Ok(())
-}
-
-fn emit_metric(name: &str, value: f64, unit: &str, labels: BTreeMap<String, String>) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "type": "metric",
-            "name": name,
-            "value": value,
-            "unit": unit,
-            "labels": labels,
-        }))?
-    );
-    Ok(())
-}
-
-fn emit_metric_at(
-    name: &str,
-    value: f64,
-    unit: &str,
-    labels: BTreeMap<String, String>,
-    timestamp: DateTime<Utc>,
-) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string(&json!({
-            "type": "metric", "name": name, "value": value, "unit": unit,
-            "timestamp": timestamp, "labels": labels,
-        }))?
-    );
     Ok(())
 }
 
@@ -704,214 +225,6 @@ fn load_rules(path: Option<&Path>) -> Result<Vec<RouteRule>> {
             })
         })
         .collect()
-}
-
-fn read_log(
-    path: &Path,
-    node: &str,
-    options: &TransitionOptions<'_>,
-    rules: &RouteNormalizer,
-    state: &mut ReadState<'_>,
-) -> Result<()> {
-    let input = fs::File::open(path)?;
-    let decoder = zstd::stream::read::Decoder::new(input)?;
-    let reader = BufReader::new(decoder);
-    for line in reader.lines() {
-        let line = line?;
-        let fields = parse_ltsv(&line);
-        let Some(method) = fields.get(options.method_field) else {
-            continue;
-        };
-        let Some(uri) = fields.get(options.uri_field) else {
-            continue;
-        };
-        let uri = uri.split('?').next().unwrap_or(uri);
-        let route = rules.normalize(uri);
-        let at = fields
-            .get(options.time_field)
-            .and_then(|value| parse_timestamp(value));
-        if options.series_only && !within_interval(at, state.interval) {
-            continue;
-        }
-        record_connection(&fields, node, options, state, at);
-        if !options.series_only || within_interval(at, state.interval) {
-            record_upstream(&fields, node, options, state);
-        }
-        if options.series_only {
-            let Some(at) = at else { continue };
-            let Some(bucket_at) = DateTime::from_timestamp(at.timestamp() / 5 * 5, 0) else {
-                continue;
-            };
-            let status_class = fields
-                .get(options.status_field)
-                .map(|status| status_class(status))
-                .unwrap_or_else(|| "unknown".into());
-            let mut bucket_route = route;
-            let new_key = (
-                bucket_at,
-                node.to_owned(),
-                (*method).to_owned(),
-                bucket_route.clone(),
-            );
-            if !state.bucket_stats.contains_key(&new_key)
-                && state.bucket_stats.len() >= MAX_ROUTE_SERIES
-            {
-                bucket_route = "/__cardinality_limit__".into();
-            }
-            let bucket = state
-                .bucket_stats
-                .entry((
-                    bucket_at,
-                    node.to_owned(),
-                    (*method).to_owned(),
-                    bucket_route,
-                ))
-                .or_default();
-            *bucket.requests_by_status.entry(status_class).or_default() += 1;
-            if let Some(value) = fields
-                .get(options.request_time_field)
-                .and_then(|value| parse_seconds_ms(value))
-            {
-                bucket.request_durations_ms.push(value);
-            }
-            if let Some(value) = fields
-                .get(options.upstream_time_field)
-                .and_then(|value| parse_upstream_seconds_ms(value))
-            {
-                bucket.upstream_durations_ms.push(value);
-            }
-            continue;
-        }
-        let mut stats_key = (node.to_owned(), (*method).to_owned(), route.clone());
-        if !state.route_stats.contains_key(&stats_key)
-            && state.route_stats.len() >= MAX_ROUTE_SERIES
-        {
-            stats_key.2 = "/__cardinality_limit__".into();
-        }
-        let bucket_route = stats_key.2.clone();
-        let stats = state.route_stats.entry(stats_key).or_default();
-        let status_class = fields
-            .get(options.status_field)
-            .map(|status| status_class(status))
-            .unwrap_or_else(|| "unknown".into());
-        *stats
-            .requests_by_status
-            .entry(status_class.clone())
-            .or_default() += 1;
-        if let Some(value) = fields
-            .get(options.request_time_field)
-            .and_then(|value| parse_seconds_ms(value))
-        {
-            stats.request_durations_ms.push(value);
-        }
-        if let Some(value) = fields
-            .get(options.upstream_time_field)
-            .and_then(|value| parse_upstream_seconds_ms(value))
-        {
-            stats.upstream_durations_ms.push(value);
-        }
-        stats.response_bytes += fields
-            .get(options.bytes_field)
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or_default();
-        if fields
-            .get(options.connection_requests_field)
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|value| value > 1)
-        {
-            stats.reused_requests += 1;
-        }
-
-        if let Some(at) = at
-            && let Some(bucket) = DateTime::from_timestamp(at.timestamp() / 5 * 5, 0)
-        {
-            let key = (bucket, node.to_owned(), (*method).to_owned(), bucket_route);
-            let bucket = state.bucket_stats.entry(key).or_default();
-            *bucket.requests_by_status.entry(status_class).or_default() += 1;
-            if let Some(value) = fields
-                .get(options.request_time_field)
-                .and_then(|value| parse_seconds_ms(value))
-            {
-                bucket.request_durations_ms.push(value);
-            }
-            if let Some(value) = fields
-                .get(options.upstream_time_field)
-                .and_then(|value| parse_upstream_seconds_ms(value))
-            {
-                bucket.upstream_durations_ms.push(value);
-            }
-        }
-
-        let Some(session) = fields.get(options.session_field) else {
-            continue;
-        };
-        if session.is_empty() || *session == "-" {
-            continue;
-        }
-        let Some(at) = at else {
-            continue;
-        };
-        state
-            .sessions
-            .entry((*session).to_owned())
-            .or_default()
-            .push(Event {
-                at,
-                route: format!("{method} {route}"),
-            });
-    }
-    Ok(())
-}
-
-fn benchmark_interval(run_dir: &Path) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let manifest: crate::model::RunManifest =
-        serde_json::from_slice(&fs::read(run_dir.join("run.json")).ok()?).ok()?;
-    Some((
-        manifest.benchmark.started_at?,
-        manifest.benchmark.finished_at?,
-    ))
-}
-
-fn within_interval(
-    timestamp: Option<DateTime<Utc>>,
-    interval: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> bool {
-    interval.is_none_or(|(start, end)| timestamp.is_some_and(|at| at >= start && at <= end))
-}
-
-fn node_from_path(path: &Path, prefix: &str) -> String {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unknown");
-    let value = name.strip_prefix(prefix).unwrap_or(name);
-    for suffix in ["-after-stdout.zst", "-during-stdout.zst", ".zst"] {
-        if let Some(value) = value.strip_suffix(suffix) {
-            return value.to_owned();
-        }
-    }
-    value.to_owned()
-}
-
-fn status_class(status: &str) -> String {
-    status
-        .chars()
-        .next()
-        .filter(char::is_ascii_digit)
-        .map(|first| format!("{first}xx"))
-        .unwrap_or_else(|| "unknown".into())
-}
-
-fn parse_seconds_ms(value: &str) -> Option<f64> {
-    value.parse::<f64>().ok().map(|value| value * 1_000.0)
-}
-
-fn parse_upstream_seconds_ms(value: &str) -> Option<f64> {
-    let values = value
-        .split([',', ':'])
-        .filter_map(|part| part.trim().parse::<f64>().ok())
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then(|| values.into_iter().sum::<f64>() * 1_000.0)
 }
 
 fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -967,24 +280,40 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
-    #[test]
-    fn reads_session_transitions_across_compressed_logs() {
-        let dir = tempdir().unwrap();
-        let logs = dir.path().join("logs");
+    fn options(dir: &Path) -> TransitionOptions<'_> {
+        TransitionOptions {
+            run_dir: dir,
+            prefix: "nginx-",
+            rules: None,
+            time_field: "time",
+            session_field: "session",
+            method_field: "method",
+            uri_field: "uri",
+        }
+    }
+
+    fn write_log(dir: &Path, lines: &[&str]) {
+        let logs = dir.join("logs");
         fs::create_dir_all(&logs).unwrap();
         let output = fs::File::create(logs.join("nginx-isu1.zst")).unwrap();
         let mut encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
-        writeln!(
-            encoder,
-            "time:2026-08-26T10:00:00+09:00\tsession:a\tmethod:GET\turi:/api/user/nao/icon"
-        )
-        .unwrap();
-        writeln!(
-            encoder,
-            "time:2026-08-26T10:00:01+09:00\tsession:a\tmethod:GET\turi:/api/livestream/42"
-        )
-        .unwrap();
+        for line in lines {
+            writeln!(encoder, "{line}").unwrap();
+        }
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn reads_session_transitions_across_compressed_logs() {
+        let dir = tempdir().unwrap();
+        write_log(
+            dir.path(),
+            &[
+                "time:2026-08-26T10:00:00+09:00\tsession:a\tmethod:GET\turi:/api/user/nao/icon",
+                "time:2026-08-26T10:00:01+09:00\tsession:a\tmethod:GET\turi:/api/livestream/42?x=1",
+                "time:2026-08-26T10:00:01+09:00\tsession:-\tmethod:GET\turi:/api/tag",
+            ],
+        );
         let rules = RouteNormalizer {
             rules: vec![
                 RouteRule {
@@ -1000,247 +329,29 @@ mod tests {
             ],
         };
         let mut sessions = BTreeMap::new();
-        let options = TransitionOptions {
-            run_dir: dir.path(),
-            prefix: "nginx-",
-            rules: None,
-            time_field: "time",
-            session_field: "session",
-            method_field: "method",
-            uri_field: "uri",
-            status_field: "status",
-            request_time_field: "reqtime",
-            upstream_time_field: "apptime",
-            bytes_field: "size",
-            connection_requests_field: "connreqs",
-            connection_field: "conn",
-            upstream_field: "upstream_addr",
-            upstream_connect_time_field: "upstream_connect",
-            upstream_header_time_field: "upstream_header",
-            end_time_field: "msec",
-            series_only: false,
-        };
-        let mut route_stats = BTreeMap::new();
-        let mut bucket_stats = BTreeMap::new();
-        let mut connections = ConnectionStats::default();
-        let mut upstreams = BTreeMap::new();
-        let mut state = ReadState {
-            sessions: &mut sessions,
-            route_stats: &mut route_stats,
-            bucket_stats: &mut bucket_stats,
-            connections: &mut connections,
-            upstreams: &mut upstreams,
-            interval: None,
-        };
         read_log(
-            &logs.join("nginx-isu1.zst"),
-            "isu1",
-            &options,
+            &dir.path().join("logs/nginx-isu1.zst"),
+            &options(dir.path()),
             &rules,
-            &mut state,
+            &mut sessions,
         )
         .unwrap();
+        assert_eq!(sessions.len(), 1);
         let events = sessions.get("a").unwrap();
         assert_eq!(events[0].route, "GET /api/user/:name/icon");
         assert_eq!(events[1].route, "GET /api/livestream/:id");
-        assert_eq!(route_stats.len(), 2);
-        assert_eq!(bucket_stats.len(), 2);
-        assert!(
-            bucket_stats
-                .keys()
-                .all(|(at, _, _, _)| at.timestamp() % 5 == 0)
-        );
-
-        let mut bounded_sessions = BTreeMap::new();
-        let mut bounded_routes = BTreeMap::new();
-        let mut bounded_buckets = BTreeMap::new();
-        let mut bounded_connections = ConnectionStats::default();
-        let mut bounded_state = ReadState {
-            sessions: &mut bounded_sessions,
-            route_stats: &mut bounded_routes,
-            bucket_stats: &mut bounded_buckets,
-            connections: &mut bounded_connections,
-            upstreams: &mut upstreams,
-            interval: Some((
-                "2026-08-26T01:00:01Z".parse().unwrap(),
-                "2026-08-26T01:00:01Z".parse().unwrap(),
-            )),
-        };
-        read_log(
-            &logs.join("nginx-isu1.zst"),
-            "isu1",
-            &TransitionOptions {
-                series_only: true,
-                ..options
-            },
-            &rules,
-            &mut bounded_state,
-        )
-        .unwrap();
-        assert!(bounded_sessions.is_empty());
-        assert!(bounded_routes.is_empty());
-        assert_eq!(bounded_buckets.len(), 1);
     }
 
     #[test]
-    fn connection_stats_follow_each_connection_through_the_log() {
+    fn access_log_without_method_or_uri_fails_instead_of_reporting_nothing() {
         let dir = tempdir().unwrap();
-        let logs = dir.path().join("logs");
-        fs::create_dir_all(&logs).unwrap();
-        let output = fs::File::create(logs.join("nginx-isu1.zst")).unwrap();
-        let mut encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
-        // Connection 1 carries two requests 20 ms apart; connection 2 carries one.
-        for (conn, msec, reqtime) in [
-            ("1", "1800000000.100", "0.010"),
-            ("1", "1800000000.140", "0.020"),
-            ("2", "1800000000.200", "0.010"),
-        ] {
-            writeln!(
-                encoder,
-                "time:2026-08-26T10:00:00+09:00\tsession:a\tmethod:GET\turi:/api/livestream/42\tstatus:200\treqtime:{reqtime}\tconn:{conn}\tmsec:{msec}"
-            )
-            .unwrap();
-        }
-        encoder.finish().unwrap();
-        let options = TransitionOptions {
-            run_dir: dir.path(),
-            prefix: "nginx-",
-            rules: None,
-            time_field: "time",
-            session_field: "session",
-            method_field: "method",
-            uri_field: "uri",
-            status_field: "status",
-            request_time_field: "reqtime",
-            upstream_time_field: "apptime",
-            bytes_field: "size",
-            connection_requests_field: "connreqs",
-            connection_field: "conn",
-            upstream_field: "upstream_addr",
-            upstream_connect_time_field: "upstream_connect",
-            upstream_header_time_field: "upstream_header",
-            end_time_field: "msec",
-            series_only: true,
-        };
-        let mut sessions = BTreeMap::new();
-        let mut route_stats = BTreeMap::new();
-        let mut bucket_stats = BTreeMap::new();
-        let mut connections = ConnectionStats::default();
-        let mut upstreams = BTreeMap::new();
-        let mut state = ReadState {
-            sessions: &mut sessions,
-            route_stats: &mut route_stats,
-            bucket_stats: &mut bucket_stats,
-            connections: &mut connections,
-            upstreams: &mut upstreams,
-            interval: None,
-        };
-        read_log(
-            &logs.join("nginx-isu1.zst"),
-            "isu1",
-            &options,
-            &RouteNormalizer { rules: vec![] },
-            &mut state,
-        )
-        .unwrap();
-
-        let first = &connections.open[&("isu1".into(), "1".into())];
-        assert_eq!(first.requests, 2);
-        assert!((first.first_start - 1_800_000_000.090).abs() < 1e-6);
-        assert!((first.last_end - 1_800_000_000.140).abs() < 1e-6);
-        // 140 ms - 20 ms of service time - the 100 ms the first response ended at = 20 ms idle.
-        let gaps = connections.gaps_ms.values().next().unwrap();
-        assert_eq!(gaps.len(), 1);
-        assert!((gaps[0] - 20.0).abs() < 1e-3, "{gaps:?}");
-        // Both connections were opened in the same five second bucket.
-        assert_eq!(
-            connections.opened.values().copied().collect::<Vec<_>>(),
-            [2]
+        // combined形式のまま（LTSVでない）logを渡した場合。
+        write_log(
+            dir.path(),
+            &["127.0.0.1 - - [26/Aug/2026:10:00:00 +0900] \"GET / HTTP/1.1\" 200 12"],
         );
-        assert!(
-            connections
-                .opened
-                .keys()
-                .all(|(at, _)| at.timestamp() % BUCKET_SECONDS == 0)
-        );
-    }
-
-    #[test]
-    fn upstream_stats_follow_retries_and_missing_times() {
-        let dir = tempdir().unwrap();
-        let logs = dir.path().join("logs");
-        fs::create_dir_all(&logs).unwrap();
-        let output = fs::File::create(logs.join("nginx-isu1.zst")).unwrap();
-        let mut encoder = zstd::stream::write::Encoder::new(output, 1).unwrap();
-        // A retried request, a plain one, and a response nginx served without an upstream.
-        for (addr, connect, header, response) in [
-            (
-                "10.0.0.2:8080, 10.0.0.3:8080",
-                "0.001, 0.002",
-                "0.010, 0.020",
-                "0.010, 0.030",
-            ),
-            ("10.0.0.3:8080", "0.004", "0.040", "0.050"),
-            ("-", "-", "-", "-"),
-        ] {
-            writeln!(
-                encoder,
-                "time:2026-08-26T10:00:00+09:00\tmethod:GET\turi:/api/x\tstatus:200\treqtime:0.050\tapptime:{response}\tupstream_addr:{addr}\tupstream_connect:{connect}\tupstream_header:{header}"
-            )
-            .unwrap();
-        }
-        encoder.finish().unwrap();
-        let options = TransitionOptions {
-            run_dir: dir.path(),
-            prefix: "nginx-",
-            rules: None,
-            time_field: "time",
-            session_field: "session",
-            method_field: "method",
-            uri_field: "uri",
-            status_field: "status",
-            request_time_field: "reqtime",
-            upstream_time_field: "apptime",
-            bytes_field: "size",
-            connection_requests_field: "connreqs",
-            connection_field: "conn",
-            upstream_field: "upstream_addr",
-            upstream_connect_time_field: "upstream_connect",
-            upstream_header_time_field: "upstream_header",
-            end_time_field: "msec",
-            series_only: false,
-        };
-        let mut sessions = BTreeMap::new();
-        let mut route_stats = BTreeMap::new();
-        let mut bucket_stats = BTreeMap::new();
-        let mut connections = ConnectionStats::default();
-        let mut upstreams = BTreeMap::new();
-        let mut state = ReadState {
-            sessions: &mut sessions,
-            route_stats: &mut route_stats,
-            bucket_stats: &mut bucket_stats,
-            connections: &mut connections,
-            upstreams: &mut upstreams,
-            interval: None,
-        };
-        read_log(
-            &logs.join("nginx-isu1.zst"),
-            "isu1",
-            &options,
-            &RouteNormalizer { rules: vec![] },
-            &mut state,
-        )
-        .unwrap();
-
-        // Both requests were served by the last address; only one of them was retried.
-        assert_eq!(upstreams.len(), 1);
-        let stats = &upstreams[&("isu1".into(), "10.0.0.3:8080".into())];
-        assert_eq!(stats.requests, 2);
-        assert_eq!(stats.retried_requests, 1);
-        // The retried request spent 1 ms + 2 ms connecting.
-        assert_eq!(stats.connect_ms, vec![3.0, 4.0]);
-        assert_eq!(stats.header_ms, vec![30.0, 40.0]);
-        assert_eq!(stats.response_ms, vec![40.0, 50.0]);
+        let error = emit(options(dir.path())).unwrap_err();
+        assert!(error.to_string().contains("none of 1 access-log lines"));
     }
 
     #[test]
@@ -1259,19 +370,7 @@ mod tests {
         );
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.50), Some(2.0));
         assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 0.95), Some(4.0));
-        assert_eq!(status_class("304"), "3xx");
-        assert_eq!(parse_upstream_seconds_ms("0.001, 0.002"), Some(3.0));
-        assert_eq!(
-            duration_summary(&[2.0, 4.0, 9.0]),
-            Some(DurationSummary {
-                sum: 15.0,
-                mean: 5.0,
-                min: 2.0,
-                max: 9.0,
-            })
-        );
     }
-
     #[test]
     fn alp_matching_groups_preserve_exact_route_percentiles() {
         let rules = RouteNormalizer {

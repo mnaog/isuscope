@@ -36,6 +36,7 @@ fn init_is_non_interactive_and_preserves_existing_files() {
         "perf-series",
         "offcpu",
         "nginx-log-delta",
+        "nginx-log-raw",
         "alp",
         "mysql-log-delta",
         "slp",
@@ -64,10 +65,12 @@ fn init_is_non_interactive_and_preserves_existing_files() {
         "offcpu",
         "nginx-log-mark",
         "nginx-log-delta",
-        "alp",
         "mysql-log-mark",
         "mysql-log-delta",
         "slp",
+        "nginx-log-raw",
+        "alp",
+        "user-transition",
     ] {
         assert!(
             collectors
@@ -75,8 +78,8 @@ fn init_is_non_interactive_and_preserves_existing_files() {
                 .any(|collector| collector["name"].as_str() == Some(name))
         );
     }
-    // perf.dataはperf-seriesが1回だけ読む。
-    for name in ["perf-report"] {
+    // access logとslow logはnode上でalp/slpが集計し、perf.dataはperf-seriesが1回だけ読む。
+    for name in ["nginx-series", "perf-report"] {
         assert!(
             !collectors
                 .iter()

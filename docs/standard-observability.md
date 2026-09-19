@@ -13,7 +13,7 @@ perf、alp、slp、sysstatは「必要になってから有効化する追加機
 | sysstat | during | CPU内訳、disk IOPS・帯域・queue・latency・utilのベンチ区間sample | `sar`がない |
 | service-sampler | during | 指定systemd unitのCPU、memory、disk I/O、PID数 | unit未指定、cgroup v2でない、unitが停止中 |
 | perf | before/after | detachしたsystem-wide sampleとhot symbol。perf.dataは`perf-series`の1回の`perf script`で読み、run全体と5秒ごとのsymbol別の割合を作る | `perf`がない、権限不足、kernelが非対応 |
-| alp | after | route別request数、p50/p95/p99、error、bytes | access logがない、alpがない |
+| alp | after | access logの差分をnode上で集計する。route別のrequest数・status・合計・平均・min/max・p50/p95/p99・error・bytes（差分全体、alp）、route別の5秒ごとのrequest数・error・p50/p95/p99（ベンチ区間、5秒ごとのfileをalp）、ベンチ側の接続の使い方とupstream別の要求数・retry・connect/header/response時間（ベンチ区間、awk）。生のlogは運ばない | access logがない（alpが無い、行はあるのにmethod/uriを1件も読めない場合は`failed`） |
 | slp | after | slow logの差分をnode上でinitializeと負荷区間に分け、文ごとの回数・合計・最大・p95・p99・lock・rowsと、DB全体の5秒ごとの回数・時間 | MySQL slow logがない、MySQLが退役済み（slpが無いのは`failed`。Ansibleのobservability roleが入れる） |
 | PostgreSQL | after | `pg_stat_statements`のquery別差分 | PostgreSQLがない、extensionが無効 |
 
@@ -41,7 +41,8 @@ unavailable_exit_codes = [75]
 
 | source | metric | 必須label |
 |---|---|---|
-| alp | `http.requests`, `http.errors`, `http.request_duration_sum`, `http.request_duration_mean`, `http.request_duration_min`, `http.request_duration`, `http.request_duration_max`, `http.response_bytes` | `node`, `method`, `route`; status別requestsは`status_class`、percentileは`quantile` |
+| alp（route別） | `http.requests`, `http.errors`, `http.request_duration_sum`, `http.request_duration_mean`, `http.request_duration_min`, `http.request_duration`, `http.request_duration_max`, `http.response_bytes`（差分全体）と、`http.requests`, `http.errors`, `http.request_duration`の5秒bucket。時間は`$request_time`（alpへ`--apptime-label reqtime`を渡す） | `node`, `method`, `route`; status別requestsは`status_class`、percentileは`quantile` |
+| alp（接続・upstream） | `client.connections_in_use`, `client.connections_opened`, `client.request_gap`（5秒bucketのp50/p95/p99）、`client.connection_requests_mean`/`_max`, `client.connections_opened_total`, `http.upstream_requests`, `http.upstream_retried_requests`, `http.upstream_{connect,header,response}_duration`（sum/mean/min/maxとp50/p95/p99）、`http.access_log_bytes`（差分の大きさ、nginx-log-delta） | `node`; upstreamは`upstream` |
 | slp（区間別） | `db.query.calls`, `db.query.total_duration`, `db.query.duration_max`, `db.query.p95_duration`, `db.query.p99_duration`, `db.query.lock_duration`, `db.query.rows_sent`, `db.query.rows_examined` | `node`, `engine`, `digest`, `window`（`initialize`、`load`、区間が分からなければ`whole`）、`digest_id`（1,024 byteを超えて切った文だけ。切る前の全文のSHA-256先頭16桁で、集計と比較の識別に使う） |
 | slp（DB全体） | `db.calls`, `db.duration`, `db.lock_duration`（5秒bucket）、`db.slow_log_bytes`（差分の大きさ）、`db.slow_log_unclassified`（`SET timestamp=`が無く区間へ振り分けられなかった文の数。0件なら出さない） | `node`, `engine` |
 | pg_stat_statements | `db.query.calls`, `db.query.total_duration`, `db.query.p95_duration`, `db.query.lock_duration`, `db.query.rows_sent`, `db.query.rows_examined` | `node`, `engine`, `digest` |
@@ -67,10 +68,10 @@ isuscope query latest --scope series --window load --metric-prefix service. --gr
 isuscope series latest --window initialize --metric host.cpu_iowait_percent --bucket 1
 ```
 
-行動遷移helperは正規化済みHTTP routeを5秒bucketへまとめ、request数とrequest/upstream時間のp50/p95/p99を時系列metricとして出力します。MySQL slow logはslpがnode上でinitializeと負荷区間に分けて文ごとに集計し、SQL別の値は区間ごとの集約だけです（SQL別の5秒時系列はありません）。5秒bucketはDB全体の`db.calls`・`db.duration`・`db.lock_duration`です。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、filter可能な`isuscope series`、`isuscope query`、`isuscope sql`から参照できます。
+HTTPのroute別5秒bucketは、alp collectorがベンチ区間を5秒ごとのfileに分けてalpで集計したrequest数・error・p50/p95/p99です（`$msec`で振り分ける）。行動遷移helperは`survey-run`で持ち帰った生のaccess logからsession単位の遷移だけを作ります。MySQL slow logはslpがnode上でinitializeと負荷区間に分けて文ごとに集計し、SQL別の値は区間ごとの集約だけです（SQL別の5秒時系列はありません）。5秒bucketはDB全体の`db.calls`・`db.duration`・`db.lock_duration`です。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、filter可能な`isuscope series`、`isuscope query`、`isuscope sql`から参照できます。
 
 after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
 
-parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式、MySQL 8.0 slow log、alp 1.0.21の表形式JSON、slp 0.2.1のTSV fixtureを使用します。公式Ubuntu Docker imageから、Ubuntu 20.04のsysstat 12.2.0、22.04の12.5.2、24.04の12.6.1、およびMySQL 8.0.46の完全な出力も採取して固定しています。fixtureの由来は`tests/fixtures/README.md`に記録します。perfはDockerだけで完了扱いにせず、公式ISUCON13 AMIの3 node実走でstart/stop/report/seriesと一時ファイル消去（reportは現在perf-seriesに統合）を確認済みです。
+parserの回帰テストには、sysstat 12系の24時間・AM/PM両形式、MySQL 8.0 slow log、alp 1.0.21の表形式JSONとalp collectorの出力（mawk・gawkで同一）、slp 0.2.1のTSV fixtureを使用します。公式Ubuntu Docker imageから、Ubuntu 20.04のsysstat 12.2.0、22.04の12.5.2、24.04の12.6.1、およびMySQL 8.0.46の完全な出力も採取して固定しています。fixtureの由来は`tests/fixtures/README.md`に記録します。perfはDockerだけで完了扱いにせず、公式ISUCON13 AMIの3 node実走でstart/stop/report/seriesと一時ファイル消去（reportは現在perf-seriesに統合）を確認済みです。
 
 標準log collectorは開始時のoffsetと先頭最大64 KiBのSHA-256を記録します。終了時は現在のfileと`.1`〜`.5`（各`.gz`も可）からfingerprintが一致する開始時fileを探し、そのoffset以降、中間世代、現在fileを時系列順に連結します。これによりrename、gzip、複数回rotation、copytruncateを同じ方式で扱い、世代欠落やfingerprint不一致は壊れた差分を成功扱いせず`unavailable`にします。

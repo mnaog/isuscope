@@ -189,7 +189,7 @@ parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","catego
 
 模型が合っても分かるのは**今の得点の内訳**だけで、「このrouteを速くすると何点増える」ではありません。増分は、そのrouteが実際に上限になっている場合にしか出ません。上限が別（他のroute、CPU、ベンチ側の並列数）なら、得点の44%を占めるrouteを2倍速くしてもscoreは動きません。内訳は候補を絞る材料として使い、増えるかどうかは1回のベンチで確かめます。実際、ISUCON12本選の練習では全routeのサーバー時間を2.07 msから0.41 msにしても処理量は+3.6%で、上限はベンチ側にありました。
 
-access logに`conn:$connection`と`msec:$msec`があると、`nginx-series` collectorがベンチ側の接続の使い方も出します。`client.connections_in_use`（最初の要求から最後の応答までを積んだ同時接続数）、`client.connections_opened`（毎bucketの新規接続）、`client.request_gap`（応答を返してから同じ接続に次の要求が来るまでの時間。分位と平均）、`client.connection_requests_mean`／`_max`です。briefの`clients`にnodeごとに1行（同時接続数の平均とピーク、毎秒の新規接続、`request_gap`の分位、接続あたりの要求数）で出ます。
+access logに`conn:$connection`と`msec:$msec`があると、`alp` collectorがnode上でベンチ側の接続の使い方も出します。`client.connections_in_use`（最初の要求から最後の応答までを積んだ同時接続数）、`client.connections_opened`（毎bucketの新規接続）、`client.request_gap`（応答を返してから同じ接続に次の要求が来るまでの時間。5秒ごとのp50/p95/p99）、`client.connection_requests_mean`／`_max`です。briefの`clients`にnodeごとに1行（同時接続数の平均とピーク、毎秒の新規接続、`request_gap`の分位、接続あたりの要求数）で出ます。
 
 `client.connections_in_use`は**保持している接続数ではありません**。最後の応答の後にkeepaliveで開いたままの時間はaccess logに出ないので入りません。保持中の接続はkernelから取る`host.tcp_established`（`/proc/net/snmp`の`Tcp:CurrEstab`）で見て、2つを分けて扱います。`keepalive_timeout`のような「遊休接続を減らす」変更の効果は後者に出ます。サーバーの処理時間が短いのに`client.request_gap`が伸び、`client.connections_in_use`が並列数と一緒に増えるだけなら、上限はサーバーの外にある可能性が高くなります（サーバー側の計測だけでは確定できません）。
 
@@ -205,7 +205,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `host-sampler`はCPU・memory・loadに加えて、接続とネットワークのcounterも1秒ごとに出します。`host.tcp_passive_opens_per_second`、`host.tcp_established`、`host.tcp_time_wait`、`host.tcp_listen_overflows_per_second`、`host.tcp_listen_drops_per_second`、`host.tcp_syn_cookies_sent_per_second`、`host.tcp_time_wait_overflow_per_second`、`host.tcp_retransmit_segments_per_second`、NICごとの`host.net_rx_packets_per_second`などと、`host.cpu_softirq_percent`です。取りこぼしのcounterが0のままなら、少なくとも受け付けの取りこぼしとしては説明できません（接続の失敗がサーバー側にないことの証明にはなりません）。毎秒値は`/proc/uptime`で測った実際の間隔で割るので、samplerが1秒より遅れても率が水増しされません。読むのは`/proc`の小さなfileだけで、追加のtoolもroot権限も要りません。
 
-ベンチ前後のcollectorは**node単位で並列**に実行します。同じnode内では設定順を保つので、perf-stopの後にperf-series、log markの後にdeltaという受け渡しは崩れません。localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
+ベンチ前後のcollectorは**node単位で並列**に実行します。同じnode内では設定順を保つので、perf-stopの後にperf-series、log markの後にdeltaという受け渡しは崩れません。localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。slow logとaccess logは生のまま運ばず、node上でslp・alpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは`survey-run`でだけ`mysql-log-raw`・`nginx-log-raw`が持ち帰ります。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
 
 `[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 

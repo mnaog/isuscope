@@ -2,6 +2,8 @@ use rusqlite::Connection;
 use std::{fs, process::Command};
 use tempfile::tempdir;
 
+#[path = "e2e/access_log.rs"]
+mod access_log;
 #[path = "e2e/adapters.rs"]
 mod adapters;
 #[path = "e2e/agent_context.rs"]

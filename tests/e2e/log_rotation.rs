@@ -48,7 +48,17 @@ fn standard_log_delta_survives_common_rotation_strategies() {
             "delta failed for {name}: {}",
             String::from_utf8_lossy(&delta.stderr)
         );
-        delta.stdout
+        // 差分はnodeに残し、後のalpが集計する。stdoutには大きさだけが出る。
+        let kept = fs::read(format!("{}.nginx.log", prefix.display())).unwrap();
+        assert!(
+            String::from_utf8_lossy(&delta.stdout).contains(&format!(
+                "\"name\":\"http.access_log_bytes\",\"value\":{}",
+                kept.len()
+            )),
+            "{}",
+            String::from_utf8_lossy(&delta.stdout)
+        );
+        kept
     };
 
     assert_eq!(

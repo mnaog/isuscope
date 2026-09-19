@@ -245,27 +245,9 @@ enum Commands {
         method_field: String,
         #[arg(long, default_value = "uri")]
         uri_field: String,
-        #[arg(long, default_value = "status")]
-        status_field: String,
-        #[arg(long, default_value = "reqtime")]
-        request_time_field: String,
-        #[arg(long, default_value = "apptime")]
-        upstream_time_field: String,
-        #[arg(long, default_value = "size")]
-        bytes_field: String,
-        #[arg(long, default_value = "connreqs")]
-        connection_requests_field: String,
-        #[arg(long, default_value = "conn")]
-        connection_field: String,
-        #[arg(long, default_value = "upstream_addr")]
-        upstream_field: String,
-        #[arg(long, default_value = "upstream_connect")]
-        upstream_connect_time_field: String,
-        #[arg(long, default_value = "upstream_header")]
-        upstream_header_time_field: String,
-        #[arg(long, default_value = "msec")]
-        end_time_field: String,
-        #[arg(long)]
+        /// 旧`nginx-series` collectorの引数。route別の集計と時系列はnode上の`alp`へ移ったので、
+        /// 渡されたら設定の更新を求めて失敗する。
+        #[arg(long, hide = true)]
         series_only: bool,
     },
     /// survey-run用のHTTP入出力capture proxyです。
@@ -505,19 +487,16 @@ async fn real_main(cli: Cli) -> Result<bool> {
         session_field,
         method_field,
         uri_field,
-        status_field,
-        request_time_field,
-        upstream_time_field,
-        bytes_field,
-        connection_requests_field,
-        connection_field,
-        upstream_field,
-        upstream_connect_time_field,
-        upstream_header_time_field,
-        end_time_field,
         series_only,
     } = &cli.command
     {
+        if *series_only {
+            anyhow::bail!(
+                "the nginx-series collector was replaced by the node-side `alp` collector; \
+                 remove nginx-series from .isuscope/config.toml and take the alp, nginx-log-raw \
+                 and user-transition collectors from `isuscope init --print`"
+            );
+        }
         isuscope::transition::emit(isuscope::transition::TransitionOptions {
             run_dir,
             prefix,
@@ -526,17 +505,6 @@ async fn real_main(cli: Cli) -> Result<bool> {
             session_field,
             method_field,
             uri_field,
-            status_field,
-            request_time_field,
-            upstream_time_field,
-            bytes_field,
-            connection_requests_field,
-            connection_field,
-            upstream_field,
-            upstream_connect_time_field,
-            upstream_header_time_field,
-            end_time_field,
-            series_only: *series_only,
         })?;
         return Ok(true);
     }
@@ -1490,11 +1458,12 @@ fn preferred_cpu(row: &BucketRow) -> &[f64] {
 }
 
 fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<SeriesCoverage> {
-    const SERIES_COLLECTORS: [&str; 7] = [
+    const SERIES_COLLECTORS: [&str; 8] = [
         "host-sampler",
         "sysstat",
         "service-sampler",
         "nginx-log-delta",
+        "alp",
         "nginx-series",
         "mysql-log-delta",
         "perf-series",

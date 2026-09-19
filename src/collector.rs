@@ -638,6 +638,7 @@ pub(crate) fn parse_standard_output(
     let raw = String::from_utf8(bytes).context("stream did not contain valid UTF-8")?;
     match parser {
         CollectorParser::AlpJson => parse_alp_json(&raw, routes),
+        CollectorParser::AlpWindows => parse_alp_windows(&raw, routes),
         CollectorParser::MysqlSlow => unreachable!("handled by streaming parser"),
         CollectorParser::SlpJson => parse_slp_json(&raw),
         CollectorParser::SlpTsv => parse_slp_tsv(&raw),
@@ -1215,6 +1216,46 @@ fn string(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<Str
         .find_map(|name| object.get(*name).and_then(Value::as_str).map(str::to_owned))
 }
 
+/// `window \t <alp JSON>`。`whole`は差分全体のroute別集計、数字は5秒bucketの開始（epoch秒）で、
+/// bucketからは`isuscope series`が使う回数・error・分位点だけを時系列として残す。
+/// `{`で始まる行は同じcollectorが出した接続とupstreamの値なので、protocolとして別に読む。
+fn parse_alp_windows(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
+    let mut metrics = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() || line.starts_with('{') {
+            continue;
+        }
+        let (window, json) = line
+            .split_once('\t')
+            .context("alp window line has no tab after the window")?;
+        let parsed = parse_alp_json(json, routes)
+            .with_context(|| format!("alp output for window {window} is not valid"))?;
+        if window == "whole" {
+            metrics.extend(parsed);
+            continue;
+        }
+        let at = window
+            .parse::<i64>()
+            .ok()
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            .with_context(|| format!("alp window {window} is not an epoch second"))?;
+        metrics.extend(
+            parsed
+                .into_iter()
+                .filter(|metric| match metric.name.as_str() {
+                    "http.requests" => !metric.labels.contains_key("status_class"),
+                    "http.errors" | "http.request_duration" => true,
+                    _ => false,
+                })
+                .map(|mut metric| {
+                    metric.timestamp = Some(at);
+                    metric
+                }),
+        );
+    }
+    Ok(metrics)
+}
+
 fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
     let normalizer = RouteNormalizer::load(routes)?;
     let value: Value = serde_json::from_str(raw).context("ALP output is not valid JSON")?;
@@ -1312,7 +1353,12 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
         }
         if let Some(value) = number(
             object,
-            &["response_bytes", "body_bytes_sent", "sum_body_bytes_sent"],
+            &[
+                "response_bytes",
+                "body_bytes_sent",
+                "sum_body_bytes_sent",
+                "sum_body",
+            ],
         ) {
             *stats.response_bytes.get_or_insert(0.0) += value;
         }
@@ -1964,6 +2010,7 @@ fn make_spec(
                 route_matching_groups.as_deref(),
                 &config.config.observability.service_units,
             )
+            .replace("{benchmark_started_at}", &windows.started_at)
             .replace("{load_started_at}", &windows.load_started_at)
             .replace("{benchmark_finished_at}", &windows.finished_at)
         })
@@ -2025,6 +2072,7 @@ fn self_program(program: &str) -> String {
 /// after phaseのcollectorへ渡す区間の境界（epoch秒）。分からなければ空文字列で、
 /// collectorは区間を分けずに全体（whole）として集計する。
 struct RunWindows {
+    started_at: String,
     load_started_at: String,
     finished_at: String,
 }
@@ -2040,6 +2088,11 @@ impl RunWindows {
                 .unwrap_or_default()
         };
         Self {
+            started_at: epoch(
+                manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.benchmark.started_at),
+            ),
             load_started_at: epoch(
                 manifest
                     .as_ref()
@@ -2128,6 +2181,131 @@ fn matches_phase(left: CollectorPhase, right: CollectorPhase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alp_windows_keep_the_whole_delta_and_five_second_buckets_apart() {
+        // 実際のcollectorとalp 1.0.21で、`access-ltsv-windows.log`を集計した出力。
+        let raw = include_str!("../tests/fixtures/alp-windows-v1.0.21.out");
+        let dir = tempfile::tempdir().unwrap();
+        let routes = dir.path().join("routes.toml");
+        fs::write(
+            &routes,
+            "[[routes]]\npattern = '^/user/[0-9]+/home$'\nreplace = '/user/:id/home'\n",
+        )
+        .unwrap();
+        let metrics = parse_alp_windows(raw, Some(&routes)).unwrap();
+        let value = |name: &str, route: &str, at: Option<i64>, extra: Option<(&str, &str)>| {
+            metrics
+                .iter()
+                .find(|metric| {
+                    metric.name == name
+                        && metric.labels["route"] == route
+                        && metric.timestamp.map(|at| at.timestamp()) == at
+                        && extra.is_none_or(|(key, value)| {
+                            metric.labels.get(key).map(String::as_str) == Some(value)
+                        })
+                        && (extra.is_some() || !metric.labels.contains_key("quantile"))
+                })
+                .map(|metric| metric.value)
+        };
+        // 差分全体：ベンチ区間の外の要求も数え、時間は`$request_time`（`apptime`ではない）。
+        assert_eq!(value("http.requests", "/initialize", None, None), Some(1.0));
+        assert_eq!(
+            value("http.requests", "/user/:id/home", None, None),
+            Some(4.0)
+        );
+        assert_eq!(
+            value("http.request_duration_sum", "/user/:id/home", None, None),
+            Some(100.0)
+        );
+        assert_eq!(
+            value("http.response_bytes", "/user/:id/home", None, None),
+            Some(400.0)
+        );
+        assert_eq!(value("http.errors", "/login", None, None), Some(1.0));
+        // 5秒bucket：区間の中だけで、回数・error・分位点だけを時系列にする。
+        let first = Some(1_789_653_660);
+        assert_eq!(
+            value("http.requests", "/user/:id/home", first, None),
+            Some(3.0)
+        );
+        assert_eq!(value("http.errors", "/login", first, None), Some(1.0));
+        assert_eq!(
+            value(
+                "http.request_duration",
+                "/user/:id/home",
+                Some(1_789_653_665),
+                Some(("quantile", "0.95"))
+            ),
+            Some(40.0)
+        );
+        assert_eq!(value("http.requests", "/initialize", first, None), None);
+        assert!(!metrics.iter().any(|metric| metric.timestamp.is_some()
+            && (metric.labels.contains_key("status_class")
+                || metric.name == "http.request_duration_sum")));
+        // 接続とupstreamの値（`{`の行）はprotocolとして別に読むので、ここには入らない。
+        assert!(
+            !metrics
+                .iter()
+                .any(|metric| metric.name.starts_with("client."))
+        );
+    }
+
+    #[test]
+    fn alp_collector_reports_connections_and_upstreams_as_protocol_metrics() {
+        let raw = include_str!("../tests/fixtures/alp-windows-v1.0.21.out");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alp.zst");
+        fs::write(&path, zstd::encode_all(raw.as_bytes(), 1).unwrap()).unwrap();
+        let (metrics, _, _) = parse_protocol(&path).unwrap();
+        let find = |name: &str, labels: &[(&str, &str)], at: Option<i64>| {
+            metrics
+                .iter()
+                .find(|metric| {
+                    metric.name == name
+                        && metric.timestamp.map(|at| at.timestamp()) == at
+                        && labels.iter().all(|(key, value)| {
+                            metric.labels.get(*key).map(String::as_str) == Some(value)
+                        })
+                })
+                .map(|metric| metric.value)
+        };
+        // 区間の中の接続は3本（2番は3要求）。区間の外の`/initialize`と`/health`は数えない。
+        assert_eq!(
+            find("client.connections_opened_total", &[], None),
+            Some(3.0)
+        );
+        assert_eq!(find("client.connection_requests_max", &[], None), Some(3.0));
+        assert_eq!(
+            find("client.connections_opened", &[], Some(1_789_653_660)),
+            Some(2.0)
+        );
+        // retryした要求は最後のupstreamの分で、時間は試行の合計（`-`は数えない）。
+        let upstream = [("upstream", "10.0.0.1:8080")];
+        assert_eq!(find("http.upstream_requests", &upstream, None), Some(3.0));
+        assert_eq!(
+            find("http.upstream_retried_requests", &upstream, None),
+            Some(1.0)
+        );
+        assert_eq!(
+            find("http.upstream_connect_duration_max", &upstream, None),
+            Some(3.0)
+        );
+        assert_eq!(
+            find(
+                "http.upstream_header_duration",
+                &[("upstream", "10.0.0.1:8080"), ("quantile", "0.50")],
+                None
+            ),
+            Some(28.0)
+        );
+        assert!(!metrics.iter().any(|metric| {
+            metric
+                .labels
+                .get("upstream")
+                .is_some_and(|upstream| upstream == "-")
+        }));
+    }
 
     #[test]
     fn slp_windows_keep_initialize_and_load_apart() {

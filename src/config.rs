@@ -252,6 +252,8 @@ pub enum Transport {
 #[serde(rename_all = "kebab-case")]
 pub enum CollectorParser {
     AlpJson,
+    /// 区間名（`whole`か5秒bucketのepoch秒）を先頭に付けたalpのJSON。node上で集計したもの。
+    AlpWindows,
     MysqlSlow,
     SlpJson,
     SlpTsv,
