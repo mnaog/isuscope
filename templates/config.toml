@@ -842,16 +842,19 @@ mkdir -p "$work"
 awk -v load='{load_started_at}' -v end='{benchmark_finished_at}' -v dir="$work" '
   # prepared statementのPrepareや接続poolのPingは`# administrator command:`として記録される。
   # 文ではないので、slpと同じく数えない。
+  # `SET timestamp=`が無く区間を決められなかった文は、負荷の後の文（意図して除く）と分けて数える。
   function flush() {
     if (window != "" && !administrative) {
       printf "%s", entry > (dir "/" window ".log")
       calls[bucket]++; seconds[bucket] += query_time; lock[bucket] += lock_time
+    } else if (timed && !decided && !administrative) {
+      unclassified++
     }
-    entry = ""; window = ""; decided = 0; administrative = 0
+    entry = ""; window = ""; decided = 0; administrative = 0; timed = 0
   }
   /^# Time: / { flush() }
-  /^# User@Host: / && decided { flush() }
-  /^# Query_time: / { query_time = $3; lock_time = $5 }
+  /^# User@Host: / && (decided || timed) { flush() }
+  /^# Query_time: / { query_time = $3; lock_time = $5; timed = 1 }
   /^# administrator command:/ { administrative = 1 }
   /^SET timestamp=/ && !decided {
     at = $0; sub(/^SET timestamp=/, "", at); sub(/;.*/, "", at); at += 0
@@ -865,6 +868,9 @@ awk -v load='{load_started_at}' -v end='{benchmark_finished_at}' -v dir="$work" 
   { entry = entry $0 "\n" }
   END {
     flush()
+    print unclassified + 0 > (dir "/unclassified")
+    if (unclassified > 0)
+      printf "{\"type\":\"metric\",\"name\":\"db.slow_log_unclassified\",\"value\":%d,\"unit\":\"queries\",\"labels\":{\"engine\":\"mysql\"}}\n", unclassified
     for (bucket in calls) {
       printf "{\"type\":\"metric\",\"name\":\"db.calls\",\"value\":%d,\"unit\":\"queries\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%d}\n", calls[bucket], bucket
       printf "{\"type\":\"metric\",\"name\":\"db.duration\",\"value\":%.3f,\"unit\":\"ms\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%d}\n", seconds[bucket] * 1000, bucket
@@ -881,8 +887,12 @@ for window in initialize load whole; do
   test -s "$work/$window.tsv" && parsed=1
   awk -v window="$window" '{ print window "\t" $0 }' "$work/$window.tsv"
 done
-# 文があったのに1件も集計できなければ、slow logの形式とslpが合っていない。
-if [ "$parsed" = 0 ] && ls "$work"/*.log >/dev/null 2>&1; then
+# 文があったのに1件も集計できなければ、slow logの形式とslpかawkが合っていない。
+unclassified=$(cat "$work/unclassified")
+if [ "$unclassified" -gt 0 ]; then
+  echo "$unclassified slow-log records had no SET timestamp and were not assigned to a window" >&2
+fi
+if [ "$parsed" = 0 ] && { ls "$work"/*.log >/dev/null 2>&1 || [ "$unclassified" -gt 0 ]; }; then
   echo 'slp parsed no records from a non-empty slow-log delta' >&2
   exit 65
 fi

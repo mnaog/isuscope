@@ -17,7 +17,7 @@
 
 remote変更を行う場合は、既存ファイルのbackup、設定検証、atomicな配置、必要最小限のreloadを行います。パッケージ導入やremote build、常駐agentは既存機能で代替できない場合だけ使用します。
 
-標準log collectorは`sha256sum`、`gzip`、`tail`、`wc`を使い、`.1`〜`.5`と各`.gz`から開始時のlogを照合します。保持世代を越えたrotationや中間世代の欠落は、壊れた差分を返さず終了コード75で`unavailable`になります。非空logをalp/slpが1件も解析できなかった場合は設定不一致として`failed`になります。
+標準log collectorは`sha256sum`、`gzip`、`tail`、`wc`を使い、`.1`〜`.5`と各`.gz`から開始時のlogを照合します。保持世代を越えたrotationや中間世代の欠落は、壊れた差分を返さず終了コード75で`unavailable`になります。非空logをalp/slpが1件も解析できなかった場合（slow logの文がどれも`SET timestamp=`を持たず区間へ振り分けられなかった場合を含む）は設定不一致として`failed`になります。
 
 `benchmark.sh`、`parse-benchmark.sh`、`setup.sh`、`config.toml`、`routes.toml`、`setup-state.json`およびisuscopeのversionは各runの`tooling/`へsnapshotされます。序盤の`survey-run`完了後は、仮説付きの`run`、結果を残す`analyze`、`enrich`、一覧JSONの`list`、小さい判断用JSONの`brief`、対象metricを絞る`query`（`--base`で2 runの比較）、briefとqueryで足りない問いに使う読み取り専用の`sql`、人間向けHTMLの`ui`を使います。
 
