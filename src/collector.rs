@@ -35,6 +35,8 @@ pub struct CollectorOutput {
 
 pub struct RunningCollector {
     child: Child,
+    /// 子のprocess group（子のpid）。子を待った後は`child.id()`が消えるので、起動時に持っておく。
+    group: Option<u32>,
     spec: ExecutionSpec,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -310,6 +312,7 @@ fn spawn(spec: ExecutionSpec, run_dir: &Path) -> Result<RunningCollector> {
         spec.collector.max_output_bytes,
     ));
     Ok(RunningCollector {
+        group: child.id(),
         child,
         spec,
         stdout_path,
@@ -327,6 +330,7 @@ async fn finalize(
     run_dir: &Path,
 ) -> CollectorOutput {
     let RunningCollector {
+        group,
         spec,
         stdout_path,
         stderr_path,
@@ -340,23 +344,26 @@ async fn finalize(
     let stdout_destination = run_dir.join("logs").join(format!("{stdout_id}.zst"));
     let stderr_destination = run_dir.join("logs").join(format!("{stderr_id}.zst"));
     let mut compression_errors = Vec::new();
-    match stdout_capture.await {
-        Ok(Ok(true)) => compression_errors.push(format!(
-            "stdout truncated at {} bytes",
-            spec.collector.max_output_bytes
-        )),
-        Ok(Ok(false)) => {}
-        Ok(Err(error)) => compression_errors.push(format!("stdout capture failed: {error}")),
-        Err(error) => compression_errors.push(format!("stdout capture task failed: {error}")),
-    }
-    match stderr_capture.await {
-        Ok(Ok(true)) => compression_errors.push(format!(
-            "stderr truncated at {} bytes",
-            spec.collector.max_output_bytes
-        )),
-        Ok(Ok(false)) => {}
-        Ok(Err(error)) => compression_errors.push(format!("stderr capture failed: {error}")),
-        Err(error) => compression_errors.push(format!("stderr capture task failed: {error}")),
+    // 子が終わっても、pipeを握った孫が残ると取り込みが終わらない。締切で打ち切り、その
+    // process groupを落として、logが途中までであることをcollectorの結果に残す。
+    for (capture, stream) in [(stdout_capture, "stdout"), (stderr_capture, "stderr")] {
+        match process::finish_capture(capture, process::CAPTURE_DEADLINE, group).await {
+            process::Capture::Finished(Ok(Ok(true))) => compression_errors.push(format!(
+                "{stream} truncated at {} bytes",
+                spec.collector.max_output_bytes
+            )),
+            process::Capture::Finished(Ok(Ok(false))) => {}
+            process::Capture::Finished(Ok(Err(error))) => {
+                compression_errors.push(format!("{stream} capture failed: {error}"))
+            }
+            process::Capture::Finished(Err(error)) => {
+                compression_errors.push(format!("{stream} capture task failed: {error}"))
+            }
+            process::Capture::Abandoned => compression_errors.push(format!(
+                "{stream} stayed open for {}s after the collector exited (a background process held it); the saved log may be incomplete",
+                process::CAPTURE_DEADLINE.as_secs()
+            )),
+        }
     }
     if let Err(value) = compress_log(&stdout_path, &stdout_destination) {
         compression_errors.push(value.to_string());

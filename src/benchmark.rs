@@ -15,7 +15,6 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -169,8 +168,12 @@ async fn execute_command(
         }
     };
     // 中断後にpipeを握ったままの相手が残っていても、取り込みを待ち続けて止まらないようにする。
-    finish_capture(stdout_task, "stdout").await?;
-    finish_capture(stderr_task, "stderr").await?;
+    let mut abandoned = Vec::new();
+    for (task, stream) in [(stdout_task, "stdout"), (stderr_task, "stderr")] {
+        if finish_capture(task, stream).await? {
+            abandoned.push(stream);
+        }
+    }
 
     let mut logs = Vec::new();
     compress_log(&stdout_raw, &run_dir.join("logs/benchmark-stdout.zst"))?;
@@ -198,10 +201,17 @@ async fn execute_command(
             .insert("isuscope.parser".into(), "inline".into());
     }
 
-    let observation = Arc::try_unwrap(observation)
+    let mut observation = Arc::try_unwrap(observation)
         .map_err(|_| anyhow::anyhow!("benchmark observation is still shared"))?
         .into_inner()
         .map_err(|_| anyhow::anyhow!("benchmark observation lock is poisoned"))?;
+    // 取り込みを打ち切ったことは、警告だけでなく保存するrunにも残す。
+    for stream in abandoned {
+        observation.messages.push(format!(
+            "isuscope: benchmark {stream} stayed open for {}s after the process ended; the saved log may be incomplete",
+            process::CAPTURE_DEADLINE.as_secs()
+        ));
+    }
     let duplicate_result = observation.protocol_result_count > 1;
     let passed = if interrupted || !status.success() || duplicate_result {
         Some(false)
@@ -242,19 +252,22 @@ async fn execute_command(
     })
 }
 
-/// 取り込みtaskの完了を待つ。pipeの書き手が残って閉じない場合は打ち切り、
-/// そこまでに書けたlogで先へ進む。
-async fn finish_capture(task: tokio::task::JoinHandle<Result<()>>, stream: &str) -> Result<()> {
-    const CAPTURE_DEADLINE: Duration = Duration::from_secs(10);
-    match tokio::time::timeout(CAPTURE_DEADLINE, task).await {
-        Ok(joined) => joined.with_context(|| format!("{stream} capture task failed"))?,
-        Err(_) => {
+/// 取り込みtaskの完了を待つ。pipeの書き手が残って閉じない場合は打ち切り（taskは止めて、
+/// 止まったことまで確かめる）、そこまでに書けたlogで先へ進む。打ち切ったら`true`。
+/// ベンチの側に残ったprocessは落とさない（ベンチが意図して残したものかもしれない）。
+async fn finish_capture(task: tokio::task::JoinHandle<Result<()>>, stream: &str) -> Result<bool> {
+    match process::finish_capture(task, process::CAPTURE_DEADLINE, None).await {
+        process::Capture::Finished(joined) => {
+            joined.with_context(|| format!("{stream} capture task failed"))??;
+            Ok(false)
+        }
+        process::Capture::Abandoned => {
             eprintln!(
                 "warning: benchmark {stream} stayed open for {}s after the process ended; \
                  the saved log may be incomplete",
-                CAPTURE_DEADLINE.as_secs()
+                process::CAPTURE_DEADLINE.as_secs()
             );
-            Ok(())
+            Ok(true)
         }
     }
 }

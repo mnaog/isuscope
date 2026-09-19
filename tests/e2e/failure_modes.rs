@@ -406,3 +406,79 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"host.cpu_
     let db = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
     assert_eq!(metric_count(&db), saved);
 }
+
+/// 子processが終わっても、pipeを握った孫が残ると取り込みにEOFが来ない。collectorとベンチの
+/// 取り込みを締切で打ち切り（taskは止めて、止まったことまで確かめる）、runを保存まで進める。
+/// 打ち切ったことは、collectorは失敗として、ベンチはrunのmessageとして残す。
+#[cfg(unix)]
+#[test]
+fn captures_held_open_by_a_background_process_are_cut_off_and_recorded() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "(sleep 14) & printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":1,\"pass\":true}'"]
+
+[[collectors]]
+name = "lingering"
+phase = "after"
+transport = "local"
+command = ["sh", "-c", "(sleep 14; touch survived) & printf '%s\n' '{\"type\":\"metric\",\"name\":\"probe.value\",\"value\":1,\"unit\":\"x\"}'"]
+"#,
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "captures end"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    // 締切（10秒）を2回待つだけで、孫のsleep（14秒）が終わるのは待たない。
+    assert!(started.elapsed() < std::time::Duration::from_secs(40));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!stderr.contains("still shared"), "{stderr}");
+
+    let runs = config_dir.join("runs");
+    let run_dir = fs::read_dir(&runs)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name() != ".incomplete")
+        .expect("the run was saved")
+        .path();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    assert_eq!(manifest["benchmark"]["passed"], true, "{manifest}");
+    assert!(
+        manifest["benchmark"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message
+                .as_str()
+                .unwrap()
+                .contains("benchmark stdout stayed open")),
+        "{}",
+        manifest["benchmark"]["messages"]
+    );
+    let collector = manifest["collectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|collector| collector["name"] == "lingering")
+        .unwrap();
+    assert_eq!(collector["status"], "failed", "{collector}");
+    assert!(
+        collector["error"]
+            .as_str()
+            .unwrap()
+            .contains("stdout stayed open"),
+        "{collector}"
+    );
+    // collectorのprocess groupに残った孫は落とされている。
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(!project.path().join("survived").exists());
+}

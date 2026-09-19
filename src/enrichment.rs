@@ -163,6 +163,7 @@ async fn execute(
         .stderr
         .take()
         .context("parser stderr was not captured")?;
+    let group = child.id();
     let stdout_task = tokio::spawn(capture_capped(
         stdout,
         stdout_raw.clone(),
@@ -189,23 +190,25 @@ async fn execute(
             )
         }
     };
-    match stdout_task.await {
-        Ok(Ok(true)) => errors.push(format!(
-            "stdout truncated at {} bytes",
-            parser.max_output_bytes
-        )),
-        Ok(Ok(false)) => {}
-        Ok(Err(error)) => errors.push(format!("stdout capture failed: {error}")),
-        Err(error) => errors.push(format!("stdout capture task failed: {error}")),
-    }
-    match stderr_task.await {
-        Ok(Ok(true)) => errors.push(format!(
-            "stderr truncated at {} bytes",
-            parser.max_output_bytes
-        )),
-        Ok(Ok(false)) => {}
-        Ok(Err(error)) => errors.push(format!("stderr capture failed: {error}")),
-        Err(error) => errors.push(format!("stderr capture task failed: {error}")),
+    // collectorと同じく、pipeを握った孫が残っても取り込みを締切で打ち切る。
+    for (task, stream) in [(stdout_task, "stdout"), (stderr_task, "stderr")] {
+        match process::finish_capture(task, process::CAPTURE_DEADLINE, group).await {
+            process::Capture::Finished(Ok(Ok(true))) => errors.push(format!(
+                "{stream} truncated at {} bytes",
+                parser.max_output_bytes
+            )),
+            process::Capture::Finished(Ok(Ok(false))) => {}
+            process::Capture::Finished(Ok(Err(error))) => {
+                errors.push(format!("{stream} capture failed: {error}"))
+            }
+            process::Capture::Finished(Err(error)) => {
+                errors.push(format!("{stream} capture task failed: {error}"))
+            }
+            process::Capture::Abandoned => errors.push(format!(
+                "{stream} stayed open for {}s after the parser exited (a background process held it); the saved log may be incomplete",
+                process::CAPTURE_DEADLINE.as_secs()
+            )),
+        }
     }
     if exit_code != Some(0) && errors.is_empty() {
         errors.push(format!(
