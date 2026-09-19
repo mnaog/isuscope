@@ -389,7 +389,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"host.cpu_
     assert!(saved > 0);
     // beginが作った行のまま、finishのtransactionが入らなかった状態。
     db.execute_batch(
-        "UPDATE runs SET state='running', finished_at=NULL, score=NULL, passed=NULL;
+        "UPDATE runs SET state='running', finished_at=NULL, score=NULL, passed=NULL, manifest_stamp=NULL;
          DELETE FROM metrics; DELETE FROM collector_runs; DELETE FROM logs;",
     )
     .unwrap();

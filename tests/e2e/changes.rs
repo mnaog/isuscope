@@ -262,8 +262,9 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     // Simulate a crash between canonical analysis publication and SQLite commit.
     db.execute("DELETE FROM run_analyses WHERE verdict='inconclusive'", [])
         .unwrap();
+    // SQLiteに残るのは書き出す前のrun.jsonの印なので、書き出したrun.jsonとは一致しない。
     db.execute(
-        "UPDATE runs SET analysis_status='pending' WHERE id=?1",
+        "UPDATE runs SET analysis_status='pending', manifest_stamp=NULL WHERE id=?1",
         [&candidate],
     )
     .unwrap();

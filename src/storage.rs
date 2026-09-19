@@ -76,14 +76,19 @@ impl Store {
         connection.busy_timeout(std::time::Duration::from_secs(10))?;
         enable_wal(&connection)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        // 同時に開いた別processと、schemaの作成・更新が交錯しないよう1つのtransactionにする。
-        // IMMEDIATEなので、後から来た側はbusy timeoutの間だけ待つ。
-        connection.execute_batch("BEGIN IMMEDIATE")?;
-        match migrate(&connection) {
-            Ok(()) => connection.execute_batch("COMMIT")?,
-            Err(error) => {
-                let _ = connection.execute_batch("ROLLBACK");
-                return Err(error);
+        // schemaが最新なら、読むだけのcommandは書き込みのtransactionを張らない。
+        let version =
+            connection.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))?;
+        if version < SCHEMA_VERSION {
+            // 同時に開いた別processと、schemaの作成・更新が交錯しないよう1つのtransactionにする。
+            // IMMEDIATEなので、後から来た側はbusy timeoutの間だけ待つ。
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            match migrate(&connection) {
+                Ok(()) => connection.execute_batch("COMMIT")?,
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
             }
         }
         let mut store = Self {
@@ -262,6 +267,10 @@ impl Store {
                 manifest.hypothesis,
                 manifest.analysis_status.as_str(),
             ],
+        )?;
+        transaction.execute(
+            "UPDATE runs SET manifest_stamp=?2 WHERE id=?1",
+            params![manifest.id, manifest_stamp(&final_dir.join("run.json"))],
         )?;
         persist_agent_context(&transaction, manifest)?;
         for log in &manifest.logs {
@@ -828,6 +837,21 @@ impl Store {
             if !manifest_path.is_file() {
                 continue;
             }
+            // indexを確定したときのrun.jsonのままなら、読み直さない（読むcommandのたびに
+            // 全runのmanifestを読んで書き込むと、履歴が増えるほど入口が重くなる）。
+            let stamp = manifest_stamp(&manifest_path);
+            let recorded = self
+                .connection
+                .query_row(
+                    "SELECT manifest_stamp FROM runs WHERE id=?1",
+                    [entry.file_name().to_string_lossy()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            if stamp.is_some() && recorded == stamp {
+                continue;
+            }
             let _lock = AnalysisLock::acquire(&run_dir)?;
             let manifest: RunManifest = match fs::read(&manifest_path)
                 .with_context(|| format!("cannot read {}", manifest_path.display()))
@@ -861,8 +885,8 @@ impl Store {
                         params![a.id,manifest.id,a.created_at.to_rfc3339(),a.verdict.as_str(),a.body,a.base_run_id])?;
                 }
                 tx.execute(
-                    "UPDATE runs SET analysis_status=?2 WHERE id=?1",
-                    params![manifest.id, manifest.analysis_status.as_str()],
+                    "UPDATE runs SET analysis_status=?2, manifest_stamp=?3 WHERE id=?1",
+                    params![manifest.id, manifest.analysis_status.as_str(), stamp],
                 )?;
                 tx.commit()?;
                 continue;
@@ -910,6 +934,7 @@ impl Store {
         fingerprints: &[Fingerprint],
         transitions: &[Transition],
     ) -> Result<()> {
+        let stamp = manifest_stamp(&self.final_dir(&manifest.id).join("run.json"));
         let transaction = self.connection.transaction()?;
         // 途中まで入った行（runningのまま）があれば、子の行ごと消して入れ直す。1つの
         // transactionなので、ここで止まっても次に開いたときに同じところからやり直せる。
@@ -997,6 +1022,10 @@ impl Store {
             )?;
         }
         persist_agent_context(&transaction, manifest)?;
+        transaction.execute(
+            "UPDATE runs SET manifest_stamp=?2 WHERE id=?1",
+            params![manifest.id, stamp],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -1246,6 +1275,19 @@ fn enable_wal(connection: &Connection) -> Result<()> {
     }
 }
 
+const SCHEMA_VERSION: u32 = 8;
+
+/// run.jsonの大きさと更新時刻。indexの確定時に保存し、一致するrunは開くたびに読み直さない。
+fn manifest_stamp(path: &Path) -> Option<String> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(format!("{}:{}", metadata.len(), modified.as_nanos()))
+}
+
 fn migrate(connection: &Connection) -> Result<()> {
     connection.execute_batch(
         "
@@ -1375,7 +1417,10 @@ fn migrate(connection: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'not_required'",
     )?;
     ensure_column(connection, "metrics", "observed_at", "TEXT")?;
-    connection.pragma_update(None, "user_version", 7)?;
+    // indexを確定したときのrun.jsonの大きさと更新時刻。行があるだけでは確定済みとは限らない
+    // （runの行はbeginで作り、finishの途中で落ちるとrunningのまま残る）。
+    ensure_column(connection, "runs", "manifest_stamp", "TEXT")?;
+    connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -1468,6 +1513,11 @@ mod tests {
                 ["legacy-run", "2026-08-28T00:00:00Z"],
             )
             .unwrap();
+        // discovery-runの行があるのは、survey-runへ改名する前のschemaのDBだけ。
+        store
+            .connection
+            .pragma_update(None, "user_version", 6)
+            .unwrap();
         drop(store);
 
         let store = Store::open(directory.path()).unwrap();
@@ -1477,7 +1527,7 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            7
+            SCHEMA_VERSION
         );
     }
 
