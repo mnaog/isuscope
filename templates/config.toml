@@ -153,15 +153,18 @@ while :; do
   psi_previous=$psi_current
   # 接続の受け付けと保持。0が続くなら、接続の取りこぼしはサーバー側ではない。
   set -- $(read_tcp); po=$1; ao=$2; rs=$3; lo=$4; ld=$5; sc=$6; tw=$7; established=$8
-  if [ "$dt_cs" -gt 0 ]; then
-  emit host.tcp_passive_opens_per_second $(( (po-ppo) * 100 / dt_cs )) connections
-  emit host.tcp_active_opens_per_second $(( (ao-pao) * 100 / dt_cs )) connections
-  emit host.tcp_retransmit_segments_per_second $(( (rs-prs) * 100 / dt_cs )) segments
-  emit host.tcp_listen_overflows_per_second $(( (lo-plo) * 100 / dt_cs )) connections
-  emit host.tcp_listen_drops_per_second $(( (ld-pld) * 100 / dt_cs )) connections
-  emit host.tcp_syn_cookies_sent_per_second $(( (sc-psc) * 100 / dt_cs )) connections
-  emit host.tcp_time_wait_overflow_per_second $(( (tw-ptw) * 100 / dt_cs )) connections
-  fi
+  # 毎秒値は小数で出す（整数で割ると、1.01秒に1件の取りこぼしが0件/秒になる）。取りこぼし系は
+  # 区間の件数もそのまま残す。件数は間隔が測れなかった区間でも正しいので、毎回出す。
+  echo "$((po-ppo)) $((ao-pao)) $((rs-prs)) $((lo-plo)) $((ld-pld)) $((sc-psc)) $((tw-ptw))" |
+  awk -v dt="$dt_cs" '{
+    split("tcp_passive_opens tcp_active_opens tcp_retransmit_segments tcp_listen_overflows tcp_listen_drops tcp_syn_cookies_sent tcp_time_wait_overflow", name, " ")
+    split("connections connections segments connections connections connections connections", unit, " ")
+    for (i = 1; i <= 7; i++) {
+      if (i >= 3) printf "host.%s %d %s\n", name[i], $i, unit[i]
+      if (dt > 0) printf "host.%s_per_second %.3f %s\n", name[i], $i * 100 / dt, unit[i]
+    }
+  }' |
+  while read -r name value unit; do emit "$name" "$value" "$unit"; done
   ppo=$po; pao=$ao; prs=$rs; plo=$lo; pld=$ld; psc=$sc; ptw=$tw
   emit host.tcp_established "$established" connections
   set -- $(read_sockets)
@@ -173,10 +176,11 @@ while :; do
     set -- ${previous:-}
     [ $# -eq 4 ] || continue
     [ "$dt_cs" -gt 0 ] || continue
-    emit_dev host.net_rx_packets_per_second $(( (rxp-$1) * 100 / dt_cs )) packets "$nic"
-    emit_dev host.net_rx_bytes_per_second $(( (rxb-$2) * 100 / dt_cs )) bytes "$nic"
-    emit_dev host.net_tx_packets_per_second $(( (txp-$3) * 100 / dt_cs )) packets "$nic"
-    emit_dev host.net_tx_bytes_per_second $(( (txb-$4) * 100 / dt_cs )) bytes "$nic"
+    set -- $(awk -v dt="$dt_cs" -v a=$((rxp-$1)) -v b=$((rxb-$2)) -v c=$((txp-$3)) -v d=$((txb-$4)) 'BEGIN { printf "%.3f %.3f %.3f %.3f", a * 100 / dt, b * 100 / dt, c * 100 / dt, d * 100 / dt }')
+    emit_dev host.net_rx_packets_per_second "$1" packets "$nic"
+    emit_dev host.net_rx_bytes_per_second "$2" bytes "$nic"
+    emit_dev host.net_tx_packets_per_second "$3" packets "$nic"
+    emit_dev host.net_tx_bytes_per_second "$4" bytes "$nic"
   done
   dev_previous=$dev_current
   pu=$u; pn=$n; ps=$s; pd=$d; pw=$w; pq=$q; pr=$r; pv=$v; pt=$t
