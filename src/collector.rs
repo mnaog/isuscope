@@ -1225,6 +1225,7 @@ fn string(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<Str
 /// `{`で始まる行は同じcollectorが出した接続とupstreamの値なので、protocolとして別に読む。
 fn parse_alp_windows(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
     let mut metrics = Vec::new();
+    let mut lines = None;
     for line in raw.lines() {
         if line.trim().is_empty() || line.starts_with('{') {
             continue;
@@ -1232,6 +1233,14 @@ fn parse_alp_windows(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
         let (window, json) = line
             .split_once('\t')
             .context("alp window line has no tab after the window")?;
+        if window == "lines" {
+            lines = Some(
+                json.trim()
+                    .parse::<f64>()
+                    .context("alp collector wrote an invalid line count")?,
+            );
+            continue;
+        }
         let parsed = parse_alp_json(json, routes)
             .with_context(|| format!("alp output for window {window} is not valid"))?;
         if window == "whole" {
@@ -1256,6 +1265,32 @@ fn parse_alp_windows(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
                     metric
                 }),
         );
+    }
+    // alpは解釈できない行（壊れたescapeのURIなど）を黙って飛ばす。methodとuriを読めた行の数と
+    // 比べ、全部飛ばされたら失敗にし（非空のlogでHTTPの集計が0件のままcompleteにしない）、
+    // 一部なら飛ばされた数を残す。
+    if let Some(lines) = lines {
+        let aggregated = metrics
+            .iter()
+            .filter(|metric| {
+                metric.name == "http.requests"
+                    && metric.timestamp.is_none()
+                    && !metric.labels.contains_key("status_class")
+            })
+            .map(|metric| metric.value)
+            .sum::<f64>();
+        if lines > 0.0 && aggregated == 0.0 {
+            anyhow::bail!("alp aggregated none of {lines} access-log lines");
+        }
+        if aggregated < lines {
+            metrics.push(Metric {
+                name: "http.access_log_skipped".into(),
+                value: lines - aggregated,
+                unit: "requests".into(),
+                timestamp: None,
+                labels: BTreeMap::new(),
+            });
+        }
     }
     Ok(metrics)
 }
@@ -2193,6 +2228,31 @@ fn matches_phase(left: CollectorPhase, right: CollectorPhase) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alp_windows_report_lines_that_alp_skipped() {
+        // alpは`uri:/bad%ZZ`のような行を黙って飛ばす（Dockerのalp 1.0.21で確かめた）。
+        let one = r#"whole	[["count","method","uri"],[1,"GET","/ok"]]"#;
+        let metrics = parse_alp_windows(&format!("{one}\nlines\t2\n"), None).unwrap();
+        let skipped = metrics
+            .iter()
+            .find(|metric| metric.name == "http.access_log_skipped")
+            .map(|metric| metric.value);
+        assert_eq!(skipped, Some(1.0));
+        let complete = parse_alp_windows(&format!("{one}\nlines\t1\n"), None).unwrap();
+        assert!(
+            !complete
+                .iter()
+                .any(|metric| metric.name == "http.access_log_skipped")
+        );
+        // 全部飛ばされて見出ししか無ければ、HTTPの集計が0件のまま成功にしない。
+        let none = "whole\t[[\"count\",\"method\",\"uri\"]]\nlines\t1\n";
+        assert!(parse_alp_windows(none, None).is_err());
+        // 空の差分は成功。
+        assert!(
+            parse_alp_windows("whole\t[[\"count\",\"method\",\"uri\"]]\nlines\t0\n", None).is_ok()
+        );
+    }
 
     #[test]
     fn alp_rows_merged_into_one_route_do_not_fabricate_percentiles() {

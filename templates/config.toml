@@ -739,6 +739,9 @@ summarize() {
     --percentiles 50,95,99 --matching-groups '{route_matching_groups}' | tr -d '\n'
 }
 printf 'whole\t%s\n' "$(summarize "$input")"
+# methodとuriを読めた行の数。alpは解釈できない行（`%ZZ`のような壊れたescapeのURIなど）を黙って
+# 飛ばすので、parserがalpの集計件数と比べ、全部飛ばされたら失敗にし、一部なら数を残す。
+printf 'lines\t%s\n' "$parsed"
 for file in "$work"/*.bucket; do
   test -e "$file" || continue
   bucket=${file##*/}

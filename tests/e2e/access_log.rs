@@ -63,6 +63,8 @@ fn alp_collector_aggregates_the_delta_on_the_node() {
     );
     // 差分と作業fileはnodeに残さない。
     assert_eq!(left, 0);
+    // alpと比べるため、methodとuriを読めた行の数も出す。
+    assert!(stdout.contains("\nlines\t8\n"), "{stdout}");
     // 差分全体（8行）と、ベンチ区間の5秒bucket（4行と2行）。bucketは負荷の始まり
     // （1789653662.5）から区切り、始まりをまたぐbucketを作らない。
     assert!(stdout.contains("whole\t[[\"count\"],[8]]"), "{stdout}");
