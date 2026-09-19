@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
 pub struct BriefOutput {
@@ -177,6 +177,9 @@ pub struct CoverageIssueGroup {
     pub status: String,
     pub nodes: Vec<String>,
     pub missing_metrics: Vec<String>,
+    /// 失敗したcollectorのerror（同じものは1つにまとめる）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
     pub occurrences: usize,
 }
 
@@ -259,7 +262,7 @@ pub fn build(
 
 fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, usize) {
     type Key = (String, String, String, String, Vec<String>);
-    let mut groups = BTreeMap::<Key, Vec<String>>::new();
+    let mut groups = BTreeMap::<Key, (Vec<String>, BTreeSet<String>)>::new();
     let mut info_count = 0;
     for item in coverage {
         let severity = match item.status.as_str() {
@@ -272,7 +275,7 @@ fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, 
             info_count += 1;
             continue;
         }
-        groups
+        let (nodes, errors) = groups
             .entry((
                 item.section,
                 item.collector,
@@ -280,13 +283,14 @@ fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, 
                 item.status,
                 item.missing_metrics,
             ))
-            .or_default()
-            .push(item.node);
+            .or_default();
+        nodes.push(item.node);
+        errors.extend(item.error);
     }
     let mut issues = groups
         .into_iter()
         .map(
-            |((section, collector, phase, status, missing_metrics), mut nodes)| {
+            |((section, collector, phase, status, missing_metrics), (mut nodes, errors))| {
                 nodes.sort();
                 nodes.dedup();
                 CoverageIssueGroup {
@@ -302,6 +306,7 @@ fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, 
                     occurrences: nodes.len(),
                     nodes,
                     missing_metrics,
+                    errors: errors.into_iter().collect(),
                 }
             },
         )
@@ -571,6 +576,7 @@ mod tests {
                 phase: "after".into(),
                 status: "missing".into(),
                 missing_metrics: vec!["http.requests".into()],
+                error: None,
             })
             .chain(std::iter::once(CoverageSummary {
                 section: "cpu".into(),
@@ -579,6 +585,7 @@ mod tests {
                 phase: "after".into(),
                 status: "unavailable".into(),
                 missing_metrics: vec!["cpu.sample_count".into()],
+                error: None,
             }))
             .collect();
         let (issues, info_count) = coverage_issues(coverage);

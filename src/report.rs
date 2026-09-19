@@ -63,6 +63,9 @@ pub struct CoverageSummary {
     pub phase: String,
     pub status: String,
     pub missing_metrics: Vec<String>,
+    /// collectorが失敗したときのerror。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, PartialEq)]
@@ -886,6 +889,7 @@ fn coverage(
                     .iter()
                     .map(|name| name.to_string())
                     .collect(),
+                error: None,
             });
             continue;
         }
@@ -913,8 +917,27 @@ fn coverage(
                 phase: collector.phase.clone(),
                 status: status.into(),
                 missing_metrics,
+                error: collector.error.clone(),
             });
         }
+    }
+    // HTTP・DB・CPU・hostのどれにも分類していないcollector（mysql-status、service-throttle、
+    // 後から足したcollectorなど）も、失敗はrunをdegradedにする。分類の一覧に無くても、失敗と
+    // そのerrorは必ず見えるようにする。
+    for collector in collectors
+        .iter()
+        .filter(|collector| collector_section(&collector.name).is_none())
+        .filter(|collector| collector.status == "failed")
+    {
+        coverage.push(CoverageSummary {
+            section: "other".into(),
+            node: collector.node.clone().unwrap_or_else(|| "local".into()),
+            collector: collector.name.clone(),
+            phase: collector.phase.clone(),
+            status: collector.status.clone(),
+            missing_metrics: Vec::new(),
+            error: collector.error.clone(),
+        });
     }
     coverage
 }
@@ -1437,5 +1460,22 @@ mod tests {
                 && item.collector == "-"
                 && item.status == "missing"
         }));
+
+        // 分類の一覧に無いcollectorも、失敗はerrorと一緒に載る（成功や不在は載せない）。
+        let mut status = collector("mysql-status", "db1", "failed");
+        status.error = Some("mysql: access denied".into());
+        let report = coverage(
+            &[status, collector("service-throttle", "app1", "unavailable")],
+            &[],
+            &[],
+        );
+        let other = report
+            .iter()
+            .filter(|item| item.section == "other")
+            .collect::<Vec<_>>();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].collector, "mysql-status");
+        assert_eq!(other[0].status, "failed");
+        assert_eq!(other[0].error.as_deref(), Some("mysql: access denied"));
     }
 }
