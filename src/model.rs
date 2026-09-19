@@ -163,6 +163,35 @@ pub struct BenchmarkResult {
     pub operator_lines_dropped: usize,
 }
 
+impl BenchmarkResult {
+    /// 5秒bucketの区切りの起点。負荷の始まり（initializeの終わり）に揃えると、initializeと
+    /// 負荷の両方にまたがるbucketができない。node上のcollector（alp、slp）とperfのparserは
+    /// この値から5秒ずつ区切る。initializeの終わりが分からないrunはベンチの始まり。
+    pub fn bucket_origin(&self) -> Option<DateTime<Utc>> {
+        self.initialize_finished_at.or(self.started_at)
+    }
+}
+
+/// `at`を含む5秒bucketの先頭。`origin`があればそこから5秒ずつ、無ければepochの5の倍数で区切る。
+pub fn bucket_start(at: DateTime<Utc>, origin: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    const BUCKET_MICROS: i64 = 5_000_000;
+    let origin = origin.unwrap_or(DateTime::UNIX_EPOCH);
+    let offset = (at - origin).num_microseconds()?;
+    Some(origin + chrono::Duration::microseconds(offset.div_euclid(BUCKET_MICROS) * BUCKET_MICROS))
+}
+
+/// epoch秒の小数を時刻にする。1.7e9秒台のf64は1e-7秒ほどずれるので、マイクロ秒に丸める
+/// （丸めないと、負荷の始まりに揃えたbucketの先頭が始まりより僅かに前になって区間から落ちる）。
+pub fn epoch_seconds(value: f64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_micros((value * 1_000_000.0).round() as i64)
+}
+
+/// 区間`[start, end)`に入るか。5秒bucketのtimestampはbucketの先頭で、中身は先頭から5秒間なので、
+/// 終わりを含めると、次の区間の最初のbucket（負荷の始まりに揃えたもの）までinitializeに入る。
+pub fn in_window(at: DateTime<Utc>, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+    at >= start && at < end
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metric {
     pub name: String,

@@ -14,6 +14,8 @@ mod analysis;
 mod benchmark_messages;
 #[path = "e2e/brief_shape.rs"]
 mod brief_shape;
+#[path = "e2e/bucket_windows.rs"]
+mod bucket_windows;
 #[path = "e2e/changes.rs"]
 mod changes;
 #[path = "e2e/concurrency.rs"]

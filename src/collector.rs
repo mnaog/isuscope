@@ -385,6 +385,7 @@ async fn finalize(
             parser,
             routes.is_file().then_some(routes.as_path()),
             benchmark_interval(run_dir),
+            bucket_origin(run_dir),
         ) {
             Ok(parsed) => metrics.extend(parsed),
             Err(error) => compression_errors.push(format!("standard output parse failed: {error}")),
@@ -606,12 +607,7 @@ fn parse_metric_timestamp(value: Option<&Value>) -> Option<chrono::DateTime<chro
         Value::String(value) => chrono::DateTime::parse_from_rfc3339(value)
             .ok()
             .map(|value| value.with_timezone(&chrono::Utc)),
-        Value::Number(value) => {
-            let seconds = value.as_f64()?;
-            let whole = seconds.floor() as i64;
-            let nanos = ((seconds - whole as f64) * 1_000_000_000.0).round() as u32;
-            chrono::DateTime::from_timestamp(whole, nanos)
-        }
+        Value::Number(value) => crate::model::epoch_seconds(value.as_f64()?),
         _ => None,
     }
 }
@@ -621,6 +617,7 @@ pub(crate) fn parse_standard_output(
     parser: CollectorParser,
     routes: Option<&Path>,
     interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+    origin: Option<chrono::DateTime<Utc>>,
 ) -> Result<Vec<Metric>> {
     let input = fs::File::open(path)?;
     let decoder = zstd::stream::read::Decoder::new(input)?;
@@ -645,11 +642,11 @@ pub(crate) fn parse_standard_output(
         CollectorParser::SlpWindows => unreachable!("handled before UTF-8 validation"),
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
         CollectorParser::ServiceCgroup => Ok(parse_service_cgroup(&raw, interval)),
-        CollectorParser::PerfScript => parse_perf_script(&raw),
+        CollectorParser::PerfScript => parse_perf_script(&raw, origin),
     }
 }
 
-fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
+fn parse_perf_script(raw: &str, origin: Option<chrono::DateTime<Utc>>) -> Result<Vec<Metric>> {
     // `# isuscope-perf-clock <wall> <uptime>`: sampleの時刻はCLOCK_MONOTONIC（uptimeと同じ基準）で、
     // 壁時計との差を足せば絶対時刻になる。`# isuscope-perf-start <wall>`は旧形式で、
     // `--reltime`の時刻（最初のsampleからの経過）をperf起動時の壁時計へ足す。
@@ -704,8 +701,7 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
     let mut buckets = BTreeMap::<(chrono::DateTime<Utc>, String, String, String), u64>::new();
     let mut parsed_lines = 0_u64;
     let mut record = |sample: Sample, buckets: &mut BTreeMap<_, u64>| {
-        let Some(bucket) = chrono::DateTime::from_timestamp(sample.at.timestamp() / 5 * 5, 0)
-        else {
+        let Some(bucket) = crate::model::bucket_start(sample.at, origin) else {
             return;
         };
         let (binary, symbol) = sample
@@ -871,6 +867,13 @@ fn parse_perf_script(raw: &str) -> Result<Vec<Metric>> {
         .chain(symbol_metrics)
         .chain(process_metrics)
         .collect())
+}
+
+/// 5秒bucketの区切りの起点（[`crate::model::BenchmarkResult::bucket_origin`]）。
+fn bucket_origin(run_dir: &Path) -> Option<chrono::DateTime<Utc>> {
+    let manifest: crate::model::RunManifest =
+        serde_json::from_slice(&fs::read(run_dir.join("run.json")).ok()?).ok()?;
+    manifest.benchmark.bucket_origin()
 }
 
 fn benchmark_interval(run_dir: &Path) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {
@@ -1216,7 +1219,8 @@ fn string(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<Str
         .find_map(|name| object.get(*name).and_then(Value::as_str).map(str::to_owned))
 }
 
-/// `window \t <alp JSON>`。`whole`は差分全体のroute別集計、数字は5秒bucketの開始（epoch秒）で、
+/// `window \t <alp JSON>`。`whole`は差分全体のroute別集計、数字は5秒bucketの開始（epoch秒。
+/// 負荷の始まりから5秒ずつ区切るので小数を持つ）で、
 /// bucketからは`isuscope series`が使う回数・error・分位点だけを時系列として残す。
 /// `{`で始まる行は同じcollectorが出した接続とupstreamの値なので、protocolとして別に読む。
 fn parse_alp_windows(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
@@ -1235,9 +1239,9 @@ fn parse_alp_windows(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
             continue;
         }
         let at = window
-            .parse::<i64>()
+            .parse::<f64>()
             .ok()
-            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            .and_then(crate::model::epoch_seconds)
             .with_context(|| format!("alp window {window} is not an epoch second"))?;
         metrics.extend(
             parsed
@@ -2088,9 +2092,11 @@ impl RunWindows {
         let manifest = fs::read(run_dir.join("run.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice::<crate::model::RunManifest>(&raw).ok());
+        // collectorのbucketは負荷の始まりから区切るので、丸めずにマイクロ秒まで渡す
+        // （ミリ秒へ丸めると、最初のbucketの先頭が始まりより前になり得る）。
         let epoch = |value: Option<chrono::DateTime<Utc>>| {
             value
-                .map(|at| format!("{:.3}", at.timestamp_micros() as f64 / 1_000_000.0))
+                .map(|at| format!("{}.{:06}", at.timestamp(), at.timestamp_subsec_micros()))
                 .unwrap_or_default()
         };
         Self {
@@ -2243,7 +2249,7 @@ mod tests {
                 .find(|metric| {
                     metric.name == name
                         && metric.labels["route"] == route
-                        && metric.timestamp.map(|at| at.timestamp()) == at
+                        && metric.timestamp.map(|at| at.timestamp_millis()) == at
                         && extra.is_none_or(|(key, value)| {
                             metric.labels.get(key).map(String::as_str) == Some(value)
                         })
@@ -2266,8 +2272,9 @@ mod tests {
             Some(400.0)
         );
         assert_eq!(value("http.errors", "/login", None, None), Some(1.0));
-        // 5秒bucket：区間の中だけで、回数・error・分位点だけを時系列にする。
-        let first = Some(1_789_653_660);
+        // 5秒bucket：区間の中だけで、回数・error・分位点だけを時系列にする。bucketは負荷の
+        // 始まり（1789653662.5）から区切るので、始まりの直前の要求は負荷側のbucketに混ざらない。
+        let first = Some(1_789_653_657_500);
         assert_eq!(
             value("http.requests", "/user/:id/home", first, None),
             Some(3.0)
@@ -2277,7 +2284,7 @@ mod tests {
             value(
                 "http.request_duration",
                 "/user/:id/home",
-                Some(1_789_653_665),
+                Some(1_789_653_662_500),
                 Some(("quantile", "0.95"))
             ),
             Some(40.0)
@@ -2306,7 +2313,7 @@ mod tests {
                 .iter()
                 .find(|metric| {
                     metric.name == name
-                        && metric.timestamp.map(|at| at.timestamp()) == at
+                        && metric.timestamp.map(|at| at.timestamp_millis()) == at
                         && labels.iter().all(|(key, value)| {
                             metric.labels.get(*key).map(String::as_str) == Some(value)
                         })
@@ -2320,7 +2327,7 @@ mod tests {
         );
         assert_eq!(find("client.connection_requests_max", &[], None), Some(3.0));
         assert_eq!(
-            find("client.connections_opened", &[], Some(1_789_653_660)),
+            find("client.connections_opened", &[], Some(1_789_653_657_500)),
             Some(2.0)
         );
         // 10.0.0.9で失敗し10.0.0.1で返った要求は、時間を試行ごとの接続先へ付ける（`-`は数えない）。
@@ -2456,7 +2463,7 @@ mod tests {
         let raw = "# isuscope-perf-clock 1787827200.250000000 1000.25\n\
 nginx 1200 [000] 1000.350000000: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)\n\
 nginx 1200 [001] 1006.000000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/nginx)\n";
-        let metrics = parse_perf_script(raw).unwrap();
+        let metrics = parse_perf_script(raw, None).unwrap();
         let buckets = metrics
             .iter()
             .filter(|metric| metric.name == "cpu.sample_count")
@@ -2469,12 +2476,12 @@ nginx 1200 [001] 1006.000000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
         );
 
         // busyboxのdateは`%N`を出さないので、小数部の無い壁時計も読める。
-        assert!(parse_perf_script("# isuscope-perf-clock 1787827200. 1000.25\n").is_ok());
+        assert!(parse_perf_script("# isuscope-perf-clock 1787827200. 1000.25\n", None).is_ok());
 
         // 時計の基準が合わない（別の時計で記録された）なら、黙って別の時刻へ置かずに失敗する。
         let mismatched = "# isuscope-perf-clock 1787827200.25 1000.25\n\
 nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)\n";
-        assert!(parse_perf_script(mismatched).is_err());
+        assert!(parse_perf_script(mismatched, None).is_err());
     }
 
     #[test]
@@ -2698,8 +2705,11 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
 
     #[test]
     fn perf_script_is_bucketed_by_symbol_and_process() {
-        let metrics =
-            parse_perf_script(include_str!("../tests/fixtures/perf-script-series.txt")).unwrap();
+        let metrics = parse_perf_script(
+            include_str!("../tests/fixtures/perf-script-series.txt"),
+            None,
+        )
+        .unwrap();
         assert!(metrics.iter().any(|metric| {
             metric.name == "cpu.sample_count"
                 && metric.value == 2.0
@@ -2714,10 +2724,33 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
     }
 
     #[test]
+    fn perf_buckets_start_at_the_load_start() {
+        // 負荷の始まり（1787827203.5）の0.2秒前と0.2秒後のsampleは、別のbucketに入る。
+        // epochの5の倍数で区切ると、どちらも1787827200のbucketに入り、区間で絞ると両方落ちる。
+        let raw = "# isuscope-perf-clock 1787827200.000000000 1000.0\n\
+nginx 1200 [000] 1003.300000000: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)\n\
+nginx 1200 [001] 1003.700000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/nginx)\n";
+        let origin = chrono::DateTime::from_timestamp_micros(1_787_827_203_500_000);
+        let buckets = parse_perf_script(raw, origin)
+            .unwrap()
+            .into_iter()
+            .filter(|metric| metric.name == "cpu.sample_count")
+            .filter_map(|metric| metric.timestamp.map(|at| at.timestamp_millis()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            buckets.into_iter().collect::<Vec<_>>(),
+            [1_787_827_198_500, 1_787_827_203_500]
+        );
+    }
+
+    #[test]
     fn perf_script_also_reports_the_whole_capture_by_symbol() {
         // perf reportを別に走らせず、同じperf scriptからrun全体の自己時間の割合を出す。
-        let metrics =
-            parse_perf_script(include_str!("../tests/fixtures/perf-script-series.txt")).unwrap();
+        let metrics = parse_perf_script(
+            include_str!("../tests/fixtures/perf-script-series.txt"),
+            None,
+        )
+        .unwrap();
         let whole = metrics
             .iter()
             .filter(|metric| metric.name == "cpu.sample_percent" && metric.timestamp.is_none())
@@ -2733,9 +2766,10 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
 
     #[test]
     fn perf_script_with_hidden_call_graph_reads_right_aligned_headers() {
-        let metrics = parse_perf_script(include_str!(
-            "../tests/fixtures/perf-script-hidden-callchain.txt"
-        ))
+        let metrics = parse_perf_script(
+            include_str!("../tests/fixtures/perf-script-hidden-callchain.txt"),
+            None,
+        )
         .unwrap();
         let counts = metrics
             .iter()
@@ -2758,8 +2792,11 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
 
     #[test]
     fn perf_script_with_call_graph_uses_the_leaf_frame() {
-        let metrics =
-            parse_perf_script(include_str!("../tests/fixtures/perf-script-callchain.txt")).unwrap();
+        let metrics = parse_perf_script(
+            include_str!("../tests/fixtures/perf-script-callchain.txt"),
+            None,
+        )
+        .unwrap();
         let counts = metrics
             .iter()
             .filter(|metric| metric.name == "cpu.sample_count" && metric.timestamp.is_some())
@@ -3026,7 +3063,7 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
             .unwrap();
         encoder.finish().unwrap();
 
-        let metrics = parse_standard_output(&path, CollectorParser::MysqlSlow, None, None)
+        let metrics = parse_standard_output(&path, CollectorParser::MysqlSlow, None, None, None)
             .expect("binary literals should be decoded lossily");
 
         assert!(metrics.iter().any(|metric| metric.name == "db.query.calls"));

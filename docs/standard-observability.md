@@ -68,7 +68,7 @@ isuscope query latest --scope series --window load --metric-prefix service. --gr
 isuscope series latest --window initialize --metric host.cpu_iowait_percent --bucket 1
 ```
 
-HTTPのroute別5秒bucketは、alp collectorがベンチ区間を5秒ごとのfileに分けてalpで集計したrequest数・error・p50/p95/p99です（`$msec`で振り分ける）。行動遷移helperは`survey-run`で持ち帰った生のaccess logからsession単位の遷移だけを作ります。MySQL slow logはslpがnode上でinitializeと負荷区間に分けて文ごとに集計し、SQL別の値は区間ごとの集約だけです（SQL別の5秒時系列はありません）。5秒bucketはDB全体の`db.calls`・`db.duration`・`db.lock_duration`です。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。bucket値には`timestamp`があり、filter可能な`isuscope series`、`isuscope query`、`isuscope sql`から参照できます。
+HTTPのroute別5秒bucketは、alp collectorがベンチ区間を5秒ごとのfileに分けてalpで集計したrequest数・error・p50/p95/p99です（`$msec`で振り分ける）。行動遷移helperは`survey-run`で持ち帰った生のaccess logからsession単位の遷移だけを作ります。MySQL slow logはslpがnode上でinitializeと負荷区間に分けて文ごとに集計し、SQL別の値は区間ごとの集約だけです（SQL別の5秒時系列はありません）。5秒bucketはDB全体の`db.calls`・`db.duration`・`db.lock_duration`です。perf scriptはprocess・binary・symbolごとのsample count/shareを5秒bucketへ変換します。5秒bucketはどれも負荷の始まり（initializeの終わり。分からなければベンチの始まり）から5秒ずつ区切り、`timestamp`はbucketの先頭です。epochの5の倍数で区切ると、負荷の始まりをまたぐbucketができ、`--window load`で絞ったときに負荷の最初の数秒（接続が急増しやすいところ）が丸ごと落ちていました。区間は`[始まり, 終わり)`で絞るので、負荷の最初のbucketはinitializeには入りません。`series`の`window.edges`は、区間の端がbucketの区切りかnode上の境界（ベンチの始まりと終わり）なら`exact`、端をまたぐbucketがあれば`approximate`です（initializeの始まりや、`--from/--to`で切った区間）。bucket値には`timestamp`があり、filter可能な`isuscope series`、`isuscope query`、`isuscope sql`から参照できます。
 
 after collectorを開始する前にbenchmarkの開始・終了時刻をrun manifestへcheckpointし、HTTP・MySQL・sysstat parserは区間外のsampleを除外します。external benchmarkでは、portalで開始する直前と終了後にEnterを押した時刻を境界として記録します。metricの`collector` labelで観測元を区別し、表のCPUは追加package不要の`host-sampler`を優先してsysstatとの二重集計を避けます。
 

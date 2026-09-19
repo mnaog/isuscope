@@ -220,7 +220,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 ## 観測の考え方
 
-標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。briefの`hosts`と`clients`は、initializeの終わりが分かるrunでは負荷区間だけで要約し、どちらで要約したかを`hosts_window`（`load`か`whole`）に出します。
+標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。5秒ごとに集計する値（HTTP、DB、perf、client）は負荷の始まりから区切るので、負荷の最初のbucketが落ちたりinitializeへ混ざったりしません。briefの`hosts`と`clients`は、initializeの終わりが分かるrunでは負荷区間だけで要約し、どちらで要約したかを`hosts_window`（`load`か`whole`）に出します。
 
 ALPはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。標準collectorを最初から全部入れる理由と、その受け入れ基準は[標準observability](docs/standard-observability.md)にあります。
 

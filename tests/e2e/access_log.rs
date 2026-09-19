@@ -34,8 +34,9 @@ fn alp_collector_aggregates_the_delta_on_the_node() {
         fs::write(format!("{}.nginx.log", prefix.display()), log).unwrap();
         let script = template
             .replace("/tmp/isuscope-{run_id}", prefix.to_str().unwrap())
-            .replace("{benchmark_started_at}", "1789653660.000")
-            .replace("{benchmark_finished_at}", "1789653670.000")
+            .replace("{benchmark_started_at}", "1789653660.000000")
+            .replace("{load_started_at}", "1789653662.500000")
+            .replace("{benchmark_finished_at}", "1789653670.000000")
             .replace("{route_matching_groups}", "");
         let output = Command::new("sh")
             .args(["-c", &script])
@@ -62,17 +63,24 @@ fn alp_collector_aggregates_the_delta_on_the_node() {
     );
     // 差分と作業fileはnodeに残さない。
     assert_eq!(left, 0);
-    // 差分全体（8行）と、ベンチ区間の5秒bucket（4行と2行）。
+    // 差分全体（8行）と、ベンチ区間の5秒bucket（4行と2行）。bucketは負荷の始まり
+    // （1789653662.5）から区切り、始まりをまたぐbucketを作らない。
     assert!(stdout.contains("whole\t[[\"count\"],[8]]"), "{stdout}");
-    assert!(stdout.contains("1789653660\t[[\"count\"],[4]]"), "{stdout}");
-    assert!(stdout.contains("1789653665\t[[\"count\"],[2]]"), "{stdout}");
+    assert!(
+        stdout.contains("1789653657.500000\t[[\"count\"],[4]]"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("1789653662.500000\t[[\"count\"],[2]]"),
+        "{stdout}"
+    );
     for expected in [
         r#""name":"client.connections_opened_total","value":3.000000"#,
         r#""name":"client.connection_requests_max","value":3.000000"#,
         r#""name":"http.upstream_retried_requests","value":1.000000,"unit":"requests","labels":{"upstream":"10.0.0.9:8080"}"#,
         r#""name":"http.upstream_response_duration_max","value":2.000000,"unit":"ms","labels":{"upstream":"10.0.0.9:8080"}"#,
         r#""name":"http.upstream_connect_duration_max","value":1.000000,"unit":"ms","labels":{"upstream":"10.0.0.1:8080"}"#,
-        r#""name":"client.request_gap","value":5360.000134,"unit":"ms","labels":{"quantile":"0.99"},"timestamp":1789653665"#,
+        r#""name":"client.request_gap","value":5360.000134,"unit":"ms","labels":{"quantile":"0.99"},"timestamp":1789653662.500000"#,
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");
     }

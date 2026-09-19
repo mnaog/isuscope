@@ -176,7 +176,11 @@ pub fn diagnose(
             "load",
             series_metrics
                 .iter()
-                .filter(|metric| metric.timestamp.is_some_and(|at| at >= start && at <= end))
+                .filter(|metric| {
+                    metric
+                        .timestamp
+                        .is_some_and(|at| crate::model::in_window(at, start, end))
+                })
                 .cloned()
                 .collect::<Vec<_>>(),
         ),

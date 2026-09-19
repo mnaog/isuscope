@@ -867,6 +867,10 @@ struct SeriesWindow {
     from_seconds: i64,
     to_seconds: i64,
     bucket_seconds: u64,
+    /// 5秒bucketで集計した値（HTTP、DB、perf、client）の区間の端。`exact`は端がbucketの区切りか、
+    /// node上で振り分けた境界（ベンチの始まりと終わり）に一致している。`approximate`は端をまたぐ
+    /// bucketがあり、始まり側のbucketは含めず、終わり側のbucketは含めている。
+    edges: &'static str,
 }
 
 #[derive(serde::Serialize)]
@@ -1026,7 +1030,7 @@ fn show_query(
                 candidate_metrics.retain(|metric| {
                     metric
                         .timestamp
-                        .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+                        .is_some_and(|timestamp| isuscope::model::in_window(timestamp, start, end))
                 });
             }
             let options = MetricQueryOptions {
@@ -1053,9 +1057,9 @@ fn show_query(
                     let manifest = store.load(&base_id)?;
                     let (start, end) = named_window(&manifest, window)?;
                     base_metrics.retain(|metric| {
-                        metric
-                            .timestamp
-                            .is_some_and(|timestamp| timestamp >= start && timestamp <= end)
+                        metric.timestamp.is_some_and(|timestamp| {
+                            isuscope::model::in_window(timestamp, start, end)
+                        })
                     });
                 }
                 let base = query::metric_query(base_id, base_metrics, options);
@@ -1196,8 +1200,9 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
     };
     let bucket_seconds = options.bucket as i64;
     let duration = (end - start).num_seconds().max(0);
-    let metrics = store
-        .metrics(&id)?
+    let metrics = store.metrics(&id)?;
+    let edges = series_edges(&manifest, &metrics, requested_start, requested_end);
+    let metrics = metrics
         .into_iter()
         .filter(|metric| metric_matches(metric, &options, requested_start, requested_end))
         .collect::<Vec<_>>();
@@ -1210,6 +1215,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             requested_start,
             requested_end,
             &options,
+            edges,
             series_coverage(&manifest.collectors),
             data,
         ))?;
@@ -1294,6 +1300,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         requested_start,
         requested_end,
         &options,
+        edges,
         series_coverage(&manifest.collectors),
         SeriesData::Overview {
             total_count,
@@ -1348,6 +1355,7 @@ fn series_output(
     window_start: chrono::DateTime<chrono::Utc>,
     window_end: chrono::DateTime<chrono::Utc>,
     options: &SeriesOptions,
+    edges: &'static str,
     coverage: Vec<SeriesCoverage>,
     data: SeriesData,
 ) -> SeriesOutput {
@@ -1365,6 +1373,7 @@ fn series_output(
             from_seconds: (window_start - benchmark_start).num_seconds(),
             to_seconds: (window_end - benchmark_start).num_seconds(),
             bucket_seconds: options.bucket,
+            edges,
         },
         filters: SeriesFilters {
             metrics: options.metrics.clone(),
@@ -1380,6 +1389,48 @@ fn series_output(
         },
         coverage,
         data,
+    }
+}
+
+/// 区間の端が5秒bucketで正確に切れているか（[`SeriesWindow::edges`]）。端がbucketの区切りか、
+/// node上で行を振り分けた境界（ベンチの始まりと終わり）なら正確。bucketの区切りは保存された
+/// bucketから読む（負荷の始まりに揃える前のrunは、epochの5の倍数で区切っている）。
+fn series_edges(
+    manifest: &isuscope::model::RunManifest,
+    metrics: &[isuscope::model::Metric],
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> &'static str {
+    const BUCKETED: [&str; 4] = [
+        "http.requests",
+        "db.calls",
+        "cpu.sample_count",
+        "client.connections_opened",
+    ];
+    let origin = manifest.benchmark.bucket_origin();
+    let aligned = |at: chrono::DateTime<chrono::Utc>, origin: chrono::DateTime<chrono::Utc>| {
+        (at - origin)
+            .num_microseconds()
+            .is_some_and(|offset| offset.rem_euclid(5_000_000) == 0)
+    };
+    let stored = metrics
+        .iter()
+        .filter(|metric| BUCKETED.contains(&metric.name.as_str()))
+        .find_map(|metric| metric.timestamp);
+    let origin = match (stored, origin) {
+        (Some(at), Some(origin)) if aligned(at, origin) => origin,
+        (Some(_), _) | (None, None) => chrono::DateTime::UNIX_EPOCH,
+        (None, Some(origin)) => origin,
+    };
+    let exact = |at: chrono::DateTime<chrono::Utc>| {
+        Some(at) == manifest.benchmark.started_at
+            || Some(at) == manifest.benchmark.finished_at
+            || aligned(at, origin)
+    };
+    if exact(start) && exact(end) {
+        "exact"
+    } else {
+        "approximate"
     }
 }
 
@@ -1404,7 +1455,9 @@ fn metric_matches(
     {
         return false;
     }
-    metric.timestamp.is_some_and(|at| at >= start && at <= end)
+    metric
+        .timestamp
+        .is_some_and(|at| isuscope::model::in_window(at, start, end))
 }
 
 fn generic_series_data(
