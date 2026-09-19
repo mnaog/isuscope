@@ -370,6 +370,9 @@ pub struct DatabaseQueryRow {
     /// 照合には全文を使い、出力だけを切る（古いslpの一括INSERTは1文で数十万文字ある）。
     #[serde(serialize_with = "serialize_capped")]
     pub digest: String,
+    /// `digest`が切られているときだけ付く、切る前の全文のhash。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest_id: Option<String>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_capped_option"
@@ -436,6 +439,7 @@ pub fn database_query(
                 source: summary.source,
                 window: summary.window,
                 digest: summary.digest.clone(),
+                digest_id: summary.digest_id,
                 sql_shape: None,
                 digest_count: 1,
                 digest_examples: vec![digest_example(&summary.digest)],
@@ -492,7 +496,14 @@ pub fn database_query_diff(
     candidate: DatabaseQueryOutput,
     limit: usize,
 ) -> QueryDiffOutput<DatabaseQueryRow> {
-    type Key = (String, String, String, Option<String>, String);
+    type Key = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
     let grouping = candidate.grouping;
     let base_run_id = base.run_id;
     let candidate_run_id = candidate.run_id;
@@ -509,6 +520,7 @@ pub fn database_query_diff(
                     row.source.clone(),
                     row.window.clone(),
                     row.digest.clone(),
+                    row.digest_id.clone(),
                 ),
                 row,
             )
@@ -525,6 +537,7 @@ pub fn database_query_diff(
                     row.source.clone(),
                     row.window.clone(),
                     row.digest.clone(),
+                    row.digest_id.clone(),
                 ),
                 row,
             )
@@ -537,25 +550,30 @@ pub fn database_query_diff(
         .collect::<BTreeSet<_>>();
     let mut rows = keys
         .into_iter()
-        .map(|(node, engine, source, window, digest)| {
+        .map(|(node, engine, source, window, digest, digest_id)| {
             let key = (
                 node.clone(),
                 engine.clone(),
                 source.clone(),
                 window.clone(),
                 digest.clone(),
+                digest_id.clone(),
             );
             let base = base.remove(&key);
             let candidate = candidate.remove(&key);
             let changes = database_changes(base.as_ref(), candidate.as_ref());
+            let mut key = BTreeMap::from([
+                ("node".into(), node),
+                ("engine".into(), engine),
+                ("source".into(), source),
+                ("window".into(), window.unwrap_or_else(|| "-".into())),
+                (grouping.into(), capped(&digest)),
+            ]);
+            if let Some(digest_id) = digest_id {
+                key.insert("digest_id".into(), digest_id);
+            }
             QueryDiffRow {
-                key: BTreeMap::from([
-                    ("node".into(), node),
-                    ("engine".into(), engine),
-                    ("source".into(), source),
-                    ("window".into(), window.unwrap_or_else(|| "-".into())),
-                    (grouping.into(), capped(&digest)),
-                ]),
+                key,
                 presence: presence(&base, &candidate),
                 base,
                 candidate,
@@ -974,7 +992,7 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
             let rows_examined = values.iter().map(|value| value.rows_examined).sum::<f64>();
             let digests = values
                 .iter()
-                .map(|value| value.digest.clone())
+                .map(|value| (value.digest.clone(), value.digest_id.clone()))
                 .collect::<BTreeSet<_>>();
             let p95_ms = (digests.len() == 1).then(|| values[0].p95_ms).flatten();
             let mut unavailable = BTreeMap::new();
@@ -990,12 +1008,13 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
                 source,
                 window,
                 digest: shape.clone(),
+                digest_id: None,
                 sql_shape: Some(shape),
                 digest_count: digests.len(),
                 digest_examples: digests
                     .into_iter()
                     .take(3)
-                    .map(|digest| digest_example(&digest))
+                    .map(|(digest, _)| digest_example(&digest))
                     .collect(),
                 calls,
                 total_ms,

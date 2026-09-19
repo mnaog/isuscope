@@ -142,6 +142,8 @@ pub struct DatabaseDiff {
     pub node: String,
     pub engine: String,
     pub digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest_id: Option<String>,
     pub source: String,
     pub presence: Presence,
     pub calls: NumericDiff,
@@ -447,7 +449,7 @@ fn database_diff(
     base: Vec<DatabaseSummary>,
     candidate: Vec<DatabaseSummary>,
 ) -> DiffSection<DatabaseDiff> {
-    type Key = (String, String, String, String);
+    type Key = (String, String, String, Option<String>, String);
     let mut base = base
         .into_iter()
         .map(|item| {
@@ -456,6 +458,7 @@ fn database_diff(
                     item.node.clone(),
                     item.engine.clone(),
                     item.digest.clone(),
+                    item.digest_id.clone(),
                     item.source.clone(),
                 ),
                 item,
@@ -470,6 +473,7 @@ fn database_diff(
                     item.node.clone(),
                     item.engine.clone(),
                     item.digest.clone(),
+                    item.digest_id.clone(),
                     item.source.clone(),
                 ),
                 item,
@@ -483,14 +487,21 @@ fn database_diff(
         .collect::<BTreeSet<_>>();
     let items = keys
         .into_iter()
-        .map(|(node, engine, digest, source)| {
-            let key = (node.clone(), engine.clone(), digest.clone(), source.clone());
+        .map(|(node, engine, digest, digest_id, source)| {
+            let key = (
+                node.clone(),
+                engine.clone(),
+                digest.clone(),
+                digest_id.clone(),
+                source.clone(),
+            );
             let base = base.remove(&key);
             let candidate = candidate.remove(&key);
             DatabaseDiff {
                 node,
                 engine,
                 digest,
+                digest_id,
                 source,
                 presence: presence(&base, &candidate),
                 calls: NumericDiff::new(
@@ -535,6 +546,7 @@ fn database_diff(
             .magnitude()
             .total_cmp(&a.total_ms.magnitude())
             .then_with(|| a.digest.cmp(&b.digest))
+            .then_with(|| a.digest_id.cmp(&b.digest_id))
     })
 }
 
@@ -791,7 +803,10 @@ pub fn write_html(diff: &RunDiff, mut writer: impl Write) -> Result<()> {
                 item.presence.as_str(),
                 escape(&item.node),
                 escape(&item.engine),
-                escape(&item.digest),
+                escape(&crate::report::digest_label(
+                    &item.digest,
+                    item.digest_id.as_deref()
+                )),
                 numeric(&item.total_ms),
                 numeric(&item.calls),
             )

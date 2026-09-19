@@ -71,6 +71,9 @@ pub struct DatabaseSummary {
     pub engine: String,
     #[serde(serialize_with = "crate::query::serialize_capped")]
     pub digest: String,
+    /// `digest`を長さの上限で切ったときだけ付く、切る前の全文のhash。集計と照合の識別に使う。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest_id: Option<String>,
     pub source: String,
     /// node上で区間ごとに集計したsource（slp）の区間。`initialize`、`load`、`whole`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -299,7 +302,7 @@ pub fn write_html(report: &RunReport, mut writer: impl Write) -> Result<()> {
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape(&item.node),
                 escape(&item.engine),
-                escape(&item.digest),
+                escape(&digest_label(&item.digest, item.digest_id.as_deref())),
                 number(item.calls),
                 number(item.total_ms),
                 optional(item.avg_ms),
@@ -606,9 +609,26 @@ fn http_source_quality(summary: &HttpRouteSummary) -> (bool, bool, bool, bool, u
     )
 }
 
+/// 切られた文は先頭が同じ別の文と見分けられるよう、全文のhashを添えて表示する。
+pub(crate) fn digest_label(digest: &str, digest_id: Option<&str>) -> String {
+    match digest_id {
+        Some(id) => format!("{digest} [{id}]"),
+        None => digest.to_owned(),
+    }
+}
+
 pub fn database_queries(metrics: &[Metric]) -> Vec<DatabaseSummary> {
-    type Key = (String, String, String, String, Option<String>);
+    type Key = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
     let mut values = BTreeMap::<Key, DatabaseSummary>::new();
+    // 同じキーへ2回目の集計が来た行。`digest_id`の無い過去のrunで、切った文が衝突したもの。
+    let mut merged = BTreeSet::<Key>::new();
     for metric in metrics {
         let Some(digest) = metric.labels.get("digest") else {
             continue;
@@ -617,43 +637,59 @@ pub fn database_queries(metrics: &[Metric]) -> Vec<DatabaseSummary> {
         let engine = label(metric, "engine");
         let source = label(metric, "collector");
         let window = metric.labels.get("window").cloned();
-        let value = values
-            .entry((
-                node.clone(),
-                engine.clone(),
-                digest.clone(),
-                source.clone(),
-                window.clone(),
-            ))
-            .or_insert_with(|| DatabaseSummary {
-                node,
-                engine,
-                digest: digest.clone(),
-                source,
-                window,
-                ..Default::default()
-            });
+        let digest_id = metric.labels.get("digest_id").cloned();
+        let key = (
+            node.clone(),
+            engine.clone(),
+            digest.clone(),
+            digest_id.clone(),
+            source.clone(),
+            window.clone(),
+        );
+        if metric.name == "db.query.calls"
+            && values.get(&key).is_some_and(|value| value.calls > 0.0)
+        {
+            merged.insert(key.clone());
+        }
+        let value = values.entry(key).or_insert_with(|| DatabaseSummary {
+            node,
+            engine,
+            digest: digest.clone(),
+            digest_id,
+            source,
+            window,
+            ..Default::default()
+        });
+        // 回数と時間は足す。上書きすると、衝突した別の文の分が消える。
         match metric.name.as_str() {
-            "db.query.calls" => value.calls = metric.value,
-            "db.query.total_duration" => value.total_ms = metric.value,
+            "db.query.calls" => value.calls += metric.value,
+            "db.query.total_duration" => value.total_ms += metric.value,
             "db.query.p95_duration" => value.p95_ms = Some(metric.value),
             "db.query.p99_duration" => value.p99_ms = Some(metric.value),
-            "db.query.duration_max" => value.max_ms = Some(metric.value),
-            "db.query.lock_duration" => value.lock_ms = metric.value,
-            "db.query.rows_sent" => value.rows_sent = metric.value,
-            "db.query.rows_examined" => value.rows_examined = metric.value,
+            "db.query.duration_max" => {
+                value.max_ms = Some(value.max_ms.unwrap_or(0.0).max(metric.value))
+            }
+            "db.query.lock_duration" => value.lock_ms += metric.value,
+            "db.query.rows_sent" => value.rows_sent += metric.value,
+            "db.query.rows_examined" => value.rows_examined += metric.value,
             _ => {}
         }
     }
-    for value in values.values_mut() {
+    for (key, value) in &mut values {
         value.avg_ms = divide(value.total_ms, value.calls);
         value.rows_examined_per_call = divide(value.rows_examined, value.calls);
+        // 別々の文の分位点は合わせられない。
+        if merged.contains(key) {
+            value.p95_ms = None;
+            value.p99_ms = None;
+        }
     }
     let mut values = values.into_values().collect::<Vec<_>>();
     values.sort_by(|a, b| {
         b.total_ms
             .total_cmp(&a.total_ms)
             .then_with(|| a.digest.cmp(&b.digest))
+            .then_with(|| a.digest_id.cmp(&b.digest_id))
     });
     values
 }
@@ -1173,6 +1209,20 @@ mod tests {
         ]);
         assert_eq!(database[0].avg_ms, Some(20.0));
         assert_eq!(database[0].rows_examined_per_call, Some(25.0));
+
+        // `digest_id`の無い過去のrunで切った文が衝突していても、回数と時間は落とさない。
+        let collided = database_queries(&[
+            metric("db.query.calls", 10.0, &db_labels),
+            metric("db.query.total_duration", 1_000.0, &db_labels),
+            metric("db.query.p95_duration", 100.0, &db_labels),
+            metric("db.query.calls", 20.0, &db_labels),
+            metric("db.query.total_duration", 8_000.0, &db_labels),
+            metric("db.query.p95_duration", 400.0, &db_labels),
+        ]);
+        assert_eq!(collided.len(), 1);
+        assert_eq!(collided[0].calls, 30.0);
+        assert_eq!(collided[0].total_ms, 9_000.0);
+        assert_eq!(collided[0].p95_ms, None);
 
         let cpu = cpu_symbols(&[metric(
             "cpu.sample_percent",

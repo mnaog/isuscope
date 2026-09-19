@@ -1500,7 +1500,12 @@ fn parse_slp_windows(raw: &str) -> Vec<Metric> {
             continue;
         };
         let mut digest = query.trim().to_owned();
+        // 切った文は先頭が同じ別の文と区別できないので、全文のhashを識別に添える。
+        let mut digest_id = None;
         if digest.len() > DIGEST_LIMIT {
+            use sha2::Digest as _;
+            digest_id =
+                Some(format!("{:x}", sha2::Sha256::digest(digest.as_bytes()))[..16].to_owned());
             let mut end = DIGEST_LIMIT;
             while !digest.is_char_boundary(end) {
                 end -= 1;
@@ -1508,11 +1513,14 @@ fn parse_slp_windows(raw: &str) -> Vec<Metric> {
             digest.truncate(end);
             digest.push('…');
         }
-        let labels = BTreeMap::from([
+        let mut labels = BTreeMap::from([
             ("digest".into(), digest),
             ("engine".into(), "mysql".into()),
             ("window".into(), window.to_owned()),
         ]);
+        if let Some(digest_id) = digest_id {
+            labels.insert("digest_id".into(), digest_id);
+        }
         let mut push = |name: &str, value: Option<f64>, unit: &str| {
             if let Some(value) = value {
                 metrics.push(Metric {
@@ -2151,6 +2159,28 @@ mod tests {
         );
         assert!(digests[0].ends_with('…'));
         assert_eq!(digests[1], "SELECT a\tb");
+    }
+
+    #[test]
+    fn slp_windows_keep_long_statements_with_the_same_prefix_apart() {
+        // 列の並びが上限より長く、表だけが違う2文は、切ると同じ文字列になる。
+        let columns = (0..200)
+            .map(|index| format!("col_{index:03}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let raw = format!(
+            "load\t10\tSELECT {columns} FROM a\t1.0\t0.1\t0.1\t0.1\t0\t10\t10\n\
+             load\t20\tSELECT {columns} FROM b\t8.0\t0.4\t0.4\t0.4\t0\t20\t20\n"
+        );
+        let rows = crate::report::database_queries(&parse_slp_windows(&raw));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].digest, rows[1].digest);
+        assert_ne!(rows[0].digest_id, rows[1].digest_id);
+        assert_eq!(rows.iter().map(|row| row.calls).sum::<f64>(), 30.0);
+        assert_eq!(rows.iter().map(|row| row.total_ms).sum::<f64>(), 9_000.0);
+        // 上限に収まる文には付けない（過去のrunとの照合を変えない）。
+        let short = parse_slp_windows("load\t1\tSELECT 1\t0.1\t0.1\t0.1\t0.1\t0\t1\t1\n");
+        assert!(!short[0].labels.contains_key("digest_id"));
     }
 
     #[test]
