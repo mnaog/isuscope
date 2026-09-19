@@ -523,8 +523,15 @@ pick_generation() {
     return 1
   fi
 }
+# 非圧縮の世代は大きさをmetadataから取る（`wc -c`は通常fileならfstatで済み、過去分を読み流さない）。
+file_size() {
+  case "$1" in
+    *.gz) stream_file "$1" | wc -c | tr -d ' ' ;;
+    *) wc -c < "$1" | tr -d ' ' ;;
+  esac
+}
 matches_marker() {
-  size=$(stream_file "$1" | wc -c | tr -d ' ')
+  size=$(file_size "$1")
   test "$size" -ge "$offset" || return 1
   digest=$(stream_file "$1" | head -c "$sample" | sha256sum)
   test "${digest%% *}" = "$prefix"
@@ -765,8 +772,15 @@ pick_generation() {
     return 1
   fi
 }
+# 非圧縮の世代は大きさをmetadataから取る（`wc -c`は通常fileならfstatで済み、過去分を読み流さない）。
+file_size() {
+  case "$1" in
+    *.gz) stream_file "$1" | wc -c | tr -d ' ' ;;
+    *) sudo -n wc -c < /dev/null "$1" | awk '{print $1}' ;;
+  esac
+}
 matches_marker() {
-  size=$(stream_file "$1" | wc -c | tr -d ' ')
+  size=$(file_size "$1")
   test "$size" -ge "$offset" || return 1
   digest=$(stream_file "$1" | head -c "$sample" | sha256sum)
   test "${digest%% *}" = "$prefix"
