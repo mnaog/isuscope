@@ -84,6 +84,16 @@ pub async fn execute(
     };
     execution.result.started_at.get_or_insert(started_at);
     execution.result.finished_at.get_or_insert_with(Utc::now);
+    // 区間の境界はマイクロ秒で記録する（collectorへ渡す値、bucketの先頭と同じ精度）。
+    let result = &mut execution.result;
+    for at in [
+        &mut result.started_at,
+        &mut result.finished_at,
+        &mut result.initialize_started_at,
+        &mut result.initialize_finished_at,
+    ] {
+        *at = at.map(crate::model::to_micros);
+    }
     execution
 }
 

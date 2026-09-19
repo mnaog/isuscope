@@ -22,7 +22,7 @@ fn slp_collector_puts_statements_on_the_right_side_of_the_load_start() {
         .to_owned();
     // MySQL 8.0.46のslow logの1文（10:42:55.822396に書かれ、35 μsかかった）。
     let record = "# Time: 2026-08-27T10:42:55.822396Z\n# User@Host: root[root] @ localhost []  Id:     8\n# Query_time: 0.000035  Lock_time: 0.000000 Rows_sent: 1  Rows_examined: 1\nSET timestamp=1787827375;\nSELECT VERSION();\n";
-    let run = |log: &str, load_start: &str| {
+    let run_from = |log: &str, begin: &str, load_start: &str| {
         let directory = tempdir().unwrap();
         let bin = directory.path().join("bin");
         fs::create_dir(&bin).unwrap();
@@ -37,7 +37,7 @@ fn slp_collector_puts_statements_on_the_right_side_of_the_load_start() {
         fs::write(format!("{}.mysql.log", prefix.display()), log).unwrap();
         let script = template
             .replace("/tmp/isuscope-{run_id}", prefix.to_str().unwrap())
-            .replace("{benchmark_started_at}", "")
+            .replace("{benchmark_started_at}", begin)
             .replace("{load_started_at}", load_start)
             .replace("{benchmark_finished_at}", "");
         let output = Command::new("sh")
@@ -61,6 +61,7 @@ fn slp_collector_puts_statements_on_the_right_side_of_the_load_start() {
             .unwrap_or_default();
         (window, stdout)
     };
+    let run = |log: &str, load_start: &str| run_from(log, "", load_start);
 
     // 始まったのは10:42:55.822361。負荷の始まりがその前なら負荷、後ならinitialize。
     // `SET timestamp=`の秒（10:42:55）だけで比べると、どちらもinitializeになっていた。
@@ -68,6 +69,12 @@ fn slp_collector_puts_statements_on_the_right_side_of_the_load_start() {
     assert_eq!(window, "load", "{stdout}");
     assert!(!stdout.contains("db.slow_log_coarse_time"), "{stdout}");
     let (window, _) = run(record, "1787827375.823000");
+    assert_eq!(window, "initialize");
+
+    // ベンチの始まりより前（log markの後、ベンチを起動するまで）の文は数えない。
+    let (window, stdout) = run_from(record, "1787827375.900000", "1787827376.000000");
+    assert_eq!(window, "", "{stdout}");
+    let (window, _) = run_from(record, "1787827375.500000", "1787827376.000000");
     assert_eq!(window, "initialize");
 
     // `# Time:`が無ければ秒までしか分からない。秒で振り分け、その数を残す。

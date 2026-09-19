@@ -1159,12 +1159,16 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         .resolve_id(requested)?
         .with_context(|| format!("run `{requested}` was not found"))?;
     let manifest = store.load(&id)?;
-    let start = manifest.benchmark.started_at.unwrap_or(manifest.started_at);
-    let end = manifest
-        .benchmark
-        .finished_at
-        .or(manifest.finished_at)
-        .unwrap_or(start);
+    // 境界はbucketの先頭と同じマイクロ秒に揃える（ナノ秒を持った古いrunでも最初のbucketを落とさない）。
+    let start =
+        isuscope::model::to_micros(manifest.benchmark.started_at.unwrap_or(manifest.started_at));
+    let end = isuscope::model::to_micros(
+        manifest
+            .benchmark
+            .finished_at
+            .or(manifest.finished_at)
+            .unwrap_or(start),
+    );
     if options.window != SeriesWindowArg::Whole && (options.from != 0 || options.to.is_some()) {
         bail!("--from/--to can be used only with `--window whole`");
     }
@@ -1198,6 +1202,10 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             end,
         ),
     };
+    let (requested_start, requested_end) = (
+        isuscope::model::to_micros(requested_start),
+        isuscope::model::to_micros(requested_end),
+    );
     let bucket_seconds = options.bucket as i64;
     let duration = (end - start).num_seconds().max(0);
     let metrics = store.metrics(&id)?;
@@ -1434,15 +1442,29 @@ fn series_edges(
         .iter()
         .filter(|metric| BUCKETED.contains(&metric.name.as_str()))
         .filter_map(|metric| metric.timestamp)
-        .filter(|at| Some(*at) != manifest.benchmark.started_at)
+        .filter(|at| {
+            Some(*at)
+                != manifest
+                    .benchmark
+                    .started_at
+                    .map(isuscope::model::to_micros)
+        })
         .peekable();
     let origin = match origin {
         Some(origin) if stored.peek().is_none() || stored.all(|at| aligned(at, origin)) => origin,
         _ => chrono::DateTime::UNIX_EPOCH,
     };
     let exact = |at: chrono::DateTime<chrono::Utc>| {
-        Some(at) == manifest.benchmark.started_at
-            || Some(at) == manifest.benchmark.finished_at
+        Some(at)
+            == manifest
+                .benchmark
+                .started_at
+                .map(isuscope::model::to_micros)
+            || Some(at)
+                == manifest
+                    .benchmark
+                    .finished_at
+                    .map(isuscope::model::to_micros)
             || aligned(at, origin)
     };
     if exact(start) && exact(end) {

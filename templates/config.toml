@@ -1062,7 +1062,8 @@ awk -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='
       if (shift > -0.5 && shift < 1.5) { at = second + shift; precise = 1 }
     }
     decided = 1
-    if (end != "" && at >= end + 0) window = ""
+    # 区間は[ベンチの始まり, 終わり)。始まる前（log markの後、ベンチを起動するまで）の文も除く。
+    if ((begin != "" && at < begin + 0) || (end != "" && at >= end + 0)) window = ""
     else if (load_start == "") window = "whole"
     else if (at < load_start + 0) window = "initialize"
     else window = "load"

@@ -168,14 +168,16 @@ impl BenchmarkResult {
     /// 負荷の両方にまたがるbucketができない。node上のcollector（alp、slp）とperfのparserは
     /// この値から5秒ずつ区切る。initializeの終わりが分からないrunはベンチの始まり。
     pub fn bucket_origin(&self) -> Option<DateTime<Utc>> {
-        self.initialize_finished_at.or(self.started_at)
+        self.initialize_finished_at
+            .or(self.started_at)
+            .map(to_micros)
     }
 
     /// 5秒bucketの区切り（起点と、先頭を切り詰めるベンチの始まり）。
     pub fn bucket_grid(&self) -> BucketGrid {
         BucketGrid {
             origin: self.bucket_origin(),
-            begin: self.started_at,
+            begin: self.started_at.map(to_micros),
         }
     }
 }
@@ -214,10 +216,17 @@ pub fn epoch_seconds(value: f64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros((value * 1_000_000.0).round() as i64)
 }
 
+/// 時刻をマイクロ秒に切り捨てる。区間の境界はcollectorへマイクロ秒で渡し、collectorはそこから
+/// bucketを区切る。境界がナノ秒を持ったままだと、bucketの先頭（マイクロ秒）が境界より数百ナノ秒
+/// 前になり、そのbucketが丸ごと区間から落ちる。記録・転送・比較をこの精度に揃える。
+pub fn to_micros(at: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(at.timestamp_micros()).unwrap_or(at)
+}
+
 /// 区間`[start, end)`に入るか。5秒bucketのtimestampはbucketの先頭で、中身は先頭から5秒間なので、
 /// 終わりを含めると、次の区間の最初のbucket（負荷の始まりに揃えたもの）までinitializeに入る。
 pub fn in_window(at: DateTime<Utc>, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
-    at >= start && at < end
+    at >= to_micros(start) && at < to_micros(end)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,5 +460,18 @@ mod bucket_tests {
             at(1_000_100_000).unwrap(),
             at(1_060_000_000).unwrap()
         ));
+        // 境界がナノ秒を持っていても（1800000000.123456789）、マイクロ秒の先頭のbucketは区間に入る。
+        let boundary = DateTime::from_timestamp(1_800_000_000, 123_456_789).unwrap();
+        let bucket = DateTime::from_timestamp_micros(1_800_000_000_123_456).unwrap();
+        assert!(in_window(
+            bucket,
+            boundary,
+            boundary + chrono::Duration::seconds(60)
+        ));
+        let benchmark = BenchmarkResult {
+            initialize_finished_at: Some(boundary),
+            ..Default::default()
+        };
+        assert_eq!(benchmark.bucket_origin(), Some(bucket));
     }
 }
