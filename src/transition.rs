@@ -122,9 +122,6 @@ struct Event {
     route: String,
 }
 
-/// 5秒bucketの幅。node上の集計（alp、slp、perf-series）と同じ区切りで時系列を並べる。
-pub(crate) const BUCKET_SECONDS: i64 = 5;
-
 /// survey-runで持ち帰った生のaccess logから、session単位の遷移を作る。route別の集計、時系列、
 /// 接続とupstreamの値はnode上のalp collectorが作るので、ここでは遷移だけを扱う。
 pub struct TransitionOptions<'a> {

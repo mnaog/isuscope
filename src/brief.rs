@@ -193,9 +193,18 @@ pub fn build(
     let (mut database, omitted_alternative_database_rows, database_window) =
         preferred_database(diagnostics.database);
     database.iter_mut().for_each(query::round_database_summary);
-    let clients = client_nodes(&diagnostics.client);
-    let hosts = host_nodes(&diagnostics.host);
     let hosts_window = diagnostics.host_window;
+    // clientの値を要約した区間の長さ。loadならinitializeの終わりから、wholeならベンチの始まりから。
+    let window_seconds = match hosts_window {
+        "load" => run.benchmark.initialize_finished_at,
+        _ => run.benchmark.started_at,
+    }
+    .zip(run.benchmark.finished_at)
+    .and_then(|(start, end)| (end - start).num_microseconds())
+    .map(|micros| micros as f64 / 1_000_000.0)
+    .filter(|seconds| *seconds > 0.0);
+    let clients = client_nodes(&diagnostics.client, window_seconds);
+    let hosts = host_nodes(&diagnostics.host);
     let benchmark_messages = benchmark_messages(&run);
     let unavailable_artifact_count = diagnostics
         .artifacts
@@ -358,7 +367,8 @@ fn by_metric_then_magnitude(mut rows: Vec<MetricQueryRow>) -> Vec<MetricQueryRow
 }
 
 /// clientの要約をnodeごとに1行へ畳む。名前順に5件だけ出すと、`request_gap`が必ず落ちる。
-fn client_nodes(rows: &[HostSummary]) -> Vec<BriefClientNode> {
+/// `window_seconds`は要約した区間の長さ。新規接続数は区間の合計なので、これで割って毎秒にする。
+fn client_nodes(rows: &[HostSummary], window_seconds: Option<f64>) -> Vec<BriefClientNode> {
     let mut nodes: BTreeMap<&str, Vec<&HostSummary>> = BTreeMap::new();
     for row in rows {
         nodes.entry(row.node.as_str()).or_default().push(row);
@@ -385,11 +395,11 @@ fn client_nodes(rows: &[HostSummary]) -> Vec<BriefClientNode> {
                     .map(|value| query::round_to(value, 1)),
                 connections_in_use_peak: find("client.connections_in_use")
                     .map(|row| query::round_to(row.peak, 1)),
+                // 新規接続数は加算できる値で、`value`は区間の合計（1 bucketぶんではない）。
                 connections_opened_per_second: find("client.connections_opened")
                     .and_then(|row| row.value)
-                    .map(|value| {
-                        query::round_to(value / crate::transition::BUCKET_SECONDS as f64, 1)
-                    }),
+                    .zip(window_seconds)
+                    .map(|(total, seconds)| query::round_to(total / seconds, 1)),
                 request_gap_ms,
                 requests_per_connection: find("client.connection_requests_mean")
                     .and_then(|row| row.value)
@@ -481,6 +491,31 @@ fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_connections_per_second_divide_the_window_total_by_its_length() {
+        // 60秒の負荷で、5秒bucketごとに10接続（合計120）なら毎秒2。1 bucketの5秒で割ると24になる。
+        let row = HostSummary {
+            node: "app1".into(),
+            metric: "client.connections_opened".into(),
+            target: "host".into(),
+            source: "alp".into(),
+            labels: BTreeMap::new(),
+            unit: "connections".into(),
+            aggregation: crate::metric_semantics::MetricAggregation::Sum,
+            value: Some(120.0),
+            peak: 10.0,
+            peak_at: None,
+            samples: 12,
+        };
+        let nodes = client_nodes(std::slice::from_ref(&row), Some(60.0));
+        assert_eq!(nodes[0].connections_opened_per_second, Some(2.0));
+        // 区間の長さが分からなければ、毎秒には直さない。
+        assert_eq!(
+            client_nodes(&[row], None)[0].connections_opened_per_second,
+            None
+        );
+    }
 
     #[test]
     fn coverage_issues_group_nodes_and_hide_info_rows() {
