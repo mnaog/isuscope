@@ -1301,6 +1301,8 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
         percentiles: BTreeMap<&'static str, f64>,
         statuses: BTreeMap<String, f64>,
         response_bytes: Option<f64>,
+        /// このrouteへまとめたalpの行の数。2行以上なら分位点は合わせられない。
+        rows: usize,
     }
     let mut routes = BTreeMap::<(String, String), HttpStats>::new();
     for value in &records {
@@ -1313,6 +1315,7 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
         let route = normalizer.normalize(route.split('?').next().unwrap_or(&route));
         let method = string(object, &["method"]).unwrap_or_else(|| "-".into());
         let stats = routes.entry((method, route)).or_default();
+        stats.rows += 1;
         stats.count += number(object, &["count", "requests"]).unwrap_or_default();
         if let Some(value) = number(object, &["sum", "sum_time", "request_time_sum"]) {
             *stats.sum_seconds.get_or_insert(0.0) += value;
@@ -1339,11 +1342,7 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
             ("0.99", &["p99", "p99_time", "request_time_p99"][..]),
         ] {
             if let Some(value) = number(object, names) {
-                stats
-                    .percentiles
-                    .entry(quantile)
-                    .and_modify(|current| *current = current.max(value))
-                    .or_insert(value);
+                stats.percentiles.insert(quantile, value);
             }
         }
         for class in ["1xx", "2xx", "3xx", "4xx", "5xx"] {
@@ -1420,7 +1419,14 @@ fn parse_alp_json(raw: &str, routes: Option<&Path>) -> Result<Vec<Metric>> {
                 });
             }
         }
-        for (quantile, seconds) in stats.percentiles {
+        // 別々に集計した行の分位点からは、合わせた分布の分位点は作れない（最大を採ると、100件の
+        // 1 msと1件の1,000 msのp95が1,000 msになる）。回数・合計・最小・最大だけを合わせる。
+        let percentiles = if stats.rows > 1 {
+            BTreeMap::new()
+        } else {
+            stats.percentiles
+        };
+        for (quantile, seconds) in percentiles {
             let mut quantile_labels = labels.clone();
             quantile_labels.insert("quantile".into(), quantile.into());
             metrics.push(Metric {
@@ -2183,6 +2189,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn alp_rows_merged_into_one_route_do_not_fabricate_percentiles() {
+        // 離れた2つの規則が同じrouteへ置換すると、alpは別々の行で分位点を出す。
+        // 100件すべて1 msと、1件1,000 msを合わせた101件のp95は1 msで、行ごとの最大ではない。
+        let dir = tempfile::tempdir().unwrap();
+        let routes = dir.path().join("routes.toml");
+        fs::write(
+            &routes,
+            "[[routes]]\npattern = '^/items/[0-9]+$'\nreplace = '/items/:key'\n\
+             [[routes]]\npattern = '^/users/[0-9]+$'\nreplace = '/users/:id'\n\
+             [[routes]]\npattern = '^/items/[a-z]+$'\nreplace = '/items/:key'\n",
+        )
+        .unwrap();
+        let raw = r#"[["count","2xx","method","uri","min","max","sum","avg","p50","p95","p99"],
+            [100,100,"GET","^/items/[0-9]+$",0.001,0.001,0.1,0.001,0.001,0.001,0.001],
+            [1,1,"GET","^/items/[a-z]+$",1.0,1.0,1.0,1.0,1.0,1.0,1.0],
+            [5,5,"GET","^/users/[0-9]+$",0.002,0.004,0.015,0.003,0.003,0.004,0.004]]"#;
+        let metrics = parse_alp_json(raw, Some(&routes)).unwrap();
+        let find = |name: &str, route: &str| {
+            metrics
+                .iter()
+                .filter(|metric| {
+                    metric.name == name
+                        && metric.labels["route"] == route
+                        && !metric.labels.contains_key("status_class")
+                })
+                .map(|metric| metric.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find("http.requests", "/items/:key"), [101.0]);
+        assert_eq!(find("http.request_duration_sum", "/items/:key"), [1_100.0]);
+        assert_eq!(find("http.request_duration_max", "/items/:key"), [1_000.0]);
+        assert!(find("http.request_duration", "/items/:key").is_empty());
+        // 1行だけのrouteの分位点はそのまま出す。
+        assert_eq!(find("http.request_duration", "/users/:id").len(), 3);
+    }
+
+    #[test]
     fn alp_windows_keep_the_whole_delta_and_five_second_buckets_apart() {
         // 実際のcollectorとalp 1.0.21で、`access-ltsv-windows.log`を集計した出力。
         let raw = include_str!("../tests/fixtures/alp-windows-v1.0.21.out");
@@ -2792,10 +2835,11 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
                 .iter()
                 .any(|metric| metric.name == "http.requests" && metric.value == 20.0)
         );
+        // 2行の分位点からは20件の分位点を作れないので、大きい方で代用せず出さない。
         assert!(
-            metrics
+            !metrics
                 .iter()
-                .any(|metric| metric.name == "http.request_duration" && metric.value == 150.0)
+                .any(|metric| metric.name == "http.request_duration")
         );
     }
 

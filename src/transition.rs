@@ -43,7 +43,44 @@ impl RouteNormalizer {
         if let Some(rule) = self.rules.iter().find(|rule| rule.source == uri) {
             return rule.replace.clone();
         }
+        // alpは束ねたmatching group（下の`alp_matching_groups`）をそのままuri欄に出す。
+        if let Some((_, replace)) = self
+            .alp_groups()
+            .into_iter()
+            .find(|(group, _)| group == uri)
+        {
+            return replace.to_owned();
+        }
         normalize(uri, &self.rules)
+    }
+
+    /// alpへ渡すmatching groupと、その置換先。隣り合った規則が同じrouteへ置換するなら、
+    /// `(A)|(B)`の1つのgroupに束ねる（alp 1.0.21は`?`を含むgroupを扱えないので`(?:`は使えない）。別々のgroupにすると、alpはそれぞれで分位点を
+    /// 出し、同じrouteの分位点を正しく合わせられない。隣り合っていない規則は束ねない
+    /// （間の規則より先に一致するようになり、最初に一致した規則で決まるrouteが変わる）。
+    fn alp_groups(&self) -> Vec<(String, &str)> {
+        let mut groups: Vec<(Vec<&str>, &str)> = Vec::new();
+        for rule in &self.rules {
+            match groups.last_mut() {
+                Some((sources, replace)) if *replace == rule.replace => sources.push(&rule.source),
+                _ => groups.push((vec![&rule.source], &rule.replace)),
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(sources, replace)| {
+                let group = if sources.len() == 1 {
+                    sources[0].to_owned()
+                } else {
+                    sources
+                        .iter()
+                        .map(|source| format!("({source})"))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                };
+                (group, replace)
+            })
+            .collect()
     }
 
     pub fn alp_matching_groups(&self) -> Result<String> {
@@ -51,6 +88,14 @@ impl RouteNormalizer {
             if rule.source.contains(',') {
                 anyhow::bail!(
                     "ALP matching-group pattern cannot contain a comma: {}",
+                    rule.source
+                );
+            }
+            // alp 1.0.21は`?`を含むgroup（`(?:`、`x?`、`+?`）に一致させられず、該当する要求を
+            // 素のURIごとの行に分けてしまう（Dockerのalpで確かめた）。
+            if rule.source.contains('?') {
+                anyhow::bail!(
+                    "ALP matching-group pattern cannot contain `?`; write optional parts as alternatives: {}",
                     rule.source
                 );
             }
@@ -63,9 +108,9 @@ impl RouteNormalizer {
             }
         }
         Ok(self
-            .rules
-            .iter()
-            .map(|rule| rule.source.as_str())
+            .alp_groups()
+            .into_iter()
+            .map(|(group, _)| group)
             .collect::<Vec<_>>()
             .join(","))
     }
@@ -397,6 +442,35 @@ mod tests {
     }
 
     #[test]
+    fn alp_matching_groups_bundle_adjacent_rules_for_the_same_route() {
+        let rule = |source: &str, replace: &str| RouteRule {
+            source: source.into(),
+            pattern: Regex::new(source).unwrap(),
+            replace: replace.into(),
+        };
+        let rules = RouteNormalizer {
+            rules: vec![
+                rule(r"^/items/[0-9]+$", "/items/:key"),
+                rule(r"^/items/[a-z]+$", "/items/:key"),
+                rule(r"^/users/[0-9]+$", "/users/:id"),
+                rule(r"^/items/[A-Z]+$", "/items/:key"),
+            ],
+        };
+        let groups = rules.alp_matching_groups().unwrap();
+        // 隣り合う2つは1つのgroupに束ね、alpが1行で分位点を出す。離れた規則は束ねない。
+        assert_eq!(
+            groups,
+            r"(^/items/[0-9]+$)|(^/items/[a-z]+$),^/users/[0-9]+$,^/items/[A-Z]+$"
+        );
+        assert_eq!(
+            rules.normalize(r"(^/items/[0-9]+$)|(^/items/[a-z]+$)"),
+            "/items/:key"
+        );
+        assert_eq!(rules.normalize(r"^/items/[A-Z]+$"), "/items/:key");
+        assert_eq!(rules.normalize("/items/abc"), "/items/:key");
+    }
+
+    #[test]
     fn alp_matching_groups_reject_ambiguous_rules() {
         let captured = RouteNormalizer {
             rules: vec![RouteRule {
@@ -415,5 +489,14 @@ mod tests {
             }],
         };
         assert!(comma.alp_matching_groups().is_err());
+
+        let optional = RouteNormalizer {
+            rules: vec![RouteRule {
+                source: r"^/api/tags/?$".into(),
+                pattern: Regex::new(r"^/api/tags/?$").unwrap(),
+                replace: "/api/tags".into(),
+            }],
+        };
+        assert!(optional.alp_matching_groups().is_err());
     }
 }
