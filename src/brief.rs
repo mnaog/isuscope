@@ -191,7 +191,7 @@ pub fn build(
     let mut http = diagnostics.http;
     http.iter_mut().for_each(query::round_http_summary);
     let (mut database, omitted_alternative_database_rows, database_window) =
-        preferred_database(diagnostics.database);
+        preferred_database(diagnostics.database, &run);
     database.iter_mut().for_each(query::round_database_summary);
     let hosts_window = diagnostics.host_window;
     // clientの値を要約した区間の長さ。loadならinitializeの終わりから、wholeならベンチの始まりから。
@@ -325,18 +325,27 @@ fn severity_rank(value: &str) -> u8 {
 
 /// DBの行を1つのsource・1つの区間へ絞る。区間ごとに集計されていれば負荷区間だけを使い、
 /// initializeの一括INSERTなどが上位を占めないようにする。
+/// DB欄に出す区間を、行の有無ではなくrunの記録から決める。負荷区間のSQLを無くせた（loadが
+/// 0件）runで、行のあるinitializeへ戻って表示しないように、loadは0件なら空のまま出す。
+/// 取れなかったこと（slpの失敗）はcoverageに出る。
 fn preferred_database(
     database: Vec<DatabaseSummary>,
+    run: &crate::model::RunManifest,
 ) -> (Vec<DatabaseSummary>, usize, Option<String>) {
     let total_count = database.len();
-    let window = ["load", "whole"]
-        .into_iter()
-        .find(|window| {
-            database
+    // slp collectorが区間に分けて集計したrun。行が1つも無くても、slpが成功していれば区間は決まる。
+    let windowed = database.iter().any(|item| item.window.is_some())
+        || (database.is_empty()
+            && run
+                .collectors
                 .iter()
-                .any(|item| item.window.as_deref() == Some(window))
-        })
-        .map(str::to_owned);
+                .any(|collector| collector.name == "slp" && collector.status == "complete"));
+    // slpは負荷の始まりが分かればinitializeとloadに、分からなければwholeに分ける。
+    let split = run.benchmark.initialize_finished_at.is_some()
+        || database
+            .iter()
+            .any(|item| matches!(item.window.as_deref(), Some("load" | "initialize")));
+    let window = windowed.then(|| if split { "load" } else { "whole" }.to_owned());
     let database = match &window {
         Some(window) => database
             .into_iter()
@@ -491,6 +500,40 @@ fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_shows_an_empty_load_rather_than_falling_back_to_initialize() {
+        // 負荷区間のSQLを無くせたrun（initializeだけに行がある）で、initializeの行を出さない。
+        let row = |window: &str| DatabaseSummary {
+            node: "db1".into(),
+            engine: "mysql".into(),
+            digest: "INSERT INTO t VALUES (?)".into(),
+            source: "slp".into(),
+            window: Some(window.into()),
+            calls: 100.0,
+            ..Default::default()
+        };
+        let run: crate::model::RunManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 6, "id": "r", "mode": "run", "state": "complete",
+            "started_at": "2026-09-19T00:00:00Z", "finished_at": null,
+            "source": {"repository": ".", "git_available": false, "commit_hash": null,
+                "branch": null, "dirty": false, "state_sha256": "", "untracked": [], "error": null},
+            "benchmark": {"mode": "command", "command": [], "exit_code": 0, "score": 1,
+                "passed": true, "messages": [], "initialize_started_at": "2026-09-19T00:00:01Z",
+                "initialize_finished_at": "2026-09-19T00:00:10Z", "error": null},
+            "collectors": [{"name": "slp", "node": "db1", "phase": "after", "status": "complete",
+                "exit_code": 0, "error": null, "log_ids": []}],
+            "logs": [], "metric_count": 0, "transition_count": 0
+        }))
+        .unwrap();
+        let (rows, omitted, window) = preferred_database(vec![row("initialize")], &run);
+        assert_eq!(window.as_deref(), Some("load"));
+        assert!(rows.is_empty());
+        assert_eq!(omitted, 1);
+        // slpが成功して1行も無いrunも、負荷区間は0件として出す。
+        let (rows, _, window) = preferred_database(Vec::new(), &run);
+        assert_eq!((rows.len(), window.as_deref()), (0, Some("load")));
+    }
 
     #[test]
     fn new_connections_per_second_divide_the_window_total_by_its_length() {
