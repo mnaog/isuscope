@@ -170,6 +170,34 @@ impl BenchmarkResult {
     pub fn bucket_origin(&self) -> Option<DateTime<Utc>> {
         self.initialize_finished_at.or(self.started_at)
     }
+
+    /// 5秒bucketの区切り（起点と、先頭を切り詰めるベンチの始まり）。
+    pub fn bucket_grid(&self) -> BucketGrid {
+        BucketGrid {
+            origin: self.bucket_origin(),
+            begin: self.started_at,
+        }
+    }
+}
+
+/// 5秒bucketの区切り。`origin`（負荷の始まり）から5秒ずつ区切り、ベンチの始まりをまたぐbucketは
+/// 始まりを先頭にした短いbucketにする（先頭が始まりより前だと、wholeで絞ったときに落ちる）。
+/// node上のcollector（alp、slp）のawkも同じ区切りを使う。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BucketGrid {
+    pub origin: Option<DateTime<Utc>>,
+    pub begin: Option<DateTime<Utc>>,
+}
+
+impl BucketGrid {
+    /// `at`を含むbucketの先頭。`origin`が無ければepochの5の倍数で区切る。
+    pub fn start(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let start = bucket_start(at, self.origin)?;
+        Some(match self.begin {
+            Some(begin) if at >= begin && start < begin => begin,
+            _ => start,
+        })
+    }
 }
 
 /// `at`を含む5秒bucketの先頭。`origin`があればそこから5秒ずつ、無ければepochの5の倍数で区切る。
@@ -368,5 +396,36 @@ mod tests {
         let legacy: RunMode = serde_json::from_str("\"discovery-run\"").unwrap();
         assert_eq!(legacy, RunMode::SurveyRun);
         assert_eq!(serde_json::to_string(&legacy).unwrap(), "\"survey-run\"");
+    }
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+
+    #[test]
+    fn buckets_start_at_the_load_start_and_are_cut_at_the_benchmark_start() {
+        let at = |micros| DateTime::from_timestamp_micros(micros);
+        let grid = BucketGrid {
+            origin: at(1_012_300_000),
+            begin: at(1_000_100_000),
+        };
+        // 負荷の始まりから5秒ずつ。
+        assert_eq!(grid.start(at(1_012_800_000).unwrap()), at(1_012_300_000));
+        assert_eq!(grid.start(at(1_012_299_999).unwrap()), at(1_007_300_000));
+        // ベンチの始まり（1000.1秒）をまたぐbucket（997.3秒から）は、始まりを先頭にする。
+        assert_eq!(grid.start(at(1_001_000_000).unwrap()), at(1_000_100_000));
+        // 始まりより前の値は、切り詰めずにそのbucketのまま（区間の外）。
+        assert_eq!(grid.start(at(999_000_000).unwrap()), at(997_300_000));
+        assert!(in_window(
+            at(1_000_100_000).unwrap(),
+            at(1_000_100_000).unwrap(),
+            at(1_060_000_000).unwrap()
+        ));
+        assert!(!in_window(
+            at(1_060_000_000).unwrap(),
+            at(1_000_100_000).unwrap(),
+            at(1_060_000_000).unwrap()
+        ));
     }
 }

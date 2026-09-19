@@ -30,6 +30,8 @@ command = ["sh", "-c", """
 at() { awk -v origin='{load_started_at}' -v offset="$1" 'BEGIN { printf "%.6f", origin + offset }'; }
 emit() { printf '{"type":"metric","name":"%s","value":%s,"unit":"x","labels":{%s},"timestamp":%s}\n' "$1" "$2" "$3" "$4"; }
 route='"node":"app1","method":"GET","route":"/a"'
+# ベンチの始まりをまたぐbucketは、始まりを先頭にする（alpのawkと同じ）。
+emit http.requests 3 "$route" '{benchmark_started_at}'
 emit http.requests 7 "$route" "$(at -5)"
 emit http.requests 100 "$route" "$(at 0)"
 emit http.requests 1 "$route" "$(at 5)"
@@ -69,6 +71,11 @@ emit client.connections_in_use 1 '"node":"app1"' "$(at 5)"
     assert_eq!(requests(&initialize), 7.0, "{initialize}");
     // initializeの始まりはbucketの区切りでもnode上の境界でもない。
     assert_eq!(initialize["window"]["edges"], "approximate");
+
+    // ベンチの始まりのbucketはwholeに入り、端はnode上の境界なので正確。
+    let whole = isuscope(&["series", "latest", "--window", "whole"]);
+    assert_eq!(requests(&whole), 111.0, "{whole}");
+    assert_eq!(whole["window"]["edges"], "exact");
 
     let brief = isuscope(&["brief", "latest"]);
     assert_eq!(brief["hosts_window"], "load");

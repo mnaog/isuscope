@@ -63,13 +63,13 @@ fn alp_collector_aggregates_the_delta_on_the_node() {
     );
     // 差分と作業fileはnodeに残さない。
     assert_eq!(left, 0);
-    // alpと比べるため、methodとuriを読めた行の数も出す。
-    assert!(stdout.contains("\nlines\t8\n"), "{stdout}");
     // 差分全体（8行）と、ベンチ区間の5秒bucket（4行と2行）。bucketは負荷の始まり
-    // （1789653662.5）から区切り、始まりをまたぐbucketを作らない。
+    // （1789653662.5）から区切り、始まりをまたぐbucketを作らない。ベンチの始まり（1789653660）を
+    // またぐbucketは、始まりを先頭にする。alpと比べるため、methodとuriを読めた行の数も出す。
+    assert!(stdout.contains("\nlines\t8\n"), "{stdout}");
     assert!(stdout.contains("whole\t[[\"count\"],[8]]"), "{stdout}");
     assert!(
-        stdout.contains("1789653657.500000\t[[\"count\"],[4]]"),
+        stdout.contains("1789653660.000000\t[[\"count\"],[4]]"),
         "{stdout}"
     );
     assert!(
@@ -92,6 +92,16 @@ fn alp_collector_aggregates_the_delta_on_the_node() {
         run(b"127.0.0.1 - - [17/Sep/2026:14:01:00 +0000] \"GET / HTTP/1.1\" 200 12\n");
     assert_eq!(output.status.code(), Some(65));
     assert!(String::from_utf8_lossy(&output.stderr).contains("none of 1 access-log lines"));
+
+    // 区間は[始まり, 終わり)。終わりちょうどの要求は時系列に入れない（差分全体には入る）。
+    let (output, _) = run(b"time:2026-09-17T14:01:10+00:00\tmethod:GET\turi:/end\tstatus:200\treqtime:0.001\tconn:9\tmsec:1789653670.000\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("whole\t[[\"count\"],[1]]"), "{stdout}");
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("17896536")),
+        "{stdout}"
+    );
 
     // 空の差分は失敗ではない。
     let (output, _) = run(b"");

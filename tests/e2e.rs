@@ -48,5 +48,7 @@ mod parallel;
 mod query;
 #[path = "e2e/score_inputs.rs"]
 mod score_inputs;
+#[path = "e2e/slow_log.rs"]
+mod slow_log;
 #[path = "e2e/sql.rs"]
 mod sql;

@@ -1,6 +1,6 @@
-{"type":"metric","name":"client.connections_in_use","value":0.706000,"unit":"connections","labels":{},"timestamp":1789653657.500000}
+{"type":"metric","name":"client.connections_in_use","value":1.412000,"unit":"connections","labels":{},"timestamp":1789653660.000000}
 {"type":"metric","name":"client.connections_in_use","value":0.601200,"unit":"connections","labels":{},"timestamp":1789653662.500000}
-{"type":"metric","name":"client.connections_opened","value":2.000000,"unit":"connections","labels":{},"timestamp":1789653657.500000}
+{"type":"metric","name":"client.connections_opened","value":2.000000,"unit":"connections","labels":{},"timestamp":1789653660.000000}
 {"type":"metric","name":"client.connections_opened","value":1.000000,"unit":"connections","labels":{},"timestamp":1789653662.500000}
 {"type":"metric","name":"client.connection_requests_mean","value":2.000000,"unit":"requests","labels":{}}
 {"type":"metric","name":"client.connection_requests_max","value":3.000000,"unit":"requests","labels":{}}
@@ -30,9 +30,9 @@
 {"type":"metric","name":"http.upstream_connect_duration","value":2.000000,"unit":"ms","labels":{"upstream":"10.0.0.9:8080","quantile":"0.50"}}
 {"type":"metric","name":"http.upstream_connect_duration","value":2.000000,"unit":"ms","labels":{"upstream":"10.0.0.9:8080","quantile":"0.95"}}
 {"type":"metric","name":"http.upstream_connect_duration","value":2.000000,"unit":"ms","labels":{"upstream":"10.0.0.9:8080","quantile":"0.99"}}
-{"type":"metric","name":"client.request_gap","value":69.999933,"unit":"ms","labels":{"quantile":"0.50"},"timestamp":1789653657.500000}
-{"type":"metric","name":"client.request_gap","value":994.999886,"unit":"ms","labels":{"quantile":"0.95"},"timestamp":1789653657.500000}
-{"type":"metric","name":"client.request_gap","value":994.999886,"unit":"ms","labels":{"quantile":"0.99"},"timestamp":1789653657.500000}
+{"type":"metric","name":"client.request_gap","value":69.999933,"unit":"ms","labels":{"quantile":"0.50"},"timestamp":1789653660.000000}
+{"type":"metric","name":"client.request_gap","value":994.999886,"unit":"ms","labels":{"quantile":"0.95"},"timestamp":1789653660.000000}
+{"type":"metric","name":"client.request_gap","value":994.999886,"unit":"ms","labels":{"quantile":"0.99"},"timestamp":1789653660.000000}
 {"type":"metric","name":"client.request_gap","value":5360.000134,"unit":"ms","labels":{"quantile":"0.50"},"timestamp":1789653662.500000}
 {"type":"metric","name":"client.request_gap","value":5360.000134,"unit":"ms","labels":{"quantile":"0.95"},"timestamp":1789653662.500000}
 {"type":"metric","name":"client.request_gap","value":5360.000134,"unit":"ms","labels":{"quantile":"0.99"},"timestamp":1789653662.500000}
@@ -72,5 +72,6 @@
 {"type":"metric","name":"http.upstream_response_duration","value":2.000000,"unit":"ms","labels":{"upstream":"10.0.0.9:8080","quantile":"0.95"}}
 {"type":"metric","name":"http.upstream_response_duration","value":2.000000,"unit":"ms","labels":{"upstream":"10.0.0.9:8080","quantile":"0.99"}}
 whole	[["count","1xx","2xx","3xx","4xx","5xx","method","uri","min","max","sum","avg","p50","p95","p99","sum_body"],[1,0,1,0,0,0,"POST","/initialize",0.5,0.5,0.5,0.5,0.5,0.5,0.5,19],[1,0,1,0,0,0,"GET","/health",0.001,0.001,0.001,0.001,0.001,0.001,0.001,2],[2,0,1,0,1,0,"POST","/login",0.005,0.006,0.011,0.005,0.005,0.006,0.006,20],[4,0,4,0,0,0,"GET","^/user/[0-9]+/home$",0.01,0.04,0.1,0.025,0.02,0.04,0.04,400]]
-1789653657.500000	[["count","1xx","2xx","3xx","4xx","5xx","method","uri","min","max","sum","avg","p50","p95","p99","sum_body"],[1,0,0,0,1,0,"POST","/login",0.005,0.005,0.005,0.005,0.005,0.005,0.005,10],[3,0,3,0,0,0,"GET","^/user/[0-9]+/home$",0.01,0.03,0.06,0.02,0.02,0.03,0.03,300]]
+lines	8
+1789653660.000000	[["count","1xx","2xx","3xx","4xx","5xx","method","uri","min","max","sum","avg","p50","p95","p99","sum_body"],[1,0,0,0,1,0,"POST","/login",0.005,0.005,0.005,0.005,0.005,0.005,0.005,10],[3,0,3,0,0,0,"GET","^/user/[0-9]+/home$",0.01,0.03,0.06,0.02,0.02,0.03,0.03,300]]
 1789653662.500000	[["count","1xx","2xx","3xx","4xx","5xx","method","uri","min","max","sum","avg","p50","p95","p99","sum_body"],[1,0,1,0,0,0,"GET","^/user/[0-9]+/home$",0.04,0.04,0.04,0.04,0.04,0.04,0.04,100],[1,0,1,0,0,0,"POST","/login",0.006,0.006,0.006,0.006,0.006,0.006,0.006,10]]

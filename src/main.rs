@@ -1225,7 +1225,9 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
     let mut nodes = BTreeSet::new();
     for metric in metrics {
         let Some(at) = metric.timestamp else { continue };
-        let bucket = (at.timestamp() - requested_start.timestamp()).div_euclid(bucket_seconds);
+        let Some(bucket) = bucket_index(at, requested_start, bucket_seconds) else {
+            continue;
+        };
         let node = metric
             .labels
             .get("node")
@@ -1395,6 +1397,20 @@ fn series_output(
 /// 区間の端が5秒bucketで正確に切れているか（[`SeriesWindow::edges`]）。端がbucketの区切りか、
 /// node上で行を振り分けた境界（ベンチの始まりと終わり）なら正確。bucketの区切りは保存された
 /// bucketから読む（負荷の始まりに揃える前のrunは、epochの5の倍数で区切っている）。
+/// 区間の始まりから数えたbucketの番号。差をマイクロ秒で取ってから割る（それぞれを整数秒へ
+/// 切ってから引くと、始まりが小数秒のとき境界の近くの値が1つ後ろのbucketへずれる）。
+fn bucket_index(
+    at: chrono::DateTime<chrono::Utc>,
+    start: chrono::DateTime<chrono::Utc>,
+    bucket_seconds: i64,
+) -> Option<i64> {
+    Some(
+        (at - start)
+            .num_microseconds()?
+            .div_euclid(bucket_seconds * 1_000_000),
+    )
+}
+
 fn series_edges(
     manifest: &isuscope::model::RunManifest,
     metrics: &[isuscope::model::Metric],
@@ -1413,14 +1429,16 @@ fn series_edges(
             .num_microseconds()
             .is_some_and(|offset| offset.rem_euclid(5_000_000) == 0)
     };
-    let stored = metrics
+    // ベンチの始まりで切り詰めたbucketは区切りに乗らないので、判定に使わない。
+    let mut stored = metrics
         .iter()
         .filter(|metric| BUCKETED.contains(&metric.name.as_str()))
-        .find_map(|metric| metric.timestamp);
-    let origin = match (stored, origin) {
-        (Some(at), Some(origin)) if aligned(at, origin) => origin,
-        (Some(_), _) | (None, None) => chrono::DateTime::UNIX_EPOCH,
-        (None, Some(origin)) => origin,
+        .filter_map(|metric| metric.timestamp)
+        .filter(|at| Some(*at) != manifest.benchmark.started_at)
+        .peekable();
+    let origin = match origin {
+        Some(origin) if stored.peek().is_none() || stored.all(|at| aligned(at, origin)) => origin,
+        _ => chrono::DateTime::UNIX_EPOCH,
     };
     let exact = |at: chrono::DateTime<chrono::Utc>| {
         Some(at) == manifest.benchmark.started_at
@@ -1477,7 +1495,9 @@ fn generic_series_data(
             .get("node")
             .cloned()
             .unwrap_or_else(|| "local".into());
-        let bucket = (at.timestamp() - window_start.timestamp()).div_euclid(bucket_seconds);
+        let Some(bucket) = bucket_index(at, window_start, bucket_seconds) else {
+            continue;
+        };
         let labels = metric
             .labels
             .iter()
@@ -1673,6 +1693,17 @@ mod series_tests {
             ..Default::default()
         };
         assert_eq!(preferred_cpu(&row), &[80.0]);
+    }
+
+    #[test]
+    fn buckets_are_counted_from_the_exact_window_start() {
+        // 負荷の始まり1012.8秒から4.4秒後（1017.2秒）は最初のbucket。整数秒へ切ってから引くと
+        // (1017 - 1012) / 5 = 1になり、hostのsampleとHTTPのbucketが別の行へずれていた。
+        let start = chrono::DateTime::from_timestamp_micros(1_012_800_000).unwrap();
+        let at = |micros| chrono::DateTime::from_timestamp_micros(micros).unwrap();
+        assert_eq!(bucket_index(at(1_017_200_000), start, 5), Some(0));
+        assert_eq!(bucket_index(at(1_017_800_000), start, 5), Some(1));
+        assert_eq!(bucket_index(at(1_012_799_999), start, 5), Some(-1));
     }
 
     #[test]

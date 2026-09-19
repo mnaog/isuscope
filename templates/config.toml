@@ -609,9 +609,16 @@ awk -F '\t' -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' 
   BEGIN { origin = (load_start != "") ? load_start + 0 : ((begin != "") ? begin + 0 : 0) }
   # 5秒bucketは負荷の始まり（分からなければベンチの始まり）から区切る。epochの5の倍数で区切ると、
   # 負荷の始まりをまたぐbucketができ、区間で絞ったときに負荷の最初の数秒が丸ごと落ちる。
-  function bucket_of(t,   offset, index5) {
+  # ベンチの始まりをまたぐbucketは、始まりを先頭にした短いbucketにする（先頭が始まりより前だと、
+  # wholeで絞ったときに落ちる）。
+  function bucket_end(t,   offset, index5) {
     offset = (t - origin) / 5; index5 = int(offset); if (index5 > offset) index5--
-    return sprintf("%.6f", origin + index5 * 5)
+    return origin + (index5 + 1) * 5
+  }
+  function bucket_of(t,   start) {
+    start = bucket_end(t) - 5
+    if (begin != "" && t >= begin + 0 && start < begin + 0) start = begin + 0
+    return sprintf("%.6f", start)
   }
   function metric(name, value, unit, labels, at) {
     printf "{\"type\":\"metric\",\"name\":\"%s\",\"value\":%.6f,\"unit\":\"%s\",\"labels\":{%s}", name, value, unit, labels
@@ -636,7 +643,8 @@ awk -F '\t' -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' 
     parsed++
     if (field["msec"] !~ /^[0-9]+(\.[0-9]+)?$/) next
     at = field["msec"] + 0
-    if ((begin != "" && at < begin + 0) || (end != "" && at > end + 0)) next
+    # 区間は[始まり, 終わり)。読む側と同じく、終わりちょうどの要求は含めない。
+    if ((begin != "" && at < begin + 0) || (end != "" && at >= end + 0)) next
     bucket = bucket_of(at)
     print > (dir "/" bucket ".bucket")
     if (field["conn"] != "" && field["reqtime"] ~ /^[0-9.]+$/) {
@@ -674,15 +682,21 @@ awk -F '\t' -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' 
     # 同時接続数は、各接続の最初の要求から最後の応答までを5秒ごとに積む（遊休中の保持は入らない）。
     for (id in first) {
       start = first[id]
+      if (begin != "" && start < begin + 0) start = begin + 0
       while (1) {
-        bucket = bucket_of(start); stop = last[id] < bucket + 5 ? last[id] : bucket + 5
+        bucket = bucket_of(start); stop = bucket_end(start); if (last[id] < stop) stop = last[id]
         if (stop > start) busy[bucket] += stop - start
         if (stop >= last[id]) break
         start = stop
       }
       connections++; total += requests[id]; if (requests[id] > most) most = requests[id]
     }
-    for (bucket in busy) metric("client.connections_in_use", busy[bucket] / 5, "connections", "", bucket)
+    # 端のbucketは5秒より短いので、実際の長さで割る。
+    for (bucket in busy) {
+      span = bucket_end(bucket) - bucket
+      if (end != "" && bucket_end(bucket) > end + 0) span = end - bucket
+      if (span > 0) metric("client.connections_in_use", busy[bucket] / span, "connections", "", bucket)
+    }
     for (bucket in opened) metric("client.connections_opened", opened[bucket], "connections", "", bucket)
     if (connections) {
       metric("client.connection_requests_mean", total / connections, "requests", "", "")
@@ -998,7 +1012,9 @@ trap 'rm -rf "$input" "$work"' EXIT
 test -r "$input" || exit 75
 command -v slp >/dev/null 2>&1 || { echo 'slp is not installed on this DB node; install it with the Ansible observability role' >&2; exit 1; }
 mkdir -p "$work"
-# 各文を`SET timestamp=`（文の開始時刻、epoch秒）で区間へ振り分ける。timezoneに依存しない。
+# 各文を開始時刻で区間へ振り分ける。`SET timestamp=`は開始の秒（epoch、整数）しか持たないので、
+# `# Time:`（書き終えた時刻、マイクロ秒）の秒以下から`Query_time`を引いて秒以下を補う。
+# 秒以下だけを使うのでtimezoneに依存しない。`# Time:`の無い文は1秒精度のまま振り分け、数を残す。
 # 変数名に`load`は使わない（gawkでは組み込みの名前で、`-v load=`は致命的なerrorになる）。
 # initializeの終わりが分からないrunは、全体を1つの区間（whole）にする。
 # 同じ処理で、DB全体の5秒ごとの文の数と時間も出す。
@@ -1006,9 +1022,16 @@ awk -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='
   BEGIN { origin = (load_start != "") ? load_start + 0 : ((begin != "") ? begin + 0 : 0) }
   # 5秒bucketは負荷の始まり（分からなければベンチの始まり）から区切る。epochの5の倍数で区切ると、
   # 負荷の始まりをまたぐbucketができ、区間で絞ったときに負荷の最初の数秒が丸ごと落ちる。
-  function bucket_of(t,   offset, index5) {
+  # ベンチの始まりをまたぐbucketは、始まりを先頭にした短いbucketにする（先頭が始まりより前だと、
+  # wholeで絞ったときに落ちる）。
+  function bucket_end(t,   offset, index5) {
     offset = (t - origin) / 5; index5 = int(offset); if (index5 > offset) index5--
-    return sprintf("%.6f", origin + index5 * 5)
+    return origin + (index5 + 1) * 5
+  }
+  function bucket_of(t,   start) {
+    start = bucket_end(t) - 5
+    if (begin != "" && t >= begin + 0 && start < begin + 0) start = begin + 0
+    return sprintf("%.6f", start)
   }
   # prepared statementのPrepareや接続poolのPingは`# administrator command:`として記録される。
   # 文ではないので、slpと同じく数えない。
@@ -1017,19 +1040,29 @@ awk -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='
     if (window != "" && !administrative) {
       printf "%s", entry > (dir "/" window ".log")
       calls[bucket]++; seconds[bucket] += query_time; lock[bucket] += lock_time
+      if (!precise) coarse++
     } else if (timed && !decided && !administrative) {
       unclassified++
     }
-    entry = ""; window = ""; decided = 0; administrative = 0; timed = 0
+    entry = ""; window = ""; decided = 0; administrative = 0; timed = 0; precise = 0; logged = ""
   }
   /^# Time: / { flush() }
+  /^# Time: / { logged = $3; sub(/^[^T]*T[0-9]+:[0-9]+:/, "", logged); sub(/[^0-9.].*$/, "", logged) }
   /^# User@Host: / && (decided || timed) { flush() }
   /^# Query_time: / { query_time = $3; lock_time = $5; timed = 1 }
   /^# administrator command:/ { administrative = 1 }
   /^SET timestamp=/ && !decided {
-    at = $0; sub(/^SET timestamp=/, "", at); sub(/;.*/, "", at); at += 0
+    second = $0; sub(/^SET timestamp=/, "", second); sub(/;.*/, "", second); second += 0
+    at = second
+    if (timed && logged ~ /\./) {
+      shift = logged - query_time - second % 60
+      while (shift >= 30) shift -= 60
+      while (shift < -30) shift += 60
+      # 開始は`SET timestamp=`の秒の中にある。大きくずれるなら組が崩れているので使わない。
+      if (shift > -0.5 && shift < 1.5) { at = second + shift; precise = 1 }
+    }
     decided = 1
-    if (end != "" && at > end + 0) window = ""
+    if (end != "" && at >= end + 0) window = ""
     else if (load_start == "") window = "whole"
     else if (at < load_start + 0) window = "initialize"
     else window = "load"
@@ -1041,6 +1074,8 @@ awk -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='
     print unclassified + 0 > (dir "/unclassified")
     if (unclassified > 0)
       printf "{\"type\":\"metric\",\"name\":\"db.slow_log_unclassified\",\"value\":%d,\"unit\":\"queries\",\"labels\":{\"engine\":\"mysql\"}}\n", unclassified
+    if (coarse > 0)
+      printf "{\"type\":\"metric\",\"name\":\"db.slow_log_coarse_time\",\"value\":%d,\"unit\":\"queries\",\"labels\":{\"engine\":\"mysql\"}}\n", coarse
     for (bucket in calls) {
       printf "{\"type\":\"metric\",\"name\":\"db.calls\",\"value\":%d,\"unit\":\"queries\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%s}\n", calls[bucket], bucket
       printf "{\"type\":\"metric\",\"name\":\"db.duration\",\"value\":%.3f,\"unit\":\"ms\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%s}\n", seconds[bucket] * 1000, bucket
