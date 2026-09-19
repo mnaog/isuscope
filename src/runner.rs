@@ -46,6 +46,13 @@ pub async fn execute(
         bail!("hypothesis must not be empty");
     }
     let mut store = Store::open(&config.data_dir)?;
+    // 実行中runの確認から`run.json`を書くまでの間に、別の`run`が同じ確認を通らないよう、
+    // 入口で握って終わるまで持つ。
+    let Some(_gate) = crate::lock::RunGate::try_acquire(&store.run_gate_path())? else {
+        bail!(
+            "another isuscope run is still in progress in this data directory; wait for it to finish"
+        );
+    };
     let recovery = store.recover_incomplete()?;
     if !recovery.recovered.is_empty() {
         for id in &recovery.recovered {

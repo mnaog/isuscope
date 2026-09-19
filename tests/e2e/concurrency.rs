@@ -211,3 +211,94 @@ command = ["isuscope", "--version"]
         .unwrap();
     assert_eq!(status, "complete");
 }
+
+/// `[lock]`が無くても、同じdata directoryで2本の`run`が同時に入口を通らない。実行中runの印は
+/// `run.json`を書いた後にしか見えないので、その前（ディスク確認のSSHやgit snapshot）の間に
+/// 2本目が来ると、どちらも「実行中のrunは無い」と判断してベンチを2本走らせていた。
+#[cfg(unix)]
+#[test]
+fn two_runs_started_together_do_not_both_pass_the_entry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempdir().unwrap();
+    let tools = project.path().join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    // ディスク確認のSSHで止まり、releaseが置かれるまで返らない。
+    let fake_ssh = tools.join("ssh");
+    fs::write(
+        &fake_ssh,
+        "#!/bin/sh\ntouch \"$MARKS/in-disk-check.$$\"\nwhile test ! -e \"$MARKS/release\"; do sleep 0.05; done\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let marks = project.path().join("marks");
+    fs::create_dir_all(&marks).unwrap();
+    write_config(
+        project.path(),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "touch \"marks/benchmark.$$\"; printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":1,\"pass\":true}'"]
+
+[[nodes]]
+name = "app1"
+host = "app1.internal"
+"#,
+    );
+    let path = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+    let spawn = |hypothesis: &str| {
+        Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(["run", "--hypothesis", hypothesis])
+            .env("PATH", &path)
+            .env("MARKS", &marks)
+            .current_dir(project.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let count = |prefix: &str| {
+        fs::read_dir(&marks)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .count()
+    };
+    let first = spawn("first");
+    let started = Instant::now();
+    while count("in-disk-check") == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "first never reached the disk check"
+        );
+        sleep(Duration::from_millis(20));
+    }
+    // 1本目がディスク確認で止まっている間に2本目を始める。入口を通れば2本目もSSHで止まる。
+    let mut second = spawn("second");
+    let started = Instant::now();
+    let second_exited = loop {
+        if second.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if count("in-disk-check") >= 2 || started.elapsed() > Duration::from_secs(10) {
+            break false;
+        }
+        sleep(Duration::from_millis(20));
+    };
+    fs::write(marks.join("release"), "").unwrap();
+    let second = second.wait_with_output().unwrap();
+    let first = first.wait_with_output().unwrap();
+    assert!(
+        second_exited,
+        "the second run passed the entry while the first was in it"
+    );
+    assert!(!second.status.success());
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("still in progress"), "{stderr}");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(count("benchmark"), 1);
+}

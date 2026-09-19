@@ -211,7 +211,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockはdirectoryの中の`lock` fileを`flock`で握るもので、kernelが所有processの終了時に外すため、落ちたprocessのlockは残りません。`owner`は誰が握っているかの説明だけで、生きた所有者がいれば終了code 75で止まります。lock fileは消さずに残ります。
 
-`[lock]`が無くても、同じdata directoryで2つの`run`は重なりません。実行中のrunは`runs/.incomplete/<run-id>.running`を`flock`で握り、後から始めた`run`はそれを見て開始を拒みます。握られていない`.incomplete`のrunだけを、中断されたrunとして`aborted`で確定します。
+`[lock]`が無くても、同じdata directoryで2つの`run`は重なりません。`run`は入口で`runs/.incomplete`のdirectoryを`flock`で握って終わるまで持ち、同時に始めた2本目は、1本目がまだディスク確認やgit snapshotの途中でも開始を拒みます。実行中のrunは`runs/.incomplete/<run-id>.running`も`flock`で握ります。握られていない`.incomplete`のrunだけを、中断されたrunとして`aborted`で確定します。
 
 `[ssh] known_hosts_file`を指定すると、全SSH呼び出しがprojectのknown_hostsを`StrictHostKeyChecking=accept-new`で使います。ベンチ前のSSH collectorがあるnodeで、そのすべてがSSH接続自体の失敗（exit 255）になった場合は、計測のないrunを残さないようベンチを開始せずに失敗させます。
 

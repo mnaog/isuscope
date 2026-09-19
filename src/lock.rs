@@ -146,6 +146,31 @@ impl Drop for RunMarker {
     }
 }
 
+/// 1つのdata directoryで`run`を1本に限る。実行中runの印（[`RunMarker`]）は`run.json`を
+/// 書いた後にしか見えないので、その前（ディスク確認やgit snapshot）に来た2本目を止められない。
+/// `run`は入口で`runs/.incomplete`のdirectory自体を握り、終わるまで持つ。`[lock]`が無くても
+/// 効き、lock fileを作らないのでGitで管理しているdata directoryにも何も残らない。
+pub struct RunGate {
+    _directory: fs::File,
+}
+
+impl RunGate {
+    /// 握れたら`Some`、別processが握っていれば`None`を返します。
+    pub fn try_acquire(directory: &Path) -> Result<Option<Self>> {
+        let file = fs::File::open(directory)
+            .with_context(|| format!("cannot open {}", directory.display()))?;
+        // SAFETY: the descriptor stays owned by `file`, and LOCK_NB never blocks.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("cannot lock {}", directory.display()));
+        }
+        Ok(Some(Self { _directory: file }))
+    }
+}
+
 /// Runs `command` while holding the lock and returns its exit status code.
 /// Each locked run appends `started_at, operation, seconds, exit` to `operation-timing.tsv`
 /// next to the lock so slow steps can be measured later.

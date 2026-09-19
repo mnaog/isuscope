@@ -108,6 +108,11 @@ impl Store {
         self.data_dir.join("runs").join(id)
     }
 
+    /// `run`を1本に限るlock（[`crate::lock::RunGate`]）で握るdirectory。
+    pub fn run_gate_path(&self) -> PathBuf {
+        self.data_dir.join("runs/.incomplete")
+    }
+
     /// 実行中のrunが持つ印の場所。staging directoryの外に置くので、確定時の移動に巻き込まれない。
     pub fn run_marker_path(&self, id: &str) -> PathBuf {
         self.data_dir
