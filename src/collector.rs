@@ -642,11 +642,18 @@ pub(crate) fn parse_standard_output(
         CollectorParser::SlpWindows => unreachable!("handled before UTF-8 validation"),
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
         CollectorParser::ServiceCgroup => Ok(parse_service_cgroup(&raw, interval)),
-        CollectorParser::PerfScript => parse_perf_script(&raw, grid),
+        CollectorParser::PerfScript => parse_perf_script(&raw, grid, interval),
     }
 }
 
-fn parse_perf_script(raw: &str, grid: crate::model::BucketGrid) -> Result<Vec<Metric>> {
+/// `interval`はベンチの区間`[始まり, 終わり)`。perfはbefore phaseで始まりafter phaseで止まるので、
+/// ベンチの前後（collectorの後処理など）のsampleも入っている。bucketにまとめた後では最後の
+/// bucketに混ざった分を取り除けないので、生のsampleの段階で区間の外を捨てる。
+fn parse_perf_script(
+    raw: &str,
+    grid: crate::model::BucketGrid,
+    interval: Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)>,
+) -> Result<Vec<Metric>> {
     // `# isuscope-perf-clock <wall> <uptime>`: sampleの時刻はCLOCK_MONOTONIC（uptimeと同じ基準）で、
     // 壁時計との差を足せば絶対時刻になる。`# isuscope-perf-start <wall>`は旧形式で、
     // `--reltime`の時刻（最初のsampleからの経過）をperf起動時の壁時計へ足す。
@@ -701,6 +708,11 @@ fn parse_perf_script(raw: &str, grid: crate::model::BucketGrid) -> Result<Vec<Me
     let mut buckets = BTreeMap::<(chrono::DateTime<Utc>, String, String, String), u64>::new();
     let mut parsed_lines = 0_u64;
     let mut record = |sample: Sample, buckets: &mut BTreeMap<_, u64>| {
+        // 形式として読めたsampleは数える（区間の外で捨てたものも、parseの失敗ではない）。
+        parsed_lines += 1;
+        if interval.is_some_and(|(start, end)| !crate::model::in_window(sample.at, start, end)) {
+            return;
+        }
         let Some(bucket) = grid.start(sample.at) else {
             return;
         };
@@ -710,7 +722,6 @@ fn parse_perf_script(raw: &str, grid: crate::model::BucketGrid) -> Result<Vec<Me
         *buckets
             .entry((bucket, sample.process, binary, symbol))
             .or_default() += 1;
-        parsed_lines += 1;
     };
     let mut pending: Option<Sample> = None;
     let mut saw_sample_text = false;
@@ -2531,7 +2542,7 @@ mod tests {
         let raw = "# isuscope-perf-clock 1787827200.250000000 1000.25\n\
 nginx 1200 [000] 1000.350000000: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)\n\
 nginx 1200 [001] 1006.000000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/nginx)\n";
-        let metrics = parse_perf_script(raw, crate::model::BucketGrid::default()).unwrap();
+        let metrics = parse_perf_script(raw, crate::model::BucketGrid::default(), None).unwrap();
         let buckets = metrics
             .iter()
             .filter(|metric| metric.name == "cpu.sample_count")
@@ -2547,7 +2558,8 @@ nginx 1200 [001] 1006.000000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
         assert!(
             parse_perf_script(
                 "# isuscope-perf-clock 1787827200. 1000.25\n",
-                crate::model::BucketGrid::default()
+                crate::model::BucketGrid::default(),
+                None
             )
             .is_ok()
         );
@@ -2555,7 +2567,7 @@ nginx 1200 [001] 1006.000000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
         // 時計の基準が合わない（別の時計で記録された）なら、黙って別の時刻へ置かずに失敗する。
         let mismatched = "# isuscope-perf-clock 1787827200.25 1000.25\n\
 nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)\n";
-        assert!(parse_perf_script(mismatched, crate::model::BucketGrid::default()).is_err());
+        assert!(parse_perf_script(mismatched, crate::model::BucketGrid::default(), None).is_err());
     }
 
     #[test]
@@ -2782,6 +2794,7 @@ nginx 1200 [000] 900000.0: cycles: 7f00 ngx_http_handler (/usr/local/sbin/nginx)
         let metrics = parse_perf_script(
             include_str!("../tests/fixtures/perf-script-series.txt"),
             crate::model::BucketGrid::default(),
+            None,
         )
         .unwrap();
         assert!(metrics.iter().any(|metric| {
@@ -2808,7 +2821,7 @@ nginx 1200 [001] 1003.700000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
             origin: chrono::DateTime::from_timestamp_micros(1_787_827_203_500_000),
             begin: None,
         };
-        let buckets = parse_perf_script(raw, grid)
+        let buckets = parse_perf_script(raw, grid, None)
             .unwrap()
             .into_iter()
             .filter(|metric| metric.name == "cpu.sample_count")
@@ -2821,11 +2834,42 @@ nginx 1200 [001] 1003.700000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
     }
 
     #[test]
+    fn perf_samples_outside_the_benchmark_are_dropped_before_bucketing() {
+        // perfはafter phaseまで止まらない。ベンチの終わり（1060.1秒）の後のsampleは、同じbucketに
+        // まとめてからでは取り除けないので、生のsampleの段階で捨てる。
+        let raw = "# isuscope-perf-clock 1000.000000000 0.0\n\
+app 1 [000] 60.000000000: cycles: 7f00 handle (/app)\n\
+app 1 [000] 60.050000000: cycles: 7f00 handle (/app)\n\
+cleanup 2 [000] 61.000000000: cycles: 7f00 compress (/usr/bin/zstd)\n\
+cleanup 2 [000] 61.500000000: cycles: 7f00 compress (/usr/bin/zstd)\n\
+cleanup 2 [000] 62.000000000: cycles: 7f00 compress (/usr/bin/zstd)\n";
+        let at = |micros| chrono::DateTime::from_timestamp_micros(micros).unwrap();
+        let grid = crate::model::BucketGrid {
+            origin: Some(at(1_012_300_000)),
+            begin: Some(at(1_000_100_000)),
+        };
+        let metrics =
+            parse_perf_script(raw, grid, Some((at(1_000_100_000), at(1_060_100_000)))).unwrap();
+        let processes = metrics
+            .iter()
+            .filter(|metric| metric.name == "cpu.sample_count")
+            .map(|metric| metric.labels["process"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(processes.into_iter().collect::<Vec<_>>(), ["app"]);
+        let whole = metrics
+            .iter()
+            .find(|metric| metric.name == "cpu.sample_percent" && metric.timestamp.is_none())
+            .unwrap();
+        assert_eq!(whole.value, 100.0);
+    }
+
+    #[test]
     fn perf_script_also_reports_the_whole_capture_by_symbol() {
         // perf reportを別に走らせず、同じperf scriptからrun全体の自己時間の割合を出す。
         let metrics = parse_perf_script(
             include_str!("../tests/fixtures/perf-script-series.txt"),
             crate::model::BucketGrid::default(),
+            None,
         )
         .unwrap();
         let whole = metrics
@@ -2846,6 +2890,7 @@ nginx 1200 [001] 1003.700000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
         let metrics = parse_perf_script(
             include_str!("../tests/fixtures/perf-script-hidden-callchain.txt"),
             crate::model::BucketGrid::default(),
+            None,
         )
         .unwrap();
         let counts = metrics
@@ -2872,6 +2917,7 @@ nginx 1200 [001] 1003.700000000: cycles: 7f01 ngx_http_handler (/usr/local/sbin/
         let metrics = parse_perf_script(
             include_str!("../tests/fixtures/perf-script-callchain.txt"),
             crate::model::BucketGrid::default(),
+            None,
         )
         .unwrap();
         let counts = metrics

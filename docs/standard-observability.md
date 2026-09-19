@@ -12,7 +12,7 @@ perf、alp、slp、sysstatは「必要になってから有効化する追加機
 |---|---|---|---|
 | sysstat | during | CPU内訳、disk IOPS・帯域・queue・latency・utilのベンチ区間sample | `sar`がない |
 | service-sampler | during | 指定systemd unitのCPU、memory、disk I/O、PID数 | unit未指定、cgroup v2でない、unitが停止中 |
-| perf | before/after | detachしたsystem-wide sampleとhot symbol。perf.dataは`perf-series`の1回の`perf script`で読み、run全体と5秒ごとのsymbol別の割合を作る | `perf`がない、権限不足、kernelが非対応 |
+| perf | before/after | detachしたsystem-wide sampleとhot symbol。perf.dataは`perf-series`の1回の`perf script`で読み、ベンチの区間`[始まり, 終わり)`のsampleだけから、区間全体と5秒ごとのsymbol別の割合を作る（perfはafter phaseまで止まらないので、ベンチの後のsampleは捨てる） | `perf`がない、権限不足、kernelが非対応 |
 | alp | after | access logの差分をnode上で集計する。route別のrequest数・status・合計・平均・min/max・p50/p95/p99・error・bytes（差分全体、alp）、route別の5秒ごとのrequest数・error・p50/p95/p99（ベンチ区間、5秒ごとのfileをalp）、ベンチ側の接続の使い方とupstream別の試行数・失敗して次へ回された試行・connect/header/response時間（試行単位、ベンチ区間、awk）。生のlogは運ばない | access logがない（alpが無い、行はあるのにmethod/uriを1件も読めない場合は`failed`） |
 | slp | after | slow logの差分をnode上でinitializeと負荷区間に分け、文ごとの回数・合計・最大・p95・p99・lock・rowsと、DB全体の5秒ごとの回数・時間 | MySQL slow logがない、MySQLが退役済み（slpが無いのは`failed`。Ansibleのobservability roleが入れる） |
 | PostgreSQL | after | `pg_stat_statements`のquery別差分 | PostgreSQLがない、extensionが無効 |
