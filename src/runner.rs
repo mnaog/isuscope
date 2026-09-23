@@ -224,7 +224,7 @@ pub async fn execute(
         );
 
         println!("→ benchmark parsers");
-        let enriched = enrichment::run_all(&config, &id, &staging).await;
+        let enriched = enrichment::run_all(&config, &id, &staging, &id).await;
         absorb_enrichments(enriched, &mut manifest, &mut metrics);
     }
 

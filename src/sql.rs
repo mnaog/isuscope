@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde::Serialize;
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum SqlFormat {
@@ -63,6 +64,15 @@ pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput
         .into_iter()
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
+    let mut unique = BTreeSet::new();
+    if let Some(duplicate) = columns
+        .iter()
+        .find(|column| !unique.insert(column.as_str()))
+    {
+        anyhow::bail!(
+            "SQL result contains duplicate column `{duplicate}`; use AS to give every selected column a unique name"
+        );
+    }
     let mut rows = Vec::new();
     let mut truncated = false;
     let mut cursor = statement.query([])?;

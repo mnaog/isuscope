@@ -494,6 +494,38 @@ fn validate(config: &Config) -> Result<()> {
             );
         }
     }
+    // Log IDs are built after expanding collectors to nodes. Validate those persisted IDs, not
+    // just the display names, because sanitizing and `-` joining otherwise admits collisions.
+    let mut output_ids = std::collections::BTreeMap::<String, String>::new();
+    for collector in &config.collectors {
+        let nodes = match collector.transport {
+            Transport::Local => vec!["local"],
+            Transport::Ssh => config
+                .nodes
+                .iter()
+                .filter(|node| {
+                    !node.rule_side
+                        && (collector.roles.is_empty()
+                            || collector.roles.iter().any(|role| node.roles.contains(role)))
+                })
+                .map(|node| node.name.as_str())
+                .collect(),
+        };
+        for node in nodes {
+            let id = format!(
+                "{}-{}-{}",
+                crate::collector::sanitize(&collector.name),
+                crate::collector::sanitize(node),
+                collector.phase.as_str()
+            );
+            let description = format!("collector `{}` on node `{node}`", collector.name);
+            if let Some(previous) = output_ids.insert(id.clone(), description.clone()) {
+                bail!(
+                    "collector output ID `{id}` collides between {previous} and {description}; rename a collector or node"
+                );
+            }
+        }
+    }
     for unit in &config.observability.service_units {
         if unit.is_empty()
             || !unit.chars().all(|character| {
