@@ -145,6 +145,8 @@ pub struct DatabaseDiff {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest_id: Option<String>,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
     pub presence: Presence,
     pub calls: NumericDiff,
     pub total_ms: NumericDiff,
@@ -451,7 +453,14 @@ fn database_diff(
     base: Vec<DatabaseSummary>,
     candidate: Vec<DatabaseSummary>,
 ) -> DiffSection<DatabaseDiff> {
-    type Key = (String, String, String, Option<String>, String);
+    type Key = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
     let mut base = base
         .into_iter()
         .map(|item| {
@@ -462,6 +471,7 @@ fn database_diff(
                     item.digest.clone(),
                     item.digest_id.clone(),
                     item.source.clone(),
+                    item.window.clone(),
                 ),
                 item,
             )
@@ -477,6 +487,7 @@ fn database_diff(
                     item.digest.clone(),
                     item.digest_id.clone(),
                     item.source.clone(),
+                    item.window.clone(),
                 ),
                 item,
             )
@@ -489,13 +500,14 @@ fn database_diff(
         .collect::<BTreeSet<_>>();
     let items = keys
         .into_iter()
-        .map(|(node, engine, digest, digest_id, source)| {
+        .map(|(node, engine, digest, digest_id, source, window)| {
             let key = (
                 node.clone(),
                 engine.clone(),
                 digest.clone(),
                 digest_id.clone(),
                 source.clone(),
+                window.clone(),
             );
             let base = base.remove(&key);
             let candidate = candidate.remove(&key);
@@ -505,6 +517,7 @@ fn database_diff(
                 digest,
                 digest_id,
                 source,
+                window,
                 presence: presence(&base, &candidate),
                 calls: NumericDiff::new(
                     base.as_ref().map(|item| item.calls),
@@ -999,5 +1012,30 @@ mod tests {
                 .presence,
             Presence::Removed
         );
+    }
+
+    #[test]
+    fn database_diff_keeps_initialize_and_load_separate() {
+        let row = |window: &str, total_ms: f64| DatabaseSummary {
+            node: "db".into(),
+            engine: "mysql".into(),
+            digest: "select ?".into(),
+            source: "slp".into(),
+            window: Some(window.into()),
+            calls: 1.0,
+            total_ms,
+            ..Default::default()
+        };
+        let section = database_diff(
+            vec![row("initialize", 1000.0), row("load", 100.0)],
+            vec![row("initialize", 10.0), row("load", 200.0)],
+        );
+        assert_eq!(section.total_count, 2);
+        let load = section
+            .items
+            .iter()
+            .find(|item| item.window.as_deref() == Some("load"))
+            .unwrap();
+        assert_eq!(load.total_ms.delta, Some(100.0));
     }
 }

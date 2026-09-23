@@ -478,17 +478,12 @@ impl Store {
         let mut index = std::collections::BTreeMap::new();
         for row in rows {
             let (name, value, labels) = row?;
-            let node = serde_json::from_str::<serde_json::Value>(&labels)
-                .ok()
-                .and_then(|labels| {
-                    labels
-                        .get("node")
-                        .and_then(|node| node.as_str().map(str::to_owned))
-                });
-            let key = match node {
-                Some(node) => format!("{name}@{node}"),
-                None => name,
-            };
+            let labels =
+                serde_json::from_str::<std::collections::BTreeMap<String, String>>(&labels)
+                    .context("invalid fingerprint labels")?;
+            // JSON encoding of a tuple is unambiguous and BTreeMap makes the complete label set
+            // canonical. Do not collapse custom dimensions such as service or path into node.
+            let key = serde_json::to_string(&(name, labels))?;
             index.insert(key, value);
         }
         Ok((!index.is_empty()).then_some(index))

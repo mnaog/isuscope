@@ -1024,6 +1024,18 @@ fn show_query(
                 metric_prefix.as_deref(),
                 Some(matches!(scope, QueryScopeArg::Series)),
             )?;
+            if needs_cpu_sample_counts(&metrics, metric_prefix.as_deref(), scope)
+                && !candidate_metrics
+                    .iter()
+                    .any(|metric| metric.name == "cpu.sample_count")
+            {
+                candidate_metrics.extend(store.query_metrics(
+                    &id,
+                    &["cpu.sample_count".into()],
+                    None,
+                    Some(true),
+                )?);
+            }
             if matches!(scope, QueryScopeArg::Series) {
                 let manifest = store.load(&id)?;
                 let (start, end) = named_window(&manifest, window)?;
@@ -1053,6 +1065,21 @@ fn show_query(
                     options.metric_prefix.as_deref(),
                     Some(options.scope == QueryScope::Series),
                 )?;
+                if needs_cpu_sample_counts(
+                    &options.metrics,
+                    options.metric_prefix.as_deref(),
+                    scope,
+                ) && !base_metrics
+                    .iter()
+                    .any(|metric| metric.name == "cpu.sample_count")
+                {
+                    base_metrics.extend(store.query_metrics(
+                        &base_id,
+                        &["cpu.sample_count".into()],
+                        None,
+                        Some(true),
+                    )?);
+                }
                 if options.scope == QueryScope::Series {
                     let manifest = store.load(&base_id)?;
                     let (start, end) = named_window(&manifest, window)?;
@@ -1080,12 +1107,13 @@ fn show_query(
             }
             let candidate_metrics =
                 store.query_metrics(&id, &[], Some("db.query."), Some(false))?;
+            let candidate_manifest = store.load(&id)?;
             let mut labels = labels;
             if window != SeriesWindowArg::Whole {
-                if !candidate_metrics
-                    .iter()
-                    .any(|metric| metric.labels.contains_key("window"))
-                {
+                if !isuscope::report::supports_database_windows(
+                    &candidate_manifest,
+                    &candidate_metrics,
+                ) {
                     bail!(
                         "run {} has no per-window database rows (it predates the windowed slp collector); use --window whole",
                         runner::short_id(&id)
@@ -1105,10 +1133,9 @@ fn show_query(
             if let Some(base_id) = base_id {
                 let base_metrics =
                     store.query_metrics(&base_id, &[], Some("db.query."), Some(false))?;
+                let base_manifest = store.load(&base_id)?;
                 if window != SeriesWindowArg::Whole
-                    && !base_metrics
-                        .iter()
-                        .any(|metric| metric.labels.contains_key("window"))
+                    && !isuscope::report::supports_database_windows(&base_manifest, &base_metrics)
                 {
                     bail!(
                         "base run {} has no per-window database rows; compare with --window whole",
@@ -1151,6 +1178,16 @@ fn show_query(
         }
     }
     Ok(())
+}
+
+fn needs_cpu_sample_counts(
+    requested: &[String],
+    prefix: Option<&str>,
+    scope: QueryScopeArg,
+) -> bool {
+    matches!(scope, QueryScopeArg::Series)
+        && (requested.is_empty() || requested.iter().any(|name| name == "cpu.sample_percent"))
+        && prefix.is_none_or(|prefix| "cpu.sample_percent".starts_with(prefix))
 }
 
 fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -> Result<()> {
@@ -1275,7 +1312,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             rows.entry((node.clone(), bucket)).or_default();
         }
     }
-    let rows = rows
+    let mut rows = rows
         .into_iter()
         .map(|((node, bucket), row)| {
             let bucket_offset = (requested_start - start).num_seconds() + bucket * bucket_seconds;
@@ -1303,6 +1340,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         })
         .collect::<Vec<_>>();
     let total_count = rows.len();
+    rows.truncate(options.limit);
     write_stdout_json(&series_output(
         id,
         start,
@@ -1314,7 +1352,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         series_coverage(&manifest.collectors),
         SeriesData::Overview {
             total_count,
-            truncated: false,
+            truncated: total_count > options.limit,
             rows,
         },
     ))?;
@@ -1705,6 +1743,15 @@ fn load_diagnostics(
 #[cfg(test)]
 mod series_tests {
     use super::*;
+
+    #[test]
+    fn percent_only_query_loads_its_additive_dependency() {
+        assert!(needs_cpu_sample_counts(
+            &["cpu.sample_percent".into()],
+            None,
+            QueryScopeArg::Series
+        ));
+    }
 
     #[test]
     fn host_sampler_cpu_wins_over_sysstat() {

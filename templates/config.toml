@@ -466,7 +466,7 @@ command = ["sh", "-c", '''
 set -eu
 log=@@NGINX_ACCESS_LOG@@
 marker=/tmp/isuscope-{run_id}.nginx.marker
-command -v sha256sum >/dev/null 2>&1 || exit 75
+command -v sha256sum >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || exit 75
 test -r "$log" || exit 75
 offset=$(wc -c < "$log" | tr -d ' ')
 # 前回までの差分は回収済み。上限を超えたログは空にしてnodeのdiskを守る
@@ -480,7 +480,8 @@ sample=$offset
 test "$sample" -le 65536 || sample=65536
 digest=$(head -c "$sample" "$log" | sha256sum)
 prefix=${digest%% *}
-printf '%s %s %s\n' "$offset" "$sample" "$prefix" > "$marker"
+set -- $(stat -c '%d %i' "$log")
+printf '%s %s %s %s %s %s\n' "$offset" "$sample" "$prefix" "$1" "$2" "$(date +%s)" > "$marker"
 ''']
 unavailable_exit_codes = [75]
 
@@ -496,11 +497,11 @@ marker=/tmp/isuscope-{run_id}.nginx.marker
 output=/tmp/isuscope-{run_id}.nginx.log
 temporary=$output.tmp
 trap 'rm -f "$temporary" "$marker"' EXIT
-command -v sha256sum >/dev/null 2>&1 || exit 75
+command -v sha256sum >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || exit 75
 test -r "$log" || exit 75
 test -r "$marker" || exit 75
-read offset sample prefix < "$marker" || exit 75
-case "$offset:$sample" in *[!0-9:]*|:*|*:) exit 75 ;; esac
+read offset sample prefix marker_device marker_inode marked_at < "$marker" || exit 75
+case "$offset:$sample:$marker_device:$marker_inode:$marked_at" in *[!0-9:]*|:*|*:) exit 75 ;; esac
 
 stream_file() {
   case "$1" in
@@ -529,11 +530,28 @@ file_size() {
 matches_marker() {
   size=$(file_size "$1")
   test "$size" -ge "$offset" || return 1
+  if test "$sample" -eq 0; then
+    case "$1" in *.gz) return 1 ;; esac
+    set -- $(stat -c '%d %i' "$1")
+    test "$1" = "$marker_device" && test "$2" = "$marker_inode"
+    return
+  fi
   digest=$(stream_file "$1" | head -c "$sample" | sha256sum)
   test "${digest%% *}" = "$prefix"
 }
 
 : > "$temporary"
+if test "$sample" -eq 0 && matches_marker "$log"; then
+  # With copytruncate the current inode survives but bytes written since mark moved to .1.
+  # A newly-created generation proves ambiguity; fail rather than silently losing its prefix.
+  if candidate=$(pick_generation 1); then
+    generation_mtime=$(stat -c '%Y' "$candidate" 2>/dev/null || printf '%s' "$marked_at")
+    if test "$generation_mtime" -ge "$marked_at"; then
+      echo 'access log rotated from an empty marker but file identity cannot prove the origin' >&2
+      exit 75
+    fi
+  fi
+fi
 if matches_marker "$log"; then
   tail -c +$((offset + 1)) "$log" > "$temporary"
 else
@@ -879,7 +897,7 @@ command = ["sh", "-c", '''
 set -eu
 log=@@MYSQL_SLOW_LOG@@
 marker=/tmp/isuscope-{run_id}.mysql.marker
-command -v sha256sum >/dev/null 2>&1 || exit 75
+command -v sha256sum >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || exit 75
 command -v sudo >/dev/null 2>&1 || exit 75
 sudo -n test -r "$log" || exit 75
 offset=$(sudo -n wc -c < /dev/null "$log" | awk '{print $1}')
@@ -894,7 +912,8 @@ sample=$offset
 test "$sample" -le 65536 || sample=65536
 digest=$(sudo -n head -c "$sample" "$log" | sha256sum)
 prefix=${digest%% *}
-printf '%s %s %s\n' "$offset" "$sample" "$prefix" > "$marker"
+set -- $(sudo -n stat -c '%d %i' "$log")
+printf '%s %s %s %s %s %s\n' "$offset" "$sample" "$prefix" "$1" "$2" "$(date +%s)" > "$marker"
 ''']
 unavailable_exit_codes = [75]
 
@@ -910,12 +929,12 @@ marker=/tmp/isuscope-{run_id}.mysql.marker
 output=/tmp/isuscope-{run_id}.mysql.log
 temporary=$output.tmp
 trap 'rm -f "$temporary" "$marker"' EXIT
-command -v sha256sum >/dev/null 2>&1 || exit 75
+command -v sha256sum >/dev/null 2>&1 && command -v stat >/dev/null 2>&1 || exit 75
 command -v sudo >/dev/null 2>&1 || exit 75
 sudo -n test -r "$log" || exit 75
 test -r "$marker" || exit 75
-read offset sample prefix < "$marker" || exit 75
-case "$offset:$sample" in *[!0-9:]*|:*|*:) exit 75 ;; esac
+read offset sample prefix marker_device marker_inode marked_at < "$marker" || exit 75
+case "$offset:$sample:$marker_device:$marker_inode:$marked_at" in *[!0-9:]*|:*|*:) exit 75 ;; esac
 
 stream_file() {
   case "$1" in
@@ -944,11 +963,26 @@ file_size() {
 matches_marker() {
   size=$(file_size "$1")
   test "$size" -ge "$offset" || return 1
+  if test "$sample" -eq 0; then
+    case "$1" in *.gz) return 1 ;; esac
+    set -- $(sudo -n stat -c '%d %i' "$1")
+    test "$1" = "$marker_device" && test "$2" = "$marker_inode"
+    return
+  fi
   digest=$(stream_file "$1" | head -c "$sample" | sha256sum)
   test "${digest%% *}" = "$prefix"
 }
 
 : > "$temporary"
+if test "$sample" -eq 0 && matches_marker "$log"; then
+  if candidate=$(pick_generation 1); then
+    generation_mtime=$(sudo -n stat -c '%Y' "$candidate" 2>/dev/null || printf '%s' "$marked_at")
+    if test "$generation_mtime" -ge "$marked_at"; then
+      echo 'slow log rotated from an empty marker but file identity cannot prove the origin' >&2
+      exit 75
+    fi
+  fi
+fi
 if matches_marker "$log"; then
   sudo -n tail -c +$((offset + 1)) "$log" > "$temporary"
 else

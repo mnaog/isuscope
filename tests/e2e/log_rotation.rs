@@ -19,10 +19,10 @@ fn standard_log_delta_survives_common_rotation_strategies() {
     let mark_template = script("nginx-log-mark");
     let delta_template = script("nginx-log-delta");
 
-    let run_case = |name: &str, rotate: &dyn Fn(&std::path::Path)| {
+    let run_case = |name: &str, initial: &[u8], rotate: &dyn Fn(&std::path::Path)| {
         let directory = tempfile::tempdir().unwrap();
         let log = directory.path().join("access.log");
-        fs::write(&log, b"before\n").unwrap();
+        fs::write(&log, initial).unwrap();
         let prefix = directory.path().join(format!("isuscope-{name}"));
         let prepare = |template: &str| {
             template
@@ -62,7 +62,7 @@ fn standard_log_delta_survives_common_rotation_strategies() {
     };
 
     assert_eq!(
-        run_case("append", &|log| {
+        run_case("append", b"before\n", &|log| {
             use std::io::Write;
             std::fs::OpenOptions::new()
                 .append(true)
@@ -74,14 +74,14 @@ fn standard_log_delta_survives_common_rotation_strategies() {
         b"appended\n"
     );
     assert_eq!(
-        run_case("rename", &|log| {
+        run_case("rename", b"before\n", &|log| {
             fs::rename(log, format!("{}.1", log.display())).unwrap();
             fs::write(log, b"new\n").unwrap();
         }),
         b"new\n"
     );
     assert_eq!(
-        run_case("copytruncate", &|log| {
+        run_case("copytruncate", b"before\n", &|log| {
             use std::io::Write;
             std::fs::OpenOptions::new()
                 .append(true)
@@ -95,7 +95,7 @@ fn standard_log_delta_survives_common_rotation_strategies() {
         b"old-tail\nnew\n"
     );
     assert_eq!(
-        run_case("gzip", &|log| {
+        run_case("gzip", b"before\n", &|log| {
             use std::io::Write;
             std::fs::OpenOptions::new()
                 .append(true)
@@ -117,7 +117,7 @@ fn standard_log_delta_survives_common_rotation_strategies() {
         b"old-tail\nnew\n"
     );
     assert_eq!(
-        run_case("multiple", &|log| {
+        run_case("multiple", b"before\n", &|log| {
             use std::io::Write;
             std::fs::OpenOptions::new()
                 .append(true)
@@ -136,5 +136,19 @@ fn standard_log_delta_survives_common_rotation_strategies() {
             fs::write(log, b"third\n").unwrap();
         }),
         b"first-tail\nsecond\nthird\n"
+    );
+    assert_eq!(
+        run_case("empty-rename", b"", &|log| {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(log)
+                .unwrap()
+                .write_all(b"first\n")
+                .unwrap();
+            fs::rename(log, format!("{}.1", log.display())).unwrap();
+            fs::write(log, b"second\n").unwrap();
+        }),
+        b"first\nsecond\n"
     );
 }
