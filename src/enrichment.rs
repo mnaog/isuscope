@@ -60,7 +60,7 @@ pub async fn enrich_saved(config: &LoadedConfig, requested: &str) -> Result<Enri
     if let Err(error) = tooling::capture(config, &run_dir.join(&relative_tooling)) {
         eprintln!("! cannot snapshot enrichment tooling: {error:#}");
     }
-    let mut outputs = run_all(config, &id, &run_dir).await;
+    let mut outputs = run_all(config, &id, &run_dir, &enrichment_id).await;
     for output in &mut outputs {
         output.result.tooling_path = Some(relative_tooling.clone());
     }
@@ -77,10 +77,15 @@ pub async fn enrich_saved(config: &LoadedConfig, requested: &str) -> Result<Enri
     })
 }
 
-pub async fn run_all(config: &LoadedConfig, run_id: &str, run_dir: &Path) -> Vec<EnrichmentOutput> {
+pub async fn run_all(
+    config: &LoadedConfig,
+    run_id: &str,
+    run_dir: &Path,
+    generation: &str,
+) -> Vec<EnrichmentOutput> {
     let mut outputs = Vec::new();
     for parser in &config.config.benchmark.parsers {
-        outputs.push(run_one(config, parser, run_id, run_dir).await);
+        outputs.push(run_one(config, parser, run_id, run_dir, generation).await);
     }
     outputs
 }
@@ -90,8 +95,9 @@ async fn run_one(
     parser: &BenchmarkParserConfig,
     run_id: &str,
     run_dir: &Path,
+    generation: &str,
 ) -> EnrichmentOutput {
-    match execute(config, parser, run_id, run_dir).await {
+    match execute(config, parser, run_id, run_dir, generation).await {
         Ok(output) => output,
         Err(error) => EnrichmentOutput {
             result: EnrichmentResult {
@@ -116,6 +122,7 @@ async fn execute(
     parser: &BenchmarkParserConfig,
     run_id: &str,
     run_dir: &Path,
+    generation: &str,
 ) -> Result<EnrichmentOutput> {
     let stdout_log = run_dir.join("logs/benchmark-stdout.zst");
     let stderr_log = run_dir.join("logs/benchmark-stderr.zst");
@@ -136,7 +143,9 @@ async fn execute(
     let (program, args) = expanded
         .split_first()
         .context("benchmark parser command must not be empty")?;
-    let prefix = format!("benchmark-parser-{}", sanitize(&parser.name));
+    // Published parser logs are immutable and belong to the same generation as the snapshot
+    // selected by run.json. An interrupted enrichment therefore cannot overwrite its evidence.
+    let prefix = format!("benchmark-parser-{}-{generation}", sanitize(&parser.name));
     let stdout_raw = run_dir.join("tmp").join(format!("{prefix}-stdout.log"));
     let stderr_raw = run_dir.join("tmp").join(format!("{prefix}-stderr.log"));
     std::fs::create_dir_all(run_dir.join("tmp"))?;

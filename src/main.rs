@@ -1275,7 +1275,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             rows.entry((node.clone(), bucket)).or_default();
         }
     }
-    let rows = rows
+    let mut rows = rows
         .into_iter()
         .map(|((node, bucket), row)| {
             let bucket_offset = (requested_start - start).num_seconds() + bucket * bucket_seconds;
@@ -1303,6 +1303,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         })
         .collect::<Vec<_>>();
     let total_count = rows.len();
+    rows.truncate(options.limit);
     write_stdout_json(&series_output(
         id,
         start,
@@ -1314,7 +1315,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         series_coverage(&manifest.collectors),
         SeriesData::Overview {
             total_count,
-            truncated: false,
+            truncated: total_count > options.limit,
             rows,
         },
     ))?;

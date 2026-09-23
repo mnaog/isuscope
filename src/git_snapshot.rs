@@ -23,6 +23,12 @@ fn capture_git(
     excludes: &[PathBuf],
 ) -> Result<SourceSnapshot> {
     let root = PathBuf::from(top);
+    let scope = repo
+        .canonicalize()
+        .unwrap_or_else(|_| repo.to_path_buf())
+        .strip_prefix(root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .unwrap_or(Path::new(""))
+        .to_path_buf();
     let commit_hash = git_output(repo, &["rev-parse", "HEAD"]).ok().map(trimmed);
     let branch = git_output(repo, &["branch", "--show-current"])
         .ok()
@@ -34,15 +40,27 @@ fn capture_git(
         git_scoped_output(repo, &["diff", "--binary", "HEAD"], excludes).unwrap_or_default();
     fs::write(output_dir.join("working-tree.patch"), &patch)?;
 
-    let untracked_raw =
-        git_output_bytes(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    // Keep paths relative to the worktree root even when source.repo is a subdirectory.
+    let untracked_raw = git_output_bytes(
+        repo,
+        &[
+            "ls-files",
+            "--full-name",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
     let mut untracked = Vec::new();
     for raw_path in untracked_raw
         .split(|byte| *byte == 0)
         .filter(|part| !part.is_empty())
     {
         let relative = String::from_utf8_lossy(raw_path).into_owned();
-        if is_excluded(Path::new(&relative), excludes) {
+        let scoped_relative = Path::new(&relative)
+            .strip_prefix(&scope)
+            .unwrap_or(Path::new(&relative));
+        if is_excluded(scoped_relative, excludes) {
             continue;
         }
         let path = root.join(&relative);
@@ -243,6 +261,23 @@ mod tests {
                 .unwrap()
                 .contains("after")
         );
+    }
+
+    #[test]
+    fn captures_untracked_files_from_a_repository_subdirectory() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let app = dir.path().join("webapp");
+        fs::create_dir(&app).unwrap();
+        fs::write(app.join("new.ts"), "new").unwrap();
+        let out = dir.path().join("snapshot");
+        let snapshot = capture(&app, &out, &[]).unwrap();
+        assert_eq!(snapshot.untracked.len(), 1);
+        assert_eq!(snapshot.untracked[0].path, "webapp/new.ts");
     }
 
     #[test]

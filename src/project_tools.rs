@@ -15,6 +15,9 @@ pub fn pin(config: &LoadedConfig, requested: &str) -> Result<String> {
     let id = store
         .resolve_id(requested)?
         .with_context(|| format!("run not found: {requested}"))?;
+    // Keep enrich/analyze from changing the manifest (and therefore its dependency set)
+    // between resolving the run and staging it.
+    let _lock = store.lock_run(&id)?;
     let run_dir = store.final_dir(&id);
     let repo = config.source_repo();
     let repo = repo.canonicalize().unwrap_or(repo);
@@ -28,14 +31,9 @@ pub fn pin(config: &LoadedConfig, requested: &str) -> Result<String> {
     if !run_dir.join("logs").is_dir() {
         bail!("logs not found: {}/logs", relative.display());
     }
-    let mut regular = vec![relative.join("run.json")];
-    for name in ["source", "tooling", "structured.json.zst", "context"] {
-        if run_dir.join(name).exists() {
-            regular.push(relative.join(name));
-        }
-    }
-    git_add(&repo, &[], &regular)?;
-    git_add(&repo, &["-f"], &[relative.join("logs")])?;
+    // Stage the complete run dependency tree even when the data directory is ignored. `-A`
+    // also removes snapshots and parser logs from an older enrichment generation from the index.
+    git_add(&repo, &["-f", "-A"], &[relative.to_path_buf()])?;
     Ok(id)
 }
 
