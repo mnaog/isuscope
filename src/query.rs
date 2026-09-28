@@ -124,7 +124,7 @@ pub fn metric_query(
     for metric in metrics
         .into_iter()
         .filter(|metric| metric_matches(metric, &options))
-        .filter(|metric| http_request_row_matches_grouping(metric, &options.group_by))
+        .filter(|metric| http_request_row_matches_grouping(metric, &options))
     {
         let labels = output_labels(&metric, &options.group_by);
         let aggregation = if options.scope == QueryScope::Series {
@@ -270,6 +270,14 @@ fn recompute_sample_percent(metrics: Vec<Metric>, options: &MetricQueryOptions) 
             })
             .collect::<BTreeMap<_, _>>();
         let labels = output_labels(metric, &options.group_by);
+        let mut labels = labels;
+        // The outer query applies selectors once more before it performs the generic grouping.
+        // Retain selector labels until that point; output_labels will remove them afterwards.
+        for (key, _) in options.labels.iter().chain(&options.label_contains) {
+            if let Some(value) = metric.labels.get(key) {
+                labels.insert(key.clone(), value.clone());
+            }
+        }
         *numerators.entry((labels, denominator_key)).or_default() += metric.value;
     }
     let timestamp = counts_timestamp(&metrics);
@@ -299,11 +307,17 @@ fn counts_timestamp(metrics: &[Metric]) -> Option<chrono::DateTime<chrono::Utc>>
         .and_then(|metric| metric.timestamp)
 }
 
-fn http_request_row_matches_grouping(metric: &Metric, group_by: &[String]) -> bool {
-    if metric.name != "http.requests" || group_by.is_empty() {
+fn http_request_row_matches_grouping(metric: &Metric, options: &MetricQueryOptions) -> bool {
+    if metric.name != "http.requests" || options.group_by.is_empty() {
         return true;
     }
-    metric.labels.contains_key("status_class") == group_by.iter().any(|key| key == "status_class")
+    let selects_status = options
+        .labels
+        .iter()
+        .chain(&options.label_contains)
+        .any(|(key, _)| key == "status_class");
+    metric.labels.contains_key("status_class")
+        == (selects_status || options.group_by.iter().any(|key| key == "status_class"))
 }
 
 pub fn metric_query_diff(
@@ -1517,6 +1531,37 @@ mod tests {
     }
 
     #[test]
+    fn http_request_status_selector_can_be_grouped_without_status_label() {
+        let mut labels = BTreeMap::from([("route".into(), "/items".into())]);
+        labels.insert("status_class".into(), "5xx".into());
+        let output = metric_query(
+            "run".into(),
+            vec![Metric {
+                name: "http.requests".into(),
+                value: 10.0,
+                unit: "requests".into(),
+                timestamp: None,
+                labels,
+            }],
+            MetricQueryOptions {
+                scope: QueryScope::Run,
+                window: None,
+                metrics: vec!["http.requests".into()],
+                metric_prefix: None,
+                node: None,
+                source: None,
+                labels: vec![("status_class".into(), "5xx".into())],
+                label_contains: Vec::new(),
+                group_by: vec!["route".into()],
+                limit: 100,
+            },
+        );
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(output.rows[0].value, Some(10.0));
+        assert!(!output.rows[0].labels.contains_key("status_class"));
+    }
+
+    #[test]
     fn series_sample_percent_is_recomputed_from_counts_for_the_whole_interval() {
         let first = chrono::Utc::now();
         let second = first + chrono::Duration::seconds(5);
@@ -1564,6 +1609,45 @@ mod tests {
         );
         assert_eq!(output.rows.len(), 2);
         assert!(output.rows.iter().all(|row| row.value == Some(50.0)));
+    }
+
+    #[test]
+    fn sample_percent_selector_survives_grouping_that_removes_its_label() {
+        let timestamp = chrono::Utc::now();
+        let metrics = [("A", 50.0), ("B", 50.0)]
+            .into_iter()
+            .map(|(process, value)| Metric {
+                name: "cpu.sample_count".into(),
+                value,
+                unit: "samples".into(),
+                timestamp: Some(timestamp),
+                labels: BTreeMap::from([
+                    ("node".into(), "app".into()),
+                    ("collector".into(), "perf".into()),
+                    ("process".into(), process.into()),
+                    ("binary".into(), "server".into()),
+                ]),
+            })
+            .collect();
+        let output = metric_query(
+            "run".into(),
+            metrics,
+            MetricQueryOptions {
+                scope: QueryScope::Series,
+                window: Some("load".into()),
+                metrics: vec!["cpu.sample_percent".into()],
+                metric_prefix: None,
+                node: None,
+                source: None,
+                labels: vec![("process".into(), "A".into())],
+                label_contains: Vec::new(),
+                group_by: vec!["binary".into()],
+                limit: 100,
+            },
+        );
+        assert_eq!(output.rows.len(), 1);
+        assert_eq!(output.rows[0].value, Some(50.0));
+        assert!(!output.rows[0].labels.contains_key("process"));
     }
 
     #[test]

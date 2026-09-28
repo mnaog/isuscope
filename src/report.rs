@@ -701,6 +701,19 @@ pub fn database_queries(metrics: &[Metric]) -> Vec<DatabaseSummary> {
     values
 }
 
+/// Whether a run used the window-aware database collector. Successful empty captures carry no
+/// metric rows, so row presence alone cannot distinguish them from legacy runs.
+pub fn supports_database_windows(run: &RunManifest, metrics: &[Metric]) -> bool {
+    metrics
+        .iter()
+        .any(|metric| metric.labels.contains_key("window"))
+        || (metrics.is_empty()
+            && run
+                .collectors
+                .iter()
+                .any(|collector| collector.name == "slp" && collector.status == "complete"))
+}
+
 pub fn cpu_symbols(metrics: &[Metric]) -> Vec<CpuSummary> {
     let mut values = metrics
         .iter()

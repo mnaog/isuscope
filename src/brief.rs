@@ -340,11 +340,7 @@ fn preferred_database(
     let total_count = database.len();
     // slp collectorが区間に分けて集計したrun。行が1つも無くても、slpが成功していれば区間は決まる。
     let windowed = database.iter().any(|item| item.window.is_some())
-        || (database.is_empty()
-            && run
-                .collectors
-                .iter()
-                .any(|collector| collector.name == "slp" && collector.status == "complete"));
+        || (database.is_empty() && crate::report::supports_database_windows(run, &[]));
     // slpは負荷の始まりが分かればinitializeとloadに、分からなければwholeに分ける。
     let split = run.benchmark.initialize_finished_at.is_some()
         || database
