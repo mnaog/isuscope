@@ -19,6 +19,49 @@ fn standard_log_delta_survives_common_rotation_strategies() {
     let mark_template = script("nginx-log-mark");
     let delta_template = script("nginx-log-delta");
 
+    // Collectors run on Linux nodes. Adapt their GNU utility calls to the native
+    // macOS tools for local tests, retaining real file identities and timestamps.
+    #[cfg(target_os = "macos")]
+    let utilities = {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        for (name, script) in [
+            (
+                "stat",
+                r#"#!/bin/sh
+set -eu
+test "$#" -eq 3 && test "$1" = -c || exit 1
+case "$2" in
+  '%d %i') exec /usr/bin/stat -f '%d %i' "$3" ;;
+  '%Y') exec /usr/bin/stat -f '%m' "$3" ;;
+  *) exit 1 ;;
+esac
+"#,
+            ),
+            (
+                "sha256sum",
+                "#!/bin/sh\nexec /usr/bin/shasum -a 256 \"$@\"\n",
+            ),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, script).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        directory
+    };
+    let shell = || {
+        let mut command = Command::new("sh");
+        command.arg("-c");
+        #[cfg(target_os = "macos")]
+        {
+            let mut paths = vec![utilities.path().to_path_buf()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            command.env("PATH", std::env::join_paths(paths).unwrap());
+        }
+        command
+    };
+
     let run_case = |name: &str, initial: &[u8], rotate: &dyn Fn(&std::path::Path)| {
         let directory = tempfile::tempdir().unwrap();
         let log = directory.path().join("access.log");
@@ -29,20 +72,14 @@ fn standard_log_delta_survives_common_rotation_strategies() {
                 .replace("/var/log/nginx/access.log", log.to_str().unwrap())
                 .replace("/tmp/isuscope-{run_id}", prefix.to_str().unwrap())
         };
-        let mark = Command::new("sh")
-            .args(["-c", &prepare(&mark_template)])
-            .output()
-            .unwrap();
+        let mark = shell().arg(prepare(&mark_template)).output().unwrap();
         assert!(
             mark.status.success(),
             "mark failed for {name}: {}",
             String::from_utf8_lossy(&mark.stderr)
         );
         rotate(&log);
-        let delta = Command::new("sh")
-            .args(["-c", &prepare(&delta_template)])
-            .output()
-            .unwrap();
+        let delta = shell().arg(prepare(&delta_template)).output().unwrap();
         assert!(
             delta.status.success(),
             "delta failed for {name}: {}",
