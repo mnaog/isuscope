@@ -267,7 +267,7 @@ fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, 
     for item in coverage {
         let severity = match item.status.as_str() {
             "failed" => "critical",
-            "missing" => "warning",
+            "missing" | "partial" => "warning",
             _ if item.missing_metrics.is_empty() => continue,
             _ => "info",
         };
@@ -559,6 +559,24 @@ mod tests {
             client_nodes(&[row], None)[0].connections_opened_per_second,
             None
         );
+    }
+
+    #[test]
+    fn partial_database_coverage_is_visible_even_when_metrics_exist() {
+        let error = "2 slow-log records could not be assigned to a window; database aggregation is incomplete";
+        let (issues, _) = coverage_issues(vec![CoverageSummary {
+            section: "database".into(),
+            node: "db1".into(),
+            collector: "slp".into(),
+            phase: "after".into(),
+            status: "partial".into(),
+            missing_metrics: vec![],
+            error: Some(error.into()),
+        }]);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, "warning");
+        assert_eq!(issues[0].status, "partial");
+        assert_eq!(issues[0].errors, [error]);
     }
 
     #[test]

@@ -78,7 +78,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
     let after: Value = serde_json::from_slice(&after.stdout).unwrap();
     assert_eq!(after["rows"][0]["runs"], 1);
 
-    // The removed commands are gone; ui still renders those views.
+    // The removed commands are gone; SQL provides access to the stored data.
     assert!(!isuscope(project.path(), &["report"]).status.success());
     assert!(
         !isuscope(project.path(), &["diff", "latest", "latest"])

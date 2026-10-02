@@ -29,7 +29,7 @@ fn slp_collector_puts_statements_on_the_right_side_of_the_load_start() {
         let slp = bin.join("slp");
         fs::write(
             &slp,
-            "#!/bin/sh\nprintf '1\\tSELECT VERSION()\\t0.000035\\t0.000035\\t0.000035\\t0.000035\\t0\\t1\\t1\\n'\n",
+            "#!/bin/sh\nwhile [ \"$1\" != --file ]; do shift; done\nawk '/^# Query_time:/ { count++ } END { printf \"%d\\tSELECT VERSION()\\t0.000035\\t0.000035\\t0.000035\\t0.000035\\t0\\t1\\t1\\n\", count }' \"$2\"\n",
         )
         .unwrap();
         fs::set_permissions(&slp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -70,6 +70,39 @@ fn slp_collector_puts_statements_on_the_right_side_of_the_load_start() {
     assert!(!stdout.contains("db.slow_log_coarse_time"), "{stdout}");
     let (window, _) = run(record, "1787827375.823000");
     assert_eq!(window, "initialize");
+
+    let records = [
+        "timestamp=1787827375",
+        "insert_id=7,timestamp=1787827375",
+        "last_insert_id=7,timestamp=1787827375",
+        "last_insert_id=7,insert_id=8,timestamp=1787827375",
+    ]
+    .map(|assignments| record.replace("timestamp=1787827375", assignments));
+    for record in &records {
+        let (window, stdout) = run(record, "1787827375.800000");
+        assert_eq!(window, "load", "{stdout}");
+        assert!(
+            stdout.contains(r#""name":"db.calls","value":1"#),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("db.slow_log_unclassified"), "{stdout}");
+    }
+    let (_, stdout) = run(&records.concat(), "1787827375.800000");
+    assert!(stdout.contains("load\t4\t"), "{stdout}");
+    assert!(
+        stdout.contains(r#""name":"db.calls","value":4"#),
+        "{stdout}"
+    );
+    let missing = record.replace("SET timestamp=1787827375;\n", "");
+    let (_, stdout) = run(&format!("{record}{missing}"), "1787827375.800000");
+    assert!(
+        stdout.contains(r#""name":"db.calls","value":1"#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(r#""name":"db.slow_log_unclassified","value":1"#),
+        "{stdout}"
+    );
 
     // ベンチの始まりより前（log markの後、ベンチを起動するまで）の文は数えない。
     let (window, stdout) = run_from(record, "1787827375.900000", "1787827376.000000");

@@ -122,8 +122,12 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert_eq!(brief["run"]["score"], 12345);
     assert_eq!(brief["transitions"]["items"][0]["count"], 7);
 
-    // `report` and `diff` were removed; brief, query and sql cover the same data.
-    for removed in [vec!["report", "latest"], vec!["diff", "latest", "latest"]] {
+    // `report`, `diff` and `ui` were removed; brief, query and sql cover the same data.
+    for removed in [
+        vec!["report", "latest"],
+        vec!["diff", "latest", "latest"],
+        vec!["ui"],
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
             .args(&removed)
             .current_dir(project.path())
@@ -131,93 +135,6 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
             .unwrap();
         assert!(!output.status.success(), "{removed:?} still exists");
     }
-
-    let mut ui = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .arg("ui")
-        .current_dir(project.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut connection = (0..50)
-        .find_map(|_| {
-            std::net::TcpStream::connect("127.0.0.1:3000")
-                .ok()
-                .or_else(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    None
-                })
-        })
-        .expect("UI did not listen on localhost:3000");
-    std::io::Write::write_all(
-        &mut connection,
-        b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-    )
-    .unwrap();
-    let mut response = String::new();
-    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(response.contains("text/html"));
-    assert!(response.contains("<!doctype html>"));
-    assert!(response.contains("HTTP routes · total time"));
-    assert!(response.contains("Coverage"));
-    assert!(response.contains("Database queries · total time"));
-    assert!(response.contains("CPU symbols · sample share"));
-    assert!(response.contains("Host metrics"));
-    assert!(response.contains("Profile artifacts"));
-    assert!(response.contains("Transitions"));
-    assert!(response.contains("Collectors"));
-    assert!(response.contains("id=\"isuscope-report\""));
-
-    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
-    std::io::Write::write_all(
-        &mut connection,
-        b"GET /api/report HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-    )
-    .unwrap();
-    let mut response = String::new();
-    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(response.contains("application/json"));
-    assert!(response.contains("\"score\": 12345"));
-
-    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
-    std::io::Write::write_all(
-        &mut connection,
-        b"GET /diff HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-    )
-    .unwrap();
-    let mut response = String::new();
-    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(response.contains("form-action 'self'"));
-    assert!(response.contains("<h1>Compare runs</h1>"));
-
-    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
-    std::io::Write::write_all(
-        &mut connection,
-        b"GET /diff?base=latest&candidate=latest HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-    )
-    .unwrap();
-    let mut response = String::new();
-    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(response.contains("<h2>CPU symbols</h2>"));
-    assert!(response.contains("id=\"isuscope-diff\""));
-
-    let mut connection = std::net::TcpStream::connect("127.0.0.1:3000").unwrap();
-    std::io::Write::write_all(
-        &mut connection,
-        b"GET /api/diff?base=latest&candidate=latest HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-    )
-    .unwrap();
-    let mut response = String::new();
-    std::io::Read::read_to_string(&mut connection, &mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(response.contains("application/json"));
-    assert!(response.contains("\"schema_version\": 1"));
-    ui.kill().unwrap();
-    ui.wait().unwrap();
 
     let latest = config_dir.join("latest");
     assert!(latest.join("run.json").is_file());

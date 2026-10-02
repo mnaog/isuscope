@@ -24,4 +24,3 @@ pub mod sql;
 pub mod storage;
 pub mod tooling;
 pub mod transition;
-pub mod ui;

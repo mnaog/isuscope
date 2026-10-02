@@ -55,7 +55,7 @@ isuscope analyze RUN_ID supported --base BASE_RUN \
 - 変更が未作成なら作成します。説明は`--description`、省略時はrunの仮説です。既存の変更に`--description`を付けるとエラーになります。
 - `provisional`の`--revisit`不足などは分析を書き込む前に検査し、分析だけが残ることはありません。
 
-- `analyze --base`は比較元の完全なrun IDを保存します。brief/UIは同じ比較処理で各1走のスコア差を表示し、誤差や性能採否は自動判定しません。
+- `analyze --base`は比較元の完全なrun IDを保存します。`brief`は各1走のスコア差を表示し、誤差や性能採否は自動判定しません。
 - スコア差の隣に**比較の前提**を出します。`source`（`state_sha256`。dirtyや変更commitも示す）、`observation`（config.toml、routes.toml、benchmark adapterなどのhashとisuscopeのversion）、`environment`（fingerprintのうち値が変わったもの。例: `nginx.config.sha256@app1`）、`benchmark`の4つを`same`／`changed`／`unknown`で返します。**`unknown`は`same`ではありません。** ベンチ側の条件はサーバーからは観測できないので、練習で自分がベンチを変えたときは`run --tag bench:<条件名>`で印を付けます。両方のrunに`bench:`tagがあるときだけ`same`／`changed`を判定し、無ければ`unknown`のままにします。
 - `change decide`の状態は`accepted`（採用）、`provisional`（暫定採用）、`rejected`（不採用）、`deferred`（保留）です。未記録と保留は別です。
 - `provisional`には`--revisit "再評価条件"`が必須です。理由と1件以上の根拠runは全状態で必須です。`--run`は繰り返せます。FAIL runも根拠にできます。
@@ -126,9 +126,8 @@ isuscope doctor
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
-| `ui` | 人間向けHTML UIをlocalhostで起動する |
 
-`list`、`brief`、`series`、`query`、`sql`は機械処理しやすいJSONを返します。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice、詳細行数）で、全nodeの状況を最初の1画面で見切るためのものです。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取れ、人が見る場合は`ui`に同じ表示が残っています。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+`list`、`brief`、`series`、`query`、`sql`は機械処理しやすいJSONを返します。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice、詳細行数）で、全nodeの状況を最初の1画面で見切るためのものです。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取得できます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
 
 どのmetricがあるかは`sql`で調べます。runごとの件数・単位・時系列の有無と、labelの種類がこれで分かります。
 

@@ -8,7 +8,7 @@ const DOCUMENTS: [&str; 3] = [
 ];
 
 /// 廃止したcommand。文書では「廃止した」と説明する行でだけ触れてよい。
-const REMOVED_COMMANDS: [&str; 3] = ["report", "diff", "metrics"];
+const REMOVED_COMMANDS: [&str; 4] = ["report", "diff", "metrics", "ui"];
 
 fn read(document: &str) -> String {
     fs::read_to_string(format!("{}/{document}", env!("CARGO_MANIFEST_DIR"))).unwrap()

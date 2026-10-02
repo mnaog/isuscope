@@ -92,8 +92,6 @@ enum Commands {
         #[arg(long, value_parser = parse_since)]
         since: Option<chrono::DateTime<chrono::Utc>>,
     },
-    /// 最新runの人間向けUIをlocalhostで起動します。
-    Ui,
     /// runの判断材料だけを小さい機械向けJSONで出力します。
     Brief {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
@@ -579,10 +577,6 @@ async fn real_main(cli: Cli) -> Result<bool> {
         .passed),
         Commands::List { limit, since } => {
             list_runs(&config, limit, since)?;
-            Ok(true)
-        }
-        Commands::Ui => {
-            isuscope::ui::serve(config, Shutdown::listen()).await?;
             Ok(true)
         }
         Commands::Brief { run, limit } => {
@@ -1518,7 +1512,12 @@ fn metric_matches(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    if !options.metrics.is_empty() && !options.metrics.contains(&metric.name) {
+    let dependency = metric.name == "cpu.sample_count"
+        && options
+            .metrics
+            .iter()
+            .any(|name| name == "cpu.sample_percent");
+    if !dependency && !options.metrics.is_empty() && !options.metrics.contains(&metric.name) {
         return false;
     }
     if let Some(node) = &options.node
@@ -1526,10 +1525,11 @@ fn metric_matches(
     {
         return false;
     }
-    if options
-        .labels
-        .iter()
-        .any(|(key, value)| metric.labels.get(key) != Some(value))
+    if !dependency
+        && options
+            .labels
+            .iter()
+            .any(|(key, value)| metric.labels.get(key) != Some(value))
     {
         return false;
     }
@@ -1548,6 +1548,30 @@ fn generic_series_data(
     type SeriesKey = (String, i64, String, String, BTreeMap<String, String>);
     let mut rows = BTreeMap::<SeriesKey, (MetricAggregation, Vec<f64>)>::new();
     let bucket_seconds = options.bucket as i64;
+    let mut buckets = BTreeMap::<i64, Vec<isuscope::model::Metric>>::new();
+    for metric in metrics {
+        if let Some(at) = metric.timestamp
+            && isuscope::model::in_window(at, window_start, end)
+            && let Some(bucket) = bucket_index(at, window_start, bucket_seconds)
+        {
+            buckets.entry(bucket).or_default().push(metric);
+        }
+    }
+    let selection = query::MetricQueryOptions {
+        scope: query::QueryScope::Series,
+        window: None,
+        metrics: options.metrics.clone(),
+        metric_prefix: None,
+        node: options.node.clone(),
+        source: None,
+        labels: options.labels.clone(),
+        label_contains: Vec::new(),
+        group_by: Vec::new(),
+        limit: usize::MAX,
+    };
+    let metrics = buckets
+        .into_values()
+        .flat_map(|metrics| query::selected_metrics(metrics, &selection));
     for metric in metrics {
         let Some(at) = metric.timestamp else { continue };
         let node = metric
@@ -1799,6 +1823,71 @@ mod series_tests {
         };
         assert_eq!(both.database(), (Some(42.0), Some(840.0)));
         assert_eq!(BucketRow::default().database(), (None, None));
+    }
+
+    #[test]
+    fn sparse_cpu_percentages_are_recomputed_per_series_bucket() {
+        let start = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let metrics = [
+            ("A", 0, 100.0),
+            ("B", 5, 100.0),
+            ("A", 10, 25.0),
+            ("B", 15, 75.0),
+        ]
+        .into_iter()
+        .flat_map(|(symbol, second, count)| {
+            [
+                ("cpu.sample_count", "samples", count),
+                ("cpu.sample_percent", "percent", 100.0),
+            ]
+            .map(|(name, unit, value)| isuscope::model::Metric {
+                name: name.into(),
+                unit: unit.into(),
+                value,
+                timestamp: Some(start + chrono::Duration::seconds(second)),
+                labels: BTreeMap::from([
+                    ("node".into(), "app".into()),
+                    ("collector".into(), "perf".into()),
+                    ("symbol".into(), symbol.into()),
+                ]),
+            })
+        })
+        .collect::<Vec<_>>();
+        for labels in [vec![], vec![("symbol".into(), "A".into())]] {
+            let options = SeriesOptions {
+                metrics: vec!["cpu.sample_percent".into()],
+                node: None,
+                labels,
+                from: 0,
+                to: None,
+                window: SeriesWindowArg::Load,
+                bucket: 10,
+                limit: 100,
+            };
+            let end = start + chrono::Duration::seconds(20);
+            let selected = metrics
+                .iter()
+                .filter(|metric| metric_matches(metric, &options, start, end))
+                .cloned()
+                .collect();
+            let SeriesData::Metrics { rows, .. } =
+                generic_series_data(start, start, end, &options, selected)
+            else {
+                panic!("expected metrics")
+            };
+            assert_eq!(rows.len(), if options.labels.is_empty() { 4 } else { 2 });
+            for row in rows {
+                assert_eq!(row.metric, "cpu.sample_percent");
+                let expected = if row.from_seconds == 0 {
+                    50.0
+                } else if row.labels["symbol"] == "A" {
+                    25.0
+                } else {
+                    75.0
+                };
+                assert_eq!(row.value, expected);
+            }
+        }
     }
 
     #[test]

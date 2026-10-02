@@ -1,13 +1,9 @@
 use crate::model::{CollectorResult, Metric, RunManifest, Transition};
-use anyhow::Result;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::PathBuf;
 
-const COMPACT_LIMIT: usize = 20;
-
-/// Lossless normalized data shared by the compact report and run diff models.
+/// Lossless normalized data used by the brief output.
 /// This is intentionally not serializable: public output must choose its own
 /// ordering and compaction only after all relevant records have been compared.
 pub struct RunDiagnostics {
@@ -24,35 +20,6 @@ pub struct RunDiagnostics {
     pub upstreams: Vec<UpstreamSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: Vec<Transition>,
-    pub run_logs: PathBuf,
-    pub latest_logs: Option<PathBuf>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RunReport {
-    pub schema_version: u32,
-    pub review: Option<crate::changes::RunReview>,
-    pub run: RunManifest,
-    pub coverage: Vec<CoverageSummary>,
-    pub http: ReportSection<HttpRouteSummary>,
-    pub database: ReportSection<DatabaseSummary>,
-    pub cpu: ReportSection<CpuSummary>,
-    pub host: ReportSection<HostSummary>,
-    pub client: ReportSection<HostSummary>,
-    pub host_window: &'static str,
-    pub upstreams: ReportSection<UpstreamSummary>,
-    pub artifacts: Vec<ProfileArtifact>,
-    pub transitions: ReportSection<Transition>,
-    pub run_logs: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_logs: Option<PathBuf>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReportSection<T> {
-    pub total_count: usize,
-    pub truncated: bool,
-    pub items: Vec<T>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -148,16 +115,6 @@ pub struct ProfileArtifact {
     pub error: Option<String>,
 }
 
-pub fn build(
-    run: RunManifest,
-    metrics: Vec<Metric>,
-    transitions: Vec<Transition>,
-    run_logs: PathBuf,
-    latest_logs: Option<PathBuf>,
-) -> RunReport {
-    diagnose(run, metrics, transitions, run_logs, latest_logs).into_report()
-}
-
 pub fn diagnose(
     run: RunManifest,
     metrics: Vec<Metric>,
@@ -210,8 +167,6 @@ pub fn diagnose(
         upstreams,
         artifacts,
         transitions,
-        run_logs,
-        latest_logs,
     }
 }
 
@@ -223,268 +178,6 @@ fn load_window(
         run.benchmark.initialize_finished_at?,
         run.benchmark.finished_at?,
     ))
-}
-
-impl RunDiagnostics {
-    pub fn into_report(self) -> RunReport {
-        RunReport {
-            review: None,
-            schema_version: 6,
-            run: self.run,
-            coverage: self.coverage,
-            http: section(self.http),
-            database: section(self.database),
-            cpu: section(self.cpu),
-            host: section(self.host),
-            client: section(self.client),
-            host_window: self.host_window,
-            upstreams: section(self.upstreams),
-            artifacts: self.artifacts,
-            transitions: section(self.transitions),
-            run_logs: self.run_logs,
-            latest_logs: self.latest_logs,
-        }
-    }
-}
-
-pub fn write_json(report: &RunReport, writer: impl Write) -> Result<()> {
-    serde_json::to_writer_pretty(writer, report)?;
-    Ok(())
-}
-
-pub fn write_html(report: &RunReport, mut writer: impl Write) -> Result<()> {
-    let title = format!("isuscope run {}", short(&report.run.id));
-    let score = report
-        .run
-        .benchmark
-        .score
-        .map_or_else(|| "-".into(), |score| score.to_string());
-    let collectors = report
-        .run
-        .collectors
-        .iter()
-        .map(|collector| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape(&collector.status),
-                escape(&collector.name),
-                escape(collector.node.as_deref().unwrap_or("local")),
-                escape(collector.error.as_deref().unwrap_or("")),
-            )
-        })
-        .collect::<String>();
-    let routes = report
-        .http.items
-        .iter()
-        .map(|route| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape(&route.method), escape(&route.route), number(route.count),
-                optional(route.total_ms), optional(route.avg_ms), optional(route.p95_ms),
-                optional(route.p99_ms), percent(route.error_rate),
-            )
-        })
-        .collect::<String>();
-    let coverage = report
-        .coverage
-        .iter()
-        .map(|item| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape(&item.status),
-                escape(&item.section),
-                escape(&item.node),
-                escape(&item.collector),
-                escape(&item.phase),
-                escape(&item.missing_metrics.join(", ")),
-            )
-        })
-        .collect::<String>();
-    let database = report
-        .database
-        .items
-        .iter()
-        .map(|item| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape(&item.node),
-                escape(&item.engine),
-                escape(&digest_label(&item.digest, item.digest_id.as_deref())),
-                number(item.calls),
-                number(item.total_ms),
-                optional(item.avg_ms),
-                optional(item.p95_ms),
-                optional(item.rows_examined_per_call),
-            )
-        })
-        .collect::<String>();
-    let cpu = report
-        .cpu
-        .items
-        .iter()
-        .map(|item| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td></tr>",
-                escape(&item.node),
-                escape(&item.process),
-                escape(&item.binary),
-                escape(&item.symbol),
-                item.sample_percent,
-            )
-        })
-        .collect::<String>();
-    let host = report
-        .host
-        .items
-        .iter()
-        .map(|item| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td><td>{:.2}</td><td>{}</td><td>{}</td></tr>",
-                escape(&item.node),
-                escape(&item.metric),
-                escape(&item.target),
-                item.value.unwrap_or(f64::NAN),
-                item.peak,
-                escape(&item.unit),
-                escape(&item.peak_at.map(|at| at.to_rfc3339()).unwrap_or_else(|| "-".into())),
-            )
-        })
-        .collect::<String>();
-    let artifacts = report
-        .artifacts
-        .iter()
-        .map(|item| {
-            let path = item
-                .expanded_path
-                .as_ref()
-                .or(item.canonical_path.as_ref())
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "-".into());
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td></tr>",
-                escape(&item.status),
-                escape(&item.kind),
-                escape(&item.node),
-                escape(&path),
-                escape(item.error.as_deref().unwrap_or("")),
-            )
-        })
-        .collect::<String>();
-    let transitions = report
-        .transitions
-        .items
-        .iter()
-        .map(|item| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape(&item.from_route),
-                escape(&item.to_route),
-                item.count,
-                optional(item.p50_ms),
-                optional(item.p95_ms),
-            )
-        })
-        .collect::<String>();
-    let embedded = serde_json::to_string(report)?.replace('<', "\\u003c");
-    let review = review_html(report.review.as_ref());
-    write!(
-        writer,
-        r#"<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>
-:root{{--bg:#0b1020;--panel:#131b2e;--text:#edf2ff;--muted:#9cabc7;--line:#293653;--ok:#65d69e;--bad:#ff7d8b;--accent:#7bb4ff}}*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif}}main{{max-width:1280px;margin:auto;padding:28px}}h1{{font-size:24px;margin:0 0 20px}}h2{{font-size:16px;margin:0 0 12px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:20px}}.card,section{{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}}.label{{color:var(--muted);font-size:12px}}.value{{font-size:22px;font-weight:700}}section{{margin:12px 0;overflow:auto}}table{{width:100%;border-collapse:collapse;white-space:nowrap}}th,td{{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line)}}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){{text-align:left}}th{{color:var(--muted);font-size:12px}}code{{color:var(--accent)}}
-</style></head><body><main><h1>{title}</h1>{review}<div class="grid"><div class="card"><div class="label">STATE</div><div class="value">{state}</div></div><div class="card"><div class="label">SCORE</div><div class="value">{score}</div></div><div class="card"><div class="label">HTTP ROUTES</div><div class="value">{route_count}</div></div><div class="card"><div class="label">METRICS</div><div class="value">{metric_count}</div></div></div><section><h2>Coverage</h2><table><thead><tr><th>STATUS</th><th>SECTION</th><th>NODE</th><th>COLLECTOR</th><th>PHASE</th><th>MISSING METRICS</th></tr></thead><tbody>{coverage}</tbody></table></section><section><h2>HTTP routes · total time</h2><table><thead><tr><th>METHOD</th><th>ROUTE</th><th>COUNT</th><th>TOTAL ms</th><th>AVG ms</th><th>P95 ms</th><th>P99 ms</th><th>ERROR %</th></tr></thead><tbody>{routes}</tbody></table></section><section><h2>Database queries · total time</h2><table><thead><tr><th>NODE</th><th>ENGINE</th><th>DIGEST</th><th>CALLS</th><th>TOTAL ms</th><th>AVG ms</th><th>P95 ms</th><th>ROWS/CALL</th></tr></thead><tbody>{database}</tbody></table></section><section><h2>CPU symbols · sample share</h2><table><thead><tr><th>NODE</th><th>PROCESS</th><th>BINARY</th><th>SYMBOL</th><th>SAMPLE %</th></tr></thead><tbody>{cpu}</tbody></table></section><section><h2>Host metrics</h2><table><thead><tr><th>NODE</th><th>METRIC</th><th>TARGET</th><th>AVERAGE</th><th>PEAK</th><th>UNIT</th><th>PEAK AT</th></tr></thead><tbody>{host}</tbody></table></section><section><h2>Profile artifacts</h2><table><thead><tr><th>STATUS</th><th>KIND</th><th>NODE</th><th>PATH</th><th>ERROR</th></tr></thead><tbody>{artifacts}</tbody></table></section><section><h2>Transitions</h2><table><thead><tr><th>FROM</th><th>TO</th><th>COUNT</th><th>P50 ms</th><th>P95 ms</th></tr></thead><tbody>{transitions}</tbody></table></section><section><h2>Collectors</h2><table><thead><tr><th>STATUS</th><th>NAME</th><th>NODE</th><th>ERROR</th></tr></thead><tbody>{collectors}</tbody></table></section><p class="label">Raw evidence: <code>{logs}</code></p><script type="application/json" id="isuscope-report">{embedded}</script></main></body></html>"#,
-        title = escape(&title),
-        state = escape(report.run.state.as_str()),
-        score = score,
-        route_count = report.http.total_count,
-        metric_count = report.run.metric_count,
-        routes = routes,
-        coverage = coverage,
-        database = database,
-        cpu = cpu,
-        host = host,
-        artifacts = artifacts,
-        transitions = transitions,
-        collectors = collectors,
-        logs = escape(
-            &report
-                .latest_logs
-                .as_deref()
-                .unwrap_or(&report.run_logs)
-                .display()
-                .to_string(),
-        ),
-        embedded = embedded,
-    )?;
-    Ok(())
-}
-
-fn review_html(review: Option<&crate::changes::RunReview>) -> String {
-    let Some(review) = review else {
-        return String::new();
-    };
-    let mut html = String::from("<section><h2>仮説・比較・変更の採否</h2>");
-    if let Some(analysis) = &review.latest_analysis {
-        html.push_str(&format!(
-            "<p>仮説判定: {} — {}</p>",
-            analysis.verdict.as_str(),
-            escape(&analysis.body)
-        ));
-    } else {
-        html.push_str("<p>分析未記録</p>");
-    }
-    if let Some(c) = &review.comparison {
-        html.push_str(&format!(
-            "<p>比較元 {} → {}: {} → {}（{}%、各1走）</p>",
-            escape(&c.base_run_id),
-            escape(&c.candidate_run_id),
-            c.score.base.map_or("-".into(), |v| v.to_string()),
-            c.score.candidate.map_or("-".into(), |v| v.to_string()),
-            optional(c.score.delta_percent)
-        ));
-    }
-    html.push_str("<p>関連する変更の現在の採否（実環境への反映状態ではありません）</p>");
-    for summary in &review.changes {
-        html.push_str(&format!(
-            "<h3>{}</h3><p>{}</p>",
-            escape(&summary.change.id),
-            escape(&summary.change.description)
-        ));
-        if let Some(d) = &summary.latest_decision {
-            html.push_str(&format!(
-                "<p>{}: {}</p>",
-                d.status.as_str(),
-                escape(&d.reason)
-            ));
-            if let Some(revisit) = &d.revisit {
-                html.push_str(&format!("<p>再評価条件: {}</p>", escape(revisit)));
-            }
-        }
-    }
-    if review.changes_truncated {
-        html.push_str("<p>先頭20変更のみ表示。change list/showで全件を確認できます。</p>");
-    }
-    html.push_str("</section>");
-    html
-}
-
-fn short(id: &str) -> &str {
-    id.get(id.len().saturating_sub(8)..).unwrap_or(id)
-}
-fn escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-fn optional(value: Option<f64>) -> String {
-    value.map_or_else(|| "-".into(), |value| format!("{value:.2}"))
-}
-fn number(value: f64) -> String {
-    format!("{value:.0}")
-}
-fn percent(value: Option<f64>) -> String {
-    value.map_or_else(|| "-".into(), |value| format!("{:.2}", value * 100.0))
 }
 
 #[derive(Debug, Default, Serialize, PartialEq)]
@@ -614,14 +307,6 @@ fn http_source_quality(summary: &HttpRouteSummary) -> (bool, bool, bool, bool, u
         summary.p95_ms.is_some(),
         summary.status_counts.len(),
     )
-}
-
-/// 切られた文は先頭が同じ別の文と見分けられるよう、全文のhashを添えて表示する。
-pub(crate) fn digest_label(digest: &str, digest_id: Option<&str>) -> String {
-    match digest_id {
-        Some(id) => format!("{digest} [{id}]"),
-        None => digest.to_owned(),
-    }
 }
 
 pub fn database_queries(metrics: &[Metric]) -> Vec<DatabaseSummary> {
@@ -869,16 +554,6 @@ fn profile_artifacts(
         .collect()
 }
 
-fn section<T>(mut items: Vec<T>) -> ReportSection<T> {
-    let total_count = items.len();
-    items.truncate(COMPACT_LIMIT);
-    ReportSection {
-        total_count,
-        truncated: total_count > items.len(),
-        items,
-    }
-}
-
 fn coverage(
     collectors: &[CollectorResult],
     summary: &[Metric],
@@ -916,7 +591,16 @@ fn coverage(
                 })
                 .map(|name| name.to_string())
                 .collect::<Vec<_>>();
+            let unclassified: f64 = metrics
+                .iter()
+                .filter(|metric| {
+                    metric.name == "db.slow_log_unclassified"
+                        && metric_matches_collector(metric, collector)
+                })
+                .map(|metric| metric.value)
+                .sum();
             let status = match collector.status.as_str() {
+                "complete" if unclassified > 0.0 => "partial",
                 "complete" if missing_metrics.is_empty() => "complete",
                 "complete" => "missing",
                 "unavailable" => "unavailable",
@@ -930,7 +614,9 @@ fn coverage(
                 phase: collector.phase.clone(),
                 status: status.into(),
                 missing_metrics,
-                error: collector.error.clone(),
+                error: collector.error.clone().or_else(|| (unclassified > 0.0).then(||
+                    format!("{unclassified} slow-log records could not be assigned to a window; database aggregation is incomplete")
+                )),
             });
         }
     }
@@ -1367,15 +1053,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_sections_expose_total_and_truncation() {
-        let values = (0..25).collect::<Vec<_>>();
-        let compact = section(values);
-        assert_eq!(compact.total_count, 25);
-        assert_eq!(compact.items.len(), COMPACT_LIMIT);
-        assert!(compact.truncated);
-    }
-
-    #[test]
     fn artifacts_always_reference_the_run_and_only_latest_gets_expanded_paths() {
         let collector = CollectorResult {
             name: "perf-flamegraph".into(),
@@ -1436,6 +1113,27 @@ mod tests {
             collector("host-sampler", "app1", "complete"),
             collector("sysstat", "app2", "unavailable"),
         ];
+        let partial = coverage(
+            &[
+                collector("slp", "db1", "complete"),
+                collector("slp", "db2", "complete"),
+            ],
+            &[
+                metric("db.query.calls", "db1", "slp"),
+                metric("db.query.total_duration", "db1", "slp"),
+                metric("db.slow_log_unclassified", "db1", "slp"),
+                metric("db.query.calls", "db2", "slp"),
+                metric("db.query.total_duration", "db2", "slp"),
+            ],
+            &[],
+        );
+        let db1 = partial.iter().find(|row| row.node == "db1").unwrap();
+        assert_eq!(db1.status, "partial");
+        assert!(db1.error.as_ref().unwrap().contains("1 slow-log records"));
+        assert_eq!(
+            partial.iter().find(|row| row.node == "db2").unwrap().status,
+            "complete"
+        );
         let metrics = vec![
             metric("http.requests", "app1", "alp"),
             metric("http.request_duration", "app1", "alp"),

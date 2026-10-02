@@ -310,19 +310,6 @@ fn decisions_are_independent_recoverable_and_concurrent() {
             .len(),
         2
     );
-
-    let store = isuscope::storage::Store::open(&p.join(".isuscope")).unwrap();
-    let manifest = store.load(&candidate).unwrap();
-    let review = store.run_review(&manifest).unwrap();
-    let mut report = isuscope::report::build(manifest, vec![], vec![], p.join("logs"), None);
-    report.review = Some(review);
-    let mut html = Vec::new();
-    isuscope::report::write_html(&report, &mut html).unwrap();
-    let html = String::from_utf8(html).unwrap();
-    assert!(html.contains("&lt;script&gt;items&lt;/script&gt;"));
-    assert!(!html.contains("<script>items</script>"));
-    assert!(html.contains("inconclusive"));
-    assert!(html.contains("各1走"));
 }
 
 #[test]

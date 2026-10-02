@@ -1085,8 +1085,16 @@ awk -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='
   /^# User@Host: / && (decided || timed) { flush() }
   /^# Query_time: / { query_time = $3; lock_time = $5; timed = 1 }
   /^# administrator command:/ { administrative = 1 }
-  /^SET timestamp=/ && !decided {
-    second = $0; sub(/^SET timestamp=/, "", second); sub(/;.*/, "", second); second += 0
+  /^SET / && timed && !decided {
+    # MySQL can prepend last_insert_id and insert_id to the metadata assignment list.
+    assignments = $0; sub(/^SET /, "", assignments); sub(/;[[:space:]]*$/, "", assignments)
+    count = split(assignments, assignment, ","); second = ""
+    for (i = 1; i <= count; i++) {
+      if (assignment[i] ~ /^[[:space:]]*timestamp=[0-9]+[[:space:]]*$/) {
+        second = assignment[i]; sub(/^[[:space:]]*timestamp=/, "", second); second += 0
+      }
+    }
+    if (second == "") { entry = entry $0 "\n"; next }
     at = second
     if (timed && logged ~ /\./) {
       shift = logged - query_time - second % 60
@@ -1130,7 +1138,7 @@ done
 # 文があったのに1件も集計できなければ、slow logの形式とslpかawkが合っていない。
 unclassified=$(cat "$work/unclassified")
 if [ "$unclassified" -gt 0 ]; then
-  echo "$unclassified slow-log records had no SET timestamp and were not assigned to a window" >&2
+  echo "$unclassified slow-log records had no valid timestamp in SET metadata; aggregation is incomplete" >&2
 fi
 if [ "$parsed" = 0 ] && { ls "$work"/*.log >/dev/null 2>&1 || [ "$unclassified" -gt 0 ]; }; then
   echo 'slp parsed no records from a non-empty slow-log delta' >&2
