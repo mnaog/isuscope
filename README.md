@@ -8,6 +8,8 @@ isuscopeは、ISUCONのベンチマークと観測結果を1つのrunとして�
 
 開始直後の全体調査では、通常の観測に匿名viewer単位の行動遷移を加える`survey-run`を1回だけ使います。
 
+遷移はsession内のリクエスト開始順で集計します。nginxログに`msec`と`reqtime`があれば、完了時刻から処理時間を引いて開始時刻を推定します。`transition.ordering_version=2`、`transition.precise_events`、`transition.legacy_events`に加え、遷移のfrom/to別に`transition.overlap_count`（実行区間が重なる隣接要求）と`transition.ambiguous_count`（同一開始時刻・旧ログ）を記録します。旧ログは従来のtimeを使い、順序不確定として残します。これらは観測順であり、因果関係や公式シナリオを保証しません。通常runでsessionログを追加収集する必要はありません。
+
 ```console
 isuscope doctor
 isuscope survey-run --hypothesis "初期状態の負荷構造を記録する"

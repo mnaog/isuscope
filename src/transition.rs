@@ -120,6 +120,8 @@ impl RouteNormalizer {
 struct Event {
     at: DateTime<Utc>,
     route: String,
+    end: DateTime<Utc>,
+    precise: bool,
 }
 
 /// survey-runで持ち帰った生のaccess logから、session単位の遷移を作る。route別の集計、時系列、
@@ -142,35 +144,88 @@ pub fn emit(options: TransitionOptions<'_>) -> Result<usize> {
     for path in paths {
         read_log(&path, &options, &rules, &mut sessions)?;
     }
-    let mut edges: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let (edges, quality) = summarize(&mut sessions);
+    for row in &edges {
+        println!("{}", serde_json::to_string(row)?);
+    }
+    for row in quality {
+        println!("{}", serde_json::to_string(&row)?);
+    }
+
+    Ok(edges.len())
+}
+
+fn summarize(
+    sessions: &mut BTreeMap<String, Vec<Event>>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    type Edge = (Vec<f64>, usize, usize);
+    let mut edges: BTreeMap<(String, String), Edge> = BTreeMap::new();
+    let mut precise = 0;
+    let mut legacy = 0;
     for events in sessions.values_mut() {
-        events.sort_by_key(|event| event.at);
+        events.sort_by_key(|event| (event.at, event.end));
+        for event in events.iter() {
+            if event.precise {
+                precise += 1;
+            } else {
+                legacy += 1;
+            }
+        }
         for pair in events.windows(2) {
-            let duration_ms = (pair[1].at - pair[0].at)
-                .num_microseconds()
-                .unwrap_or_default() as f64
-                / 1_000.0;
-            edges
+            let edge = edges
                 .entry((pair[0].route.clone(), pair[1].route.clone()))
-                .or_default()
-                .push(duration_ms);
+                .or_default();
+            edge.0.push(
+                (pair[1].at - pair[0].at)
+                    .num_microseconds()
+                    .unwrap_or_default() as f64
+                    / 1000.0,
+            );
+            edge.1 += usize::from(pair[0].precise && pair[1].precise && pair[1].at < pair[0].end);
+            edge.2 += usize::from(!pair[0].precise || !pair[1].precise || pair[0].at == pair[1].at);
         }
     }
-    for ((from, to), durations) in &mut edges {
+    let mut transitions = Vec::new();
+    let mut quality = vec![
+        json!({"type":"metric","name":"transition.ordering_version","value":2,"unit":"version"}),
+        json!({"type":"metric","name":"transition.precise_events","value":precise,"unit":"events"}),
+        json!({"type":"metric","name":"transition.legacy_events","value":legacy,"unit":"events"}),
+    ];
+    for ((from, to), (mut durations, overlap, ambiguous)) in edges {
         durations.sort_by(f64::total_cmp);
-        println!(
-            "{}",
-            serde_json::to_string(&json!({
-                "type": "transition",
-                "from": from,
-                "to": to,
-                "count": durations.len(),
-                "p50_ms": percentile(durations, 0.50),
-                "p95_ms": percentile(durations, 0.95),
-            }))?
+        transitions.push(
+            json!({"type":"transition","from":from,"to":to,"count":durations.len(),
+            "p50_ms":percentile(&durations,0.50),"p95_ms":percentile(&durations,0.95)}),
         );
+        for (name, value) in [
+            ("transition.overlap_count", overlap),
+            ("transition.ambiguous_count", ambiguous),
+        ] {
+            quality.push(json!({"type":"metric","name":name,"value":value,"unit":"transitions","labels":{"from":from,"to":to}}));
+        }
     }
-    Ok(edges.len())
+    (transitions, quality)
+}
+
+// nginx records completion time in $msec. Subtract $request_time to order starts.
+// Older logs remain readable, but their ordering is explicitly marked ambiguous.
+fn event_time(
+    fields: &BTreeMap<&str, &str>,
+    time_field: &str,
+) -> Option<(DateTime<Utc>, DateTime<Utc>, bool)> {
+    if let (Some(end), Some(seconds)) = (
+        fields.get("msec").and_then(|v| parse_timestamp(v)),
+        fields.get("reqtime").and_then(|v| v.parse::<f64>().ok()),
+    ) {
+        if seconds.is_finite() && (0.0..=86_400.0).contains(&seconds) {
+            let duration = chrono::Duration::microseconds((seconds * 1_000_000.0).round() as i64);
+            if let Some(start) = end.checked_sub_signed(duration) {
+                return Some((start, end, true));
+            }
+        }
+    }
+    let at = fields.get(time_field).and_then(|v| parse_timestamp(v))?;
+    Some((at, at, false))
 }
 
 fn read_log(
@@ -205,10 +260,7 @@ fn read_log(
         else {
             continue;
         };
-        let Some(at) = fields
-            .get(options.time_field)
-            .and_then(|value| parse_timestamp(value))
-        else {
+        let Some((at, end, precise)) = event_time(&fields, options.time_field) else {
             continue;
         };
         let route = rules.normalize(uri.split('?').next().unwrap_or(uri));
@@ -217,6 +269,8 @@ fn read_log(
             .or_default()
             .push(Event {
                 at,
+                end,
+                precise,
                 route: format!("{method} {route}"),
             });
     }
@@ -343,6 +397,56 @@ mod tests {
             writeln!(encoder, "{line}").unwrap();
         }
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn orders_by_start_and_marks_overlap_and_legacy() {
+        let make = |line: &str, route: &str| {
+            let fields = parse_ltsv(line);
+            let (at, end, precise) = event_time(&fields, "time").unwrap();
+            Event {
+                at,
+                end,
+                precise,
+                route: route.into(),
+            }
+        };
+        let mut sessions = BTreeMap::from([(
+            "a".into(),
+            vec![
+                make("msec:100.300\treqtime:0.100", "B"),
+                make("msec:100.900\treqtime:0.800", "A"),
+                make("msec:101.100\treqtime:0.100", "C"),
+            ],
+        )]);
+        let (edges, quality) = summarize(&mut sessions);
+        assert_eq!(edges[0]["from"], "A");
+        assert_eq!(edges[0]["to"], "B");
+        assert_eq!(edges[0]["p50_ms"], 100.0);
+        assert!(
+            quality
+                .iter()
+                .any(|v| v["name"] == "transition.overlap_count"
+                    && v["labels"]["from"] == "A"
+                    && v["value"] == 1)
+        );
+        sessions.insert(
+            "legacy".into(),
+            vec![make("time:100", "X"), make("time:100", "Y")],
+        );
+        let (_, quality) = summarize(&mut sessions);
+        assert!(
+            quality
+                .iter()
+                .any(|v| v["name"] == "transition.ambiguous_count"
+                    && v["labels"]["from"] == "X"
+                    && v["value"] == 1)
+        );
+        assert!(
+            quality
+                .iter()
+                .any(|v| v["name"] == "transition.legacy_events" && v["value"] == 2)
+        );
     }
 
     #[test]
