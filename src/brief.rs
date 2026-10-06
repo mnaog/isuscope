@@ -9,10 +9,13 @@ use crate::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// 長文の冒頭だけを出す文字数。全文は各欄の`full_text`の命令で読む。
+const EXCERPT_CHARS: usize = 240;
+
 #[derive(Debug, Serialize)]
 pub struct BriefOutput {
     pub schema_version: u32,
-    pub review: Option<crate::changes::RunReview>,
+    pub review: Option<BriefReview>,
     pub run: BriefRun,
     pub coverage_issues: BriefSection<CoverageIssueGroup>,
     pub coverage_info_count: usize,
@@ -28,12 +31,17 @@ pub struct BriefOutput {
     pub database_window: Option<String>,
     pub database: BriefSection<DatabaseSummary>,
     pub omitted_alternative_database_rows: usize,
+    /// idle taskが待機していた時間（`swapper`の`native_safe_halt`など）は除いて順位を付けます。
+    /// `sample_percent`は除く前の全sampleに対する割合のままです。
     pub cpu: BriefSection<CpuSummary>,
     /// `hosts`と`clients`を要約した区間。initializeの終わりが分かるrunは`load`、
     /// 分からないrunは`whole`（initializeを含む）。
     pub hosts_window: &'static str,
     /// 1 node 1行。詳細は`query --scope series --window load`で掘ります。
+    /// 遊んでいたnodeは`quiet_hosts`へまとめ、ここには出しません。
     pub hosts: Vec<BriefHostNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quiet_hosts: Option<BriefQuietHosts>,
     /// ベンチ側の接続の使い方。access logに`$connection`と`$msec`があるとき、1 node 1行。
     pub clients: Vec<BriefClientNode>,
     /// Per backend, when the access log carries `$upstream_addr` and the upstream times.
@@ -72,6 +80,165 @@ pub struct BriefHostNode {
     pub top_services: Vec<BriefService>,
     /// このnodeの詳細行数。`query`で何件に当たるかの目安。
     pub detail_rows: usize,
+}
+
+/// どの値も閾値を下回っていたnode。負荷を振り分ける余地として、名前とその中の最大値だけ残す。
+#[derive(Debug, Serialize)]
+pub struct BriefQuietHosts {
+    pub nodes: Vec<String>,
+    pub cpu_busy_peak_percent: f64,
+    pub busiest_core_peak_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iowait_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure_peak_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_util_peak_percent: Option<f64>,
+}
+
+/// [`crate::changes::RunReview`]から判断に要る部分だけを残したもの。長文は冒頭だけにし、
+/// run・commitは短縮形にする。
+#[derive(Debug, Serialize)]
+pub struct BriefReview {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_analysis: Option<BriefAnalysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<BriefComparison>,
+    pub changes: Vec<BriefChange>,
+    pub changes_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefAnalysis {
+    pub verdict: crate::model::AnalysisVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_run: Option<String>,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefComparison {
+    pub base_run: String,
+    pub score: crate::diff::ScoreDiff,
+    pub conditions: Vec<crate::changes::ComparisonCondition>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefChange {
+    pub id: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// 最新の判断。まだ判断していない変更では出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+    /// 理由が`latest_analysis.body`と同じ文章なら出さず、`reason_same_as_analysis`を立てる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reason_same_as_analysis: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revisit: Option<String>,
+    /// 判断の根拠にしたrun。`短縮ID commit先頭12桁`、未commitの変更があれば` dirty`を付ける。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_text: Option<String>,
+}
+
+pub fn review(review: crate::changes::RunReview) -> BriefReview {
+    let short = |id: &str| crate::runner::short_id(id).to_owned();
+    let analysis_body = review
+        .latest_analysis
+        .as_ref()
+        .map(|analysis| analysis.body.clone());
+    let latest_analysis = review.latest_analysis.map(|analysis| {
+        let (body, cut) = excerpt(&analysis.body);
+        BriefAnalysis {
+            verdict: analysis.verdict,
+            base_run: analysis.base_run_id.as_deref().map(short),
+            body,
+            full_text: cut.then(|| {
+                format!(
+                    "isuscope sql \"SELECT body FROM run_analyses WHERE id='{}'\"",
+                    analysis.id
+                )
+            }),
+        }
+    });
+    let comparison = review.comparison.map(|comparison| BriefComparison {
+        base_run: short(&comparison.base_run_id),
+        score: comparison.score,
+        conditions: comparison.conditions,
+    });
+    let changes = review
+        .changes
+        .into_iter()
+        .map(|summary| {
+            let change = summary.change;
+            let (description, mut cut) = excerpt(&change.description);
+            let decision = summary.latest_decision;
+            let same = decision
+                .as_ref()
+                .is_some_and(|decision| Some(&decision.reason) == analysis_body.as_ref());
+            let reason = decision.as_ref().filter(|_| !same).map(|decision| {
+                let (reason, reason_cut) = excerpt(&decision.reason);
+                cut |= reason_cut;
+                reason
+            });
+            BriefChange {
+                full_text: cut.then(|| format!("isuscope change show {}", change.id)),
+                id: change.id,
+                description,
+                target: change.target,
+                status: decision.as_ref().map(|decision| decision.status.as_str()),
+                decided_at: decision
+                    .as_ref()
+                    .map(|decision| decision.created_at.to_rfc3339()),
+                reason,
+                reason_same_as_analysis: same,
+                revisit: decision
+                    .as_ref()
+                    .and_then(|decision| decision.revisit.clone()),
+                evidence: decision
+                    .map(|decision| {
+                        decision
+                            .evidence
+                            .iter()
+                            .map(|evidence| {
+                                let commit = evidence
+                                    .source
+                                    .commit_hash
+                                    .as_deref()
+                                    .map(|hash| &hash[..12.min(hash.len())])
+                                    .unwrap_or("no-commit");
+                                let dirty = if evidence.source.dirty { " dirty" } else { "" };
+                                format!("{} {commit}{dirty}", short(&evidence.run_id))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    BriefReview {
+        latest_analysis,
+        comparison,
+        changes,
+        changes_truncated: review.changes_truncated,
+    }
+}
+
+/// 冒頭[`EXCERPT_CHARS`]文字と、切ったかどうか。
+fn excerpt(text: &str) -> (String, bool) {
+    match text.char_indices().nth(EXCERPT_CHARS) {
+        Some((end, _)) => (format!("{}…", &text[..end]), true),
+        None => (text.to_owned(), false),
+    }
 }
 
 /// ベンチ側がそのnodeへの接続をどう使ったか。
@@ -207,7 +374,7 @@ pub fn build(
     .map(|micros| micros as f64 / 1_000_000.0)
     .filter(|seconds| *seconds > 0.0);
     let clients = client_nodes(&diagnostics.client, window_seconds);
-    let hosts = host_nodes(&diagnostics.host);
+    let (hosts, quiet_hosts) = split_quiet_hosts(host_nodes(&diagnostics.host));
     let benchmark_messages = benchmark_messages(&run);
     let unavailable_artifact_count = diagnostics
         .artifacts
@@ -241,9 +408,17 @@ pub fn build(
         database_window,
         database: section(database, limit),
         omitted_alternative_database_rows,
-        cpu: section(diagnostics.cpu, limit),
+        cpu: section(
+            diagnostics
+                .cpu
+                .into_iter()
+                .filter(|row| !is_idle(row))
+                .collect(),
+            limit,
+        ),
         hosts_window,
         hosts,
+        quiet_hosts,
         clients,
         upstreams: section(diagnostics.upstreams, limit),
         transitions: section(diagnostics.transitions, limit),
@@ -488,6 +663,67 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
         .collect()
 }
 
+/// idle taskが何もせず待っていたsample。`swapper`でも割り込み処理（softirqなど）は仕事なので残す。
+fn is_idle(row: &CpuSummary) -> bool {
+    const IDLE_SYMBOLS: &[&str] = &[
+        "native_safe_halt",
+        "pv_native_safe_halt",
+        "default_idle",
+        "arch_cpu_idle",
+        "cpu_idle_poll",
+        "do_idle",
+        "poll_idle",
+        "intel_idle",
+        "intel_idle_irq",
+        "acpi_idle_do_entry",
+        "acpi_safe_halt",
+        "mwait_idle_with_hints",
+        "cpuidle_enter_state",
+    ];
+    row.process.starts_with("swapper") && IDLE_SYMBOLS.contains(&row.symbol.as_str())
+}
+
+/// どの値も分かっていて閾値を下回るnodeを1つにまとめる。実データで遊んでいたnodeはCPUのピークが
+/// 15%未満、ディスク7%未満、iowait 0.1%未満で、詰まっていたnodeとは桁が違う。値の欠けたnodeは
+/// 遊んでいたとは言えないので、まとめずにそのまま出す。1台だけならまとめても短くならない。
+fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<BriefQuietHosts>) {
+    let quiet = |node: &BriefHostNode| {
+        node.cpu_busy_peak_percent.is_some_and(|value| value < 25.0)
+            && node
+                .busiest_core_peak_percent
+                .is_some_and(|value| value < 30.0)
+            && node.iowait_percent.is_none_or(|value| value < 5.0)
+            && node
+                .pressure
+                .as_ref()
+                .is_none_or(|pressure| pressure.peak_percent < 10.0)
+            && node.disk_util_peak_percent.is_none_or(|value| value < 20.0)
+    };
+    let (quiet, busy): (Vec<_>, Vec<_>) = nodes.into_iter().partition(quiet);
+    if quiet.len() < 2 {
+        let mut nodes = busy;
+        nodes.extend(quiet);
+        nodes.sort_by(|a, b| a.node.cmp(&b.node));
+        return (nodes, None);
+    }
+    let max = |values: &mut dyn Iterator<Item = Option<f64>>| values.flatten().reduce(f64::max);
+    let summary = BriefQuietHosts {
+        cpu_busy_peak_percent: max(&mut quiet.iter().map(|node| node.cpu_busy_peak_percent))
+            .unwrap_or_default(),
+        busiest_core_peak_percent: max(&mut quiet
+            .iter()
+            .map(|node| node.busiest_core_peak_percent))
+        .unwrap_or_default(),
+        iowait_percent: max(&mut quiet.iter().map(|node| node.iowait_percent)),
+        pressure_peak_percent: max(&mut quiet
+            .iter()
+            .map(|node| node.pressure.as_ref().map(|pressure| pressure.peak_percent))),
+        disk_util_peak_percent: max(&mut quiet.iter().map(|node| node.disk_util_peak_percent)),
+        nodes: quiet.into_iter().map(|node| node.node).collect(),
+    };
+    (busy, Some(summary))
+}
+
 fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
     let total_count = items.len();
     items.truncate(limit);
@@ -501,6 +737,292 @@ fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_run() -> crate::model::RunManifest {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 6, "id": "01a1017e-d070-71c2-a89f-0835b7c5d88e", "mode": "run",
+            "state": "complete", "started_at": "2026-09-19T00:00:00Z", "finished_at": null,
+            "hypothesis": "受取履歴の全走査を索引で無くし、/loginの遅延と減点を減らす",
+            "source": {"repository": ".", "git_available": true,
+                "commit_hash": "288ecdfda281d39efa09ca11f32b3c21e9ef9c38", "branch": "main",
+                "dirty": false, "state_sha256": "", "untracked": [], "error": null},
+            "benchmark": {"mode": "command", "command": [], "exit_code": 0, "score": 5386,
+                "passed": true, "messages": [], "error": null},
+            "collectors": [], "logs": [], "metric_count": 0, "transition_count": 0
+        }))
+        .unwrap()
+    }
+
+    fn host(node: &str, busy: f64, core: f64, disk: f64) -> BriefHostNode {
+        BriefHostNode {
+            node: node.into(),
+            cpu_busy_percent: Some(busy / 2.0),
+            cpu_busy_peak_percent: Some(busy),
+            busiest_core_peak_percent: Some(core),
+            iowait_percent: Some(0.1),
+            steal_percent: None,
+            pressure: Some(BriefPressure {
+                resource: "io".into(),
+                peak_percent: 2.0,
+            }),
+            load1_peak: None,
+            memory_used_peak_bytes: None,
+            disk_util_peak_percent: Some(disk),
+            top_services: Vec::new(),
+            detail_rows: 10,
+        }
+    }
+
+    #[test]
+    fn idle_samples_do_not_take_the_cpu_ranking() {
+        let row = |process: &str, symbol: &str| CpuSummary {
+            process: process.into(),
+            symbol: symbol.into(),
+            ..Default::default()
+        };
+        assert!(is_idle(&row("swapper", "native_safe_halt")));
+        // idle taskの中でも割り込み処理は仕事なので順位に残す。
+        assert!(!is_idle(&row("swapper", "__softirqentry_text_start")));
+        assert!(!is_idle(&row("mysqld", "native_safe_halt")));
+    }
+
+    #[test]
+    fn quiet_nodes_are_folded_and_nodes_with_missing_values_are_kept() {
+        let mut unknown = host("app5", 3.0, 3.0, 1.0);
+        unknown.busiest_core_peak_percent = None;
+        let (hosts, quiet) = split_quiet_hosts(vec![
+            host("app1", 60.0, 72.0, 100.0),
+            host("app2", 5.5, 5.8, 2.8),
+            host("app3", 14.4, 15.7, 6.4),
+            unknown,
+        ]);
+        let names = hosts
+            .iter()
+            .map(|host| host.node.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["app1", "app5"]);
+        let quiet = quiet.unwrap();
+        assert_eq!(quiet.nodes, ["app2", "app3"]);
+        assert_eq!(quiet.cpu_busy_peak_percent, 14.4);
+        assert_eq!(quiet.disk_util_peak_percent, Some(6.4));
+        // 遊んでいたnodeが1台だけなら、まとめずにそのまま出す。
+        let (hosts, quiet) = split_quiet_hosts(vec![
+            host("app2", 5.0, 5.0, 2.0),
+            host("app1", 60.0, 72.0, 100.0),
+        ]);
+        assert!(quiet.is_none());
+        assert_eq!(hosts[0].node, "app1");
+    }
+
+    fn review_with(reason: &str, body: &str) -> crate::changes::RunReview {
+        let source = crate::model::SourceSnapshot {
+            commit_hash: Some("288ecdfda281d39efa09ca11f32b3c21e9ef9c38".into()),
+            dirty: true,
+            state_sha256: "6c67fe53".repeat(8),
+            ..Default::default()
+        };
+        crate::changes::RunReview {
+            latest_analysis: Some(crate::model::RunAnalysis {
+                id: "analysis".into(),
+                created_at: chrono::Utc::now(),
+                verdict: crate::model::AnalysisVerdict::Supported,
+                body: body.into(),
+                base_run_id: Some("01a10172-4d7a-71a3-80c3-cb2a224dc72b".into()),
+            }),
+            comparison: None,
+            changes: vec![crate::changes::ChangeSummary {
+                change: crate::changes::Change {
+                    schema_version: 1,
+                    id: "receipt-index".into(),
+                    description: "受取履歴へ複合索引を張る".into(),
+                    created_at: chrono::Utc::now(),
+                    target: Some("commit 288ecdfda281".into()),
+                },
+                latest_decision: Some(crate::changes::Decision {
+                    schema_version: 1,
+                    id: "decision".into(),
+                    change_id: "receipt-index".into(),
+                    created_at: chrono::Utc::now(),
+                    status: crate::changes::DecisionStatus::Accepted,
+                    reason: reason.into(),
+                    revisit: None,
+                    evidence: vec![crate::changes::Evidence {
+                        run_id: "01a1017e-d070-71c2-a89f-0835b7c5d88e".into(),
+                        source,
+                    }],
+                }),
+            }],
+            changes_truncated: false,
+        }
+    }
+
+    #[test]
+    fn review_drops_the_repeated_reason_and_cuts_long_text() {
+        let body = "減点が減った。".repeat(60);
+        let brief = review(review_with(&body, &body));
+        let analysis = brief.latest_analysis.unwrap();
+        assert_eq!(analysis.base_run.as_deref(), Some("224dc72b"));
+        assert_eq!(analysis.body.chars().count(), EXCERPT_CHARS + 1);
+        assert!(analysis.full_text.unwrap().contains("run_analyses"));
+        let change = &brief.changes[0];
+        assert_eq!(change.status, Some("accepted"));
+        assert!(change.reason.is_none() && change.reason_same_as_analysis);
+        assert_eq!(change.evidence, ["b7c5d88e 288ecdfda281 dirty"]);
+        // 分析と違う理由は、短ければそのまま出し、全文への案内も付けない。
+        let brief = review(review_with("索引で走査行が減った", &body));
+        assert_eq!(
+            brief.changes[0].reason.as_deref(),
+            Some("索引で走査行が減った")
+        );
+        assert!(!brief.changes[0].reason_same_as_analysis);
+        assert!(brief.changes[0].full_text.is_none());
+    }
+
+    /// AIのtool出力の上限（Codexでは約4500 tokens）を超えると、真ん中のsectionが削られる。
+    /// 5 nodeで各sectionが埋まった忙しいrunでも、上限に余裕を持って収まる大きさに保つ。
+    #[test]
+    fn a_busy_five_node_brief_fits_the_tool_output_budget() {
+        let nodes = (1..=5)
+            .map(|index| format!("practice-12-fifth-20261003-app{index}"))
+            .collect::<Vec<_>>();
+        let http = (0..18)
+            .map(|index| HttpRouteSummary {
+                node: nodes[0].clone(),
+                method: "POST".into(),
+                route: format!("/user/:userId/present/receive/{index}"),
+                count: 584.0,
+                total_ms: Some(633035.0),
+                avg_ms: Some(1083.964),
+                min_ms: Some(1.0),
+                p50_ms: Some(334.0),
+                p95_ms: Some(5458.0),
+                p99_ms: Some(6525.0),
+                max_ms: Some(10000.0),
+                errors: 195.0,
+                error_rate: Some(0.333904),
+                response_bytes: Some(611933.0),
+                status_counts: ["1xx", "2xx", "3xx", "4xx", "5xx"]
+                    .into_iter()
+                    .map(|status| (status.into(), 100.0))
+                    .collect(),
+            })
+            .collect();
+        let database = (0..50)
+            .map(|index| DatabaseSummary {
+                node: nodes[0].clone(),
+                engine: "mysql".into(),
+                digest: format!(
+                    "SELECT * FROM `user_present_all_received_history` WHERE `user_id`=N AND `present_all_id` IN (N, N, N) AND `deleted_at` IS NULL ORDER BY `created_at` DESC /* {index} */"
+                ),
+                source: "slp".into(),
+                window: Some("load".into()),
+                calls: 9512.0,
+                total_ms: 861649.247,
+                avg_ms: Some(90.585),
+                p95_ms: Some(173.887),
+                p99_ms: Some(209.11),
+                max_ms: Some(1200.5),
+                lock_ms: 12.5,
+                rows_sent: 9512.0,
+                rows_examined: 241836.0,
+                rows_examined_per_call: Some(241836.0),
+                ..Default::default()
+            })
+            .collect();
+        let cpu = nodes
+            .iter()
+            .flat_map(|node| {
+                std::iter::once(CpuSummary {
+                    node: node.clone(),
+                    process: "swapper".into(),
+                    binary: "[kernel.kallsyms]".into(),
+                    symbol: "native_safe_halt".into(),
+                    source: "perf-series".into(),
+                    sample_percent: 96.9,
+                })
+                .chain((0..10).map(|index| CpuSummary {
+                    node: node.clone(),
+                    process: "connection".into(),
+                    binary: "mysqld".into(),
+                    symbol: format!("btr_cur_search_to_nth_level_{index}"),
+                    source: "perf-series".into(),
+                    sample_percent: 4.49,
+                }))
+            })
+            .collect();
+        let host = nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(index, node)| {
+                let busy = if index == 0 { 90.0 } else { 5.0 };
+                [
+                    ("host.cpu_busy_percent", busy, BTreeMap::new()),
+                    (
+                        "host.core_busy_percent",
+                        busy,
+                        BTreeMap::from([("core".into(), "0".into())]),
+                    ),
+                    ("host.cpu_iowait_percent", busy / 2.0, BTreeMap::new()),
+                    ("host.disk_util_percent", busy, BTreeMap::new()),
+                    ("host.load1", 2.0, BTreeMap::new()),
+                    ("host.memory_used_bytes", 1957359616.0, BTreeMap::new()),
+                ]
+                .into_iter()
+                .map(|(metric, value, labels)| HostSummary {
+                    node: node.clone(),
+                    metric: metric.into(),
+                    target: "host".into(),
+                    source: "sysstat".into(),
+                    labels,
+                    unit: "percent".into(),
+                    aggregation: crate::metric_semantics::MetricAggregation::Average,
+                    value: Some(value),
+                    peak: value,
+                    peak_at: None,
+                    samples: 20,
+                })
+                .collect::<Vec<_>>()
+            })
+            .collect();
+        let empty = || {
+            query::metric_query(
+                "run".into(),
+                Vec::new(),
+                query::MetricQueryOptions {
+                    scope: query::QueryScope::Run,
+                    window: None,
+                    metrics: Vec::new(),
+                    metric_prefix: None,
+                    node: None,
+                    source: None,
+                    labels: Vec::new(),
+                    label_contains: Vec::new(),
+                    group_by: Vec::new(),
+                    limit: usize::MAX,
+                },
+            )
+        };
+        let diagnostics = RunDiagnostics {
+            run: test_run(),
+            coverage: Vec::new(),
+            http,
+            database,
+            cpu,
+            host,
+            client: Vec::new(),
+            host_window: "load",
+            upstreams: Vec::new(),
+            artifacts: Vec::new(),
+            transitions: Vec::new(),
+        };
+        let mut brief = build(diagnostics, empty(), empty(), 5);
+        let long = "受取履歴の旧単発SELECTは995回・合計373401.675ms。".repeat(20);
+        brief.review = Some(review(review_with(&long, &long)));
+        assert!(brief.cpu.items.iter().all(|row| row.process != "swapper"));
+        assert_eq!(brief.hosts.len(), 1);
+        let size = serde_json::to_vec(&brief).unwrap().len();
+        assert!(size <= 12_000, "brief is {size} bytes");
+    }
 
     #[test]
     fn database_shows_an_empty_load_rather_than_falling_back_to_initialize() {

@@ -1740,8 +1740,10 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
         },
     );
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
-    brief.review = Some(review);
-    write_stdout_json(&brief)?;
+    brief.review = Some(brief::review(review));
+    // AIのtool出力には上限があり、超えると真ん中から削られる。字下げを付けない。
+    serde_json::to_writer(std::io::stdout().lock(), &brief)?;
+    println!();
     Ok(())
 }
 

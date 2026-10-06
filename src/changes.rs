@@ -219,14 +219,14 @@ fn comparison_conditions(
 
     let environment = match (base_environment, candidate_environment) {
         (Some(before), Some(after)) => {
-            let mut differences = before
-                .keys()
-                .chain(after.keys())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .filter(|key| before.get(*key) != after.get(*key))
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut differences = group_by_node(
+                before
+                    .keys()
+                    .chain(after.keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|key| before.get(*key) != after.get(*key)),
+            );
             if differences.is_empty() {
                 condition("environment", ConditionState::Same, Vec::new())
             } else {
@@ -270,6 +270,38 @@ fn comparison_conditions(
     };
     conditions.push(benchmark);
     conditions
+}
+
+/// fingerprintの鍵（`[name, labels]`のJSON）を、node以外が同じものごとに1行へまとめる。
+/// 同じfileを全nodeへ配ると、nodeの数だけ同じ差分が並んでしまう。
+fn group_by_node<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for key in keys {
+        let Ok((name, mut labels)) =
+            serde_json::from_str::<(String, std::collections::BTreeMap<String, String>)>(key)
+        else {
+            groups.entry(key.clone()).or_default();
+            continue;
+        };
+        let node = labels.remove("node");
+        let rest = labels
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>();
+        let label = if rest.is_empty() {
+            name
+        } else {
+            format!("{name}{{{}}}", rest.join(","))
+        };
+        groups.entry(label).or_default().extend(node);
+    }
+    groups
+        .into_iter()
+        .map(|(label, nodes)| match nodes.as_slice() {
+            [] => label,
+            _ => format!("{label} on {}", nodes.join(", ")),
+        })
+        .collect()
 }
 
 fn validate_id(id: &str) -> Result<()> {
@@ -582,5 +614,37 @@ impl Store {
             tx.commit()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_differences_name_each_change_once_with_its_nodes() {
+        let key = |name: &str, labels: &[(&str, &str)]| {
+            let labels = labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::to_string(&(name, labels)).unwrap()
+        };
+        let keys = [
+            key("file.sha256", &[("node", "app1")]),
+            key("file.sha256", &[("node", "app2")]),
+            key("service.state", &[("node", "app1"), ("service", "nginx")]),
+            key("kernel", &[]),
+            "not json".to_owned(),
+        ];
+        assert_eq!(
+            group_by_node(keys.iter()),
+            [
+                "file.sha256 on app1, app2",
+                "kernel",
+                "not json",
+                "service.state{service=nginx} on app1",
+            ]
+        );
     }
 }

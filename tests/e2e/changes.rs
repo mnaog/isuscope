@@ -23,6 +23,11 @@ fn json(project: &std::path::Path, args: &[&str]) -> Value {
     serde_json::from_str(&ok(project, args)).unwrap()
 }
 
+/// briefがrunを示す短縮形（`isuscope run`が表示するもの）。
+fn short(id: &str) -> &str {
+    &id[id.len() - 8..]
+}
+
 fn config(project: &std::path::Path, score: i64) {
     fs::write(project.join(".isuscope/config.toml"), format!(
         "[benchmark]\nmode = \"command\"\ncommand = [\"sh\", \"-c\", \"echo '{{\\\"type\\\":\\\"isuscope.result\\\",\\\"score\\\":{score},\\\"pass\\\":true}}'\"]\n"
@@ -173,12 +178,9 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         brief["review"]["latest_analysis"]["verdict"],
         "inconclusive"
     );
-    assert_eq!(brief["review"]["latest_analysis"]["base_run_id"], base);
+    assert_eq!(brief["review"]["latest_analysis"]["base_run"], short(&base));
     assert_eq!(brief["review"]["comparison"]["score"]["delta"], -10);
-    assert_eq!(
-        brief["review"]["changes"][0]["latest_decision"]["status"],
-        "accepted"
-    );
+    assert_eq!(brief["review"]["changes"][0]["status"], "accepted");
     assert!(
         json(p, &["change", "list", "--status", "provisional"])["changes"]
             .as_array()
@@ -236,7 +238,10 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     }
     assert_eq!(json(p, &["change", "show", "items"]), history);
     let restored = json(p, &["brief", &candidate]);
-    assert_eq!(restored["review"]["latest_analysis"]["base_run_id"], base);
+    assert_eq!(
+        restored["review"]["latest_analysis"]["base_run"],
+        short(&base)
+    );
     let db = Connection::open(p.join(".isuscope/isuscope.sqlite3")).unwrap();
     assert_eq!(
         db.query_row("SELECT count(*) FROM change_decisions", [], |r| r
