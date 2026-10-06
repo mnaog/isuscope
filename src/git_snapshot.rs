@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
-use walkdir::WalkDir;
 
 pub fn capture(repo: &Path, output_dir: &Path, excludes: &[PathBuf]) -> Result<SourceSnapshot> {
     fs::create_dir_all(output_dir)?;
@@ -104,29 +103,7 @@ fn capture_without_git(
     git_error: String,
 ) -> Result<SourceSnapshot> {
     let mut files = Vec::new();
-    let walker = WalkDir::new(repo)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            let Ok(relative) = entry.path().strip_prefix(repo) else {
-                return false;
-            };
-            relative.as_os_str().is_empty() || !is_excluded(relative, excludes)
-        });
-    for entry in walker {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = match path.strip_prefix(repo) {
-            Ok(relative) => relative,
-            Err(_) => continue,
-        };
-        if path.is_file() {
-            files.push(FileDigest {
-                path: relative.display().to_string(),
-                sha256: sha256_file(path)?,
-            });
-        }
-    }
+    collect_files(repo, repo, excludes, &mut files)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     let mut state = Sha256::new();
     for file in &files {
@@ -145,6 +122,34 @@ fn capture_without_git(
     };
     write_snapshot(output_dir, &snapshot)?;
     Ok(snapshot)
+}
+
+/// Symlinked directories are not descended; symlinked files are hashed through the link.
+fn collect_files(
+    repo: &Path,
+    dir: &Path,
+    excludes: &[PathBuf],
+    files: &mut Vec<FileDigest>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("cannot read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let Ok(relative) = path.strip_prefix(repo) else {
+            continue;
+        };
+        if is_excluded(relative, excludes) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            collect_files(repo, &path, excludes, files)?;
+        } else if path.is_file() {
+            files.push(FileDigest {
+                path: relative.display().to_string(),
+                sha256: sha256_file(&path)?,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn is_excluded(relative: &Path, configured: &[PathBuf]) -> bool {
