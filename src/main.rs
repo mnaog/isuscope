@@ -93,8 +93,7 @@ enum Commands {
         #[arg(long, default_value_t = 5, value_parser = parse_list_limit)]
         limit: usize,
     },
-    /// 保存済みindexへ読み取り専用のSQLを実行します。運用画面とbriefの全文案内が使います。
-    #[command(hide = true)]
+    /// 保存済みindexへ読み取り専用のSQLを実行します。briefとqueryで足りない問いに使います。
     Sql {
         /// 実行するSELECT。`--schema`と同時には指定できません。
         #[arg(conflicts_with = "schema", required_unless_present = "schema")]
@@ -1708,7 +1707,13 @@ fn write_rows_json(value: &impl serde::Serialize, identity: &[&str]) -> Result<(
 }
 
 fn hoist_common(value: &mut serde_json::Value, identity: &[&str]) {
-    let Some(rows) = value.get("rows").and_then(serde_json::Value::as_array) else {
+    // briefの表は`items`に行を持つ。
+    let field = if value.get("rows").is_some() {
+        "rows"
+    } else {
+        "items"
+    };
+    let Some(rows) = value.get(field).and_then(serde_json::Value::as_array) else {
         return;
     };
     if rows.len() < 2 {
@@ -1741,7 +1746,7 @@ fn hoist_common(value: &mut serde_json::Value, identity: &[&str]) {
         return;
     }
     if let Some(rows) = value
-        .get_mut("rows")
+        .get_mut(field)
         .and_then(serde_json::Value::as_array_mut)
     {
         for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
@@ -1909,16 +1914,25 @@ fn table(value: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
     (serde_json::json!(columns), serde_json::Value::Array(rows))
 }
 
-/// 件数のように小数部の無い値を`584.0`ではなく`584`で書く。
+/// 小数は3桁まで（0.001未満は有効数字3桁）に丸め、件数のように小数部の無い値は`584.0`ではなく
+/// `584`で書く。
 fn integral_numbers(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Number(number) => {
-            if let Some(float) = number.as_f64().filter(|_| number.is_f64())
-                && float.fract() == 0.0
-                && float.abs() < 9.0e15
-            {
-                *value = serde_json::Value::from(float as i64);
-            }
+            let Some(float) = number.as_f64().filter(|_| number.is_f64()) else {
+                return;
+            };
+            let float = if float == 0.0 || float.abs() >= 0.001 {
+                (float * 1000.0).round() / 1000.0
+            } else {
+                let scale = 10f64.powi(2 - float.abs().log10().floor() as i32);
+                (float * scale).round() / scale
+            };
+            *value = if float.fract() == 0.0 && float.abs() < 9.0e15 {
+                serde_json::Value::from(float as i64)
+            } else {
+                serde_json::Number::from_f64(float).map_or(serde_json::Value::Null, Into::into)
+            };
         }
         serde_json::Value::Array(items) => items.iter_mut().for_each(integral_numbers),
         serde_json::Value::Object(fields) => fields.values_mut().for_each(integral_numbers),
@@ -1968,6 +1982,19 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
     );
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
     brief.review = Some(brief::review(review));
+    let mut brief = serde_json::to_value(&brief)?;
+    for (section, identity) in [
+        ("benchmark", &["unit", "aggregation", "samples"][..]),
+        ("score_inputs", &["unit", "aggregation", "samples"][..]),
+        ("http", &["node", "method"][..]),
+        ("database", &["node", "engine", "source", "window"][..]),
+        ("cpu", &["node", "source"][..]),
+        ("upstreams", &["node"][..]),
+    ] {
+        if let Some(section) = brief.get_mut(section) {
+            hoist_common(section, identity);
+        }
+    }
     write_stdout_json(&brief)
 }
 

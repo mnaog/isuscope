@@ -142,7 +142,7 @@ pub async fn execute(
     };
     store.begin(&manifest)?;
 
-    print_header(&manifest, &config);
+    print_header(&manifest);
     let mut metrics = Vec::new();
     let mut fingerprints = Vec::new();
     let mut transitions = Vec::new();
@@ -262,7 +262,7 @@ pub async fn execute(
     manifest.metric_count = metrics.len();
     manifest.fingerprint_count = fingerprints.len();
     manifest.transition_count = transitions.len();
-    let final_dir = store.finish(&manifest, &metrics, &fingerprints, &transitions)?;
+    store.finish(&manifest, &metrics, &fingerprints, &transitions)?;
 
     println!();
     println!("run       {}", short_id(&id));
@@ -301,7 +301,6 @@ pub async fn execute(
         );
     }
     println!("analysis  {}", manifest.analysis_status.as_str());
-    println!("saved     {}", final_dir.display());
     if manifest.analysis_status == AnalysisStatus::Pending {
         println!();
         println!(
@@ -377,7 +376,7 @@ fn absorb(
     }
 }
 
-fn print_header(manifest: &RunManifest, config: &LoadedConfig) {
+fn print_header(manifest: &RunManifest) {
     println!("run       {}", short_id(&manifest.id));
     println!("mode      {}", manifest.mode.as_str());
     println!("hypothesis {}", manifest.hypothesis);
@@ -404,7 +403,6 @@ fn print_header(manifest: &RunManifest, config: &LoadedConfig) {
             short_id(&context.input_id)
         );
     }
-    println!("data      {}", config.data_dir.display());
     println!();
 }
 

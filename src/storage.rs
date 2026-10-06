@@ -39,6 +39,8 @@ pub struct RunSummary {
     /// The form printed by `run` and accepted everywhere a run is named.
     pub short_id: String,
     pub started_at: String,
+    /// 先頭12桁（ほかの出力の短縮commitと同じ）。完全な値は`brief`の`run`にある。
+    #[serde(serialize_with = "short_commit")]
     pub commit_hash: Option<String>,
     pub dirty: bool,
     pub mode: String,
@@ -54,6 +56,16 @@ pub struct RunSummary {
     /// First parser failure message of a run that did not pass.
     #[serde(rename = "failure_reason")]
     pub failure: Option<String>,
+}
+
+fn short_commit<S: serde::Serializer>(
+    commit: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match commit {
+        Some(commit) => serializer.serialize_str(&commit[..commit.len().min(12)]),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[derive(Debug, Default)]

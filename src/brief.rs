@@ -845,7 +845,7 @@ mod tests {
         let analysis = brief.latest_analysis.unwrap();
         assert_eq!(analysis.base_short_id.as_deref(), Some("224dc72b"));
         assert_eq!(analysis.body.chars().count(), EXCERPT_CHARS + 1);
-        assert!(analysis.full_text.unwrap().contains("run_analyses"));
+        assert!(analysis.full_text.unwrap().starts_with("isuscope sql"));
         let change = &brief.changes[0];
         assert_eq!(change.status, Some("accepted"));
         assert!(change.reason.is_none() && change.reason_same_as_analysis);

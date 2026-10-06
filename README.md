@@ -117,20 +117,21 @@ isuscope doctor
 | `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
+| `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 
-`list`、`brief`、`series`、`query`、`change`は機械処理しやすいJSONを返します。同じ形の行が並ぶ表は、列名を`columns`に1回だけ置き、`rows`の各行を値の並びにします。キーは「対象_統計_単位」（例: `cpu_busy_max_percent`、`p95_ms`）で、統計は`avg`・`max`・`min`・`p95`・`total`、メモリはMiBです。`query --base`の各行は、行を識別する値（node、route、digest、metricとlabelsなど）、`presence`、値ごとの比較元（`calls_base`）と対象（`calls`）を並べ、主要な値（回数・合計・平均・p95、HTTPはエラー数も）には差（`calls_delta`、`calls_delta_percent`）も付けます。全行で同じ識別値は出力の`common`へ1回だけ出します。比較しない`query`でも、全行で同じnode・source・window・labelなどは`common`へ1回だけ出します。行を返す出力は約12KBを超えないよう末尾の行を減らし、そのときは`truncated`と`warnings`で伝えます（全行が要るときは`ISUSCOPE_OUTPUT_BYTES=0`）。`series`はmetricごとの単位と集計方法を`metrics`に1回だけ置き、`coverage`には完了しなかったcollectorだけを並べます。`--group-by sql-shape`の行では`digest`が文の形になり、元の文が2種類以上あるときだけ`digest_examples`に並べます。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice）で、全nodeの状況を最初の1画面で見切るためのものです。CPU・コア・iowait・PSI・diskがどれも低かったnodeが2台以上あれば、`quiet_hosts`へ名前と最大値だけをまとめます（負荷を振り分ける余地として読みます）。`cpu`はidle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。`review`は分析・変更の本文を冒頭だけにし、全文を読む命令を`full_text`に添えます。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは、索引のSQLite（`data_dir`の`isuscope.sqlite3`。既定は`.isuscope/isuscope.sqlite3`）を`sqlite3 -readonly`で直接引きます（`.schema`でtable定義）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・SQLiteで取得できます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+`list`、`brief`、`series`、`query`、`sql`、`change`は機械処理しやすいJSONを返します。同じ形の行が並ぶ表は、列名を`columns`に1回だけ置き、`rows`の各行を値の並びにします。キーは「対象_統計_単位」（例: `cpu_busy_max_percent`、`p95_ms`）で、統計は`avg`・`max`・`min`・`p95`・`total`、メモリはMiBです。`query --base`の各行は、行を識別する値（node、route、digest、metricとlabelsなど）、`presence`、値ごとの比較元（`calls_base`）と対象（`calls`）を並べ、主要な値（回数・合計・平均・p95、HTTPはエラー数も）には差（`calls_delta`、`calls_delta_percent`）も付けます。全行で同じ識別値は出力の`common`へ1回だけ出します。比較しない`query`でも、全行で同じnode・source・window・labelなどは`common`へ1回だけ出します。行を返す出力は約12KBを超えないよう末尾の行を減らし、そのときは`truncated`と`warnings`で伝えます（全行が要るときは`ISUSCOPE_OUTPUT_BYTES=0`）。`series`はmetricごとの単位と集計方法を`metrics`に1回だけ置き、`coverage`には完了しなかったcollectorだけを並べます。`--group-by sql-shape`の行では`digest`が文の形になり、元の文が2種類以上あるときだけ`digest_examples`に並べます。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice）で、全nodeの状況を最初の1画面で見切るためのものです。CPU・コア・iowait・PSI・diskがどれも低かったnodeが2台以上あれば、`quiet_hosts`へ名前と最大値だけをまとめます（負荷を振り分ける余地として読みます）。`cpu`はidle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。`review`は分析・変更の本文を冒頭だけにし、全文を読む命令を`full_text`に添えます。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取得できます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
 
-どのmetricがあるかはSQLiteで調べます。runごとの件数・単位・時系列の有無と、labelの種類がこれで分かります。
+どのmetricがあるかは`sql`で調べます。runごとの件数・単位・時系列の有無と、labelの種類がこれで分かります。
 
 ```console
-sqlite3 -readonly -header .isuscope/isuscope.sqlite3 "SELECT name, COUNT(*) samples, SUM(observed_at IS NOT NULL) timestamped,
+isuscope sql "SELECT name, COUNT(*) samples, SUM(observed_at IS NOT NULL) timestamped,
   GROUP_CONCAT(DISTINCT unit) units FROM metrics
   WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1)
-  GROUP BY name ORDER BY samples DESC"
-sqlite3 -readonly -header .isuscope/isuscope.sqlite3 "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metrics m, json_each(m.labels_json) j
-  WHERE m.run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) GROUP BY j.key"
+  GROUP BY name ORDER BY samples DESC" --format tsv
+isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metrics m, json_each(m.labels_json) j
+  WHERE m.run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) GROUP BY j.key" --format tsv
 ```
 
 ```console
@@ -171,7 +172,7 @@ parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","catego
 
 ### 最初のrunで確認すること
 
-`survey-run`を1回通したら、`brief`で次を確かめてから改善へ進みます。`coverage_issues`が空であること、HTTP routeに動的IDが残っていないこと（残っていれば`routes suggest`）、`perf`系collectorが対象nodeで`complete`であること、transitionが0件でないこと（sessionのfieldがある場合）、benchmark stdout/stderrが保存されていることです。collectorが失敗したときは、`sqlite3 -readonly -header .isuscope/isuscope.sqlite3 "SELECT name, node, status, error FROM collector_runs WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) AND status!='"'"'complete'"'"'"`で原因を見て、run directoryの`logs/`にある該当collectorのstderrを開きます。`degraded`はベンチがPASSでもcollectorが失敗した状態です。観測条件を変えたrunは、その前後のscore比較に使いません。
+`survey-run`を1回通したら、`brief`で次を確かめてから改善へ進みます。`coverage_issues`が空であること、HTTP routeに動的IDが残っていないこと（残っていれば`routes suggest`）、`perf`系collectorが対象nodeで`complete`であること、transitionが0件でないこと（sessionのfieldがある場合）、benchmark stdout/stderrが保存されていることです。collectorが失敗したときは、`isuscope sql "SELECT name, node, status, error FROM collector_runs WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) AND status!='"'"'complete'"'"'" --format tsv`で原因を見て、run directoryの`logs/`にある該当collectorのstderrを開きます。`degraded`はベンチがPASSでもcollectorが失敗した状態です。観測条件を変えたrunは、その前後のscore比較に使いません。
 
 ### 得点が何でできているかを確定する
 

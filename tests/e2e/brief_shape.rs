@@ -259,7 +259,8 @@ parser = "slp-windows"
     let brief: serde_json::Value = parsed(&isuscope(&["brief", "latest"]).stdout).unwrap();
     assert_eq!(brief["database_window"], "load");
     let top = &brief["database"]["rows"][0];
-    assert_eq!(top["window"], "load");
+    // 全行で同じ区間は表の`common`に1回だけ出る。
+    assert_eq!(brief["database"]["common"]["window"], "load");
     assert!(
         top["digest"].as_str().unwrap().contains("id_generator"),
         "{top}"
