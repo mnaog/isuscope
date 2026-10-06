@@ -216,12 +216,12 @@ fn event_time(
     if let (Some(end), Some(seconds)) = (
         fields.get("msec").and_then(|v| parse_timestamp(v)),
         fields.get("reqtime").and_then(|v| v.parse::<f64>().ok()),
-    ) {
-        if seconds.is_finite() && (0.0..=86_400.0).contains(&seconds) {
-            let duration = chrono::Duration::microseconds((seconds * 1_000_000.0).round() as i64);
-            if let Some(start) = end.checked_sub_signed(duration) {
-                return Some((start, end, true));
-            }
+    ) && seconds.is_finite()
+        && (0.0..=86_400.0).contains(&seconds)
+    {
+        let duration = chrono::Duration::microseconds((seconds * 1_000_000.0).round() as i64);
+        if let Some(start) = end.checked_sub_signed(duration) {
+            return Some((start, end, true));
         }
     }
     let at = fields.get(time_field).and_then(|v| parse_timestamp(v))?;
