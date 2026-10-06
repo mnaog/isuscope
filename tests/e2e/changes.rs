@@ -68,6 +68,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         .as_str()
         .unwrap()
         .to_owned();
+    // A change is created by the analysis that first decides it.
     ok(
         p,
         &[
@@ -78,36 +79,48 @@ fn decisions_are_independent_recoverable_and_concurrent() {
             &base[..12],
             "--analysis",
             "queries improved; score fell",
-        ],
-    );
-
-    ok(
-        p,
-        &[
-            "change",
-            "create",
+            "--change",
             "items",
+            "--decision",
+            "deferred",
             "--description",
             "<script>items</script>",
-            "--target",
-            "existing-row update only",
         ],
     );
-    assert!(
-        !cli(
-            p,
-            &["change", "create", "../escape", "--description", "bad"]
-        )
-        .status
-        .success()
-    );
-    assert!(
-        !cli(
-            p,
-            &["change", "create", "items", "--description", "overwrite"]
-        )
-        .status
-        .success()
+    let created = json(p, &["change", "show", "items"]);
+    assert_eq!(created["change"]["description"], "<script>items</script>");
+    // A rejected change leaves no analysis behind.
+    for args in [
+        [
+            "--change",
+            "../escape",
+            "--decision",
+            "accepted",
+            "--description",
+            "bad",
+        ],
+        [
+            "--change",
+            "items",
+            "--decision",
+            "accepted",
+            "--description",
+            "overwrite",
+        ],
+    ] {
+        let mut command = vec![
+            "analyze",
+            &candidate,
+            "inconclusive",
+            "--analysis",
+            "rejected",
+        ];
+        command.extend(args);
+        assert!(!cli(p, &command).status.success(), "{args:?}");
+    }
+    assert_eq!(
+        json(p, &["brief", &candidate])["review"]["latest_analysis"]["body"],
+        "queries improved; score fell"
     );
     assert!(
         !cli(
@@ -214,7 +227,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         assert!(child.wait().unwrap().success());
     }
     let history = json(p, &["change", "show", "items"]);
-    assert_eq!(history["decisions"].as_array().unwrap().len(), 4);
+    assert_eq!(history["decisions"].as_array().unwrap().len(), 5);
     assert_eq!(
         history["decisions"][0]["evidence"]
             .as_array()
@@ -247,13 +260,13 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         db.query_row("SELECT count(*) FROM change_decisions", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         db.query_row("SELECT count(*) FROM change_decision_runs", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        5
+        7
     );
     assert_eq!(
         db.query_row(
@@ -288,24 +301,19 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     ok(
         p,
         &[
-            "change",
-            "create",
+            "analyze",
+            &candidate,
+            "inconclusive",
+            "--base",
+            &base,
+            "--analysis",
+            "investigate separately",
+            "--change",
             "registration",
+            "--decision",
+            "deferred",
             "--description",
             "registration lookup",
-        ],
-    );
-    ok(
-        p,
-        &[
-            "change",
-            "decide",
-            "registration",
-            "deferred",
-            "--run",
-            &candidate,
-            "--reason",
-            "investigate separately",
         ],
     );
     assert_eq!(
@@ -328,7 +336,7 @@ fn analyze_records_a_change_decision_with_the_analysis() {
         .as_str()
         .unwrap()
         .to_owned();
-    // A skipped analysis takes its reason through --analysis as well as --reason.
+    // A skipped analysis takes its reason through --analysis.
     ok(
         p,
         &["analyze", &base, "skipped", "--analysis", "baseline only"],

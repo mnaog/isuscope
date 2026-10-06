@@ -233,12 +233,8 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
     }
 }
 
-/// 冒頭[`EXCERPT_CHARS`]文字と、切ったかどうか。
 fn excerpt(text: &str) -> (String, bool) {
-    match text.char_indices().nth(EXCERPT_CHARS) {
-        Some((end, _)) => (format!("{}…", &text[..end]), true),
-        None => (text.to_owned(), false),
-    }
+    crate::model::excerpt(text, EXCERPT_CHARS)
 }
 
 /// ベンチ側がそのnodeへの接続をどう使ったか。

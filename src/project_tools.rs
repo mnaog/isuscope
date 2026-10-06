@@ -1,57 +1,12 @@
-//! Repository-side helpers for saved runs: staging raw logs and proposing route rules.
+//! Repository-side helpers for saved runs: proposing route rules.
 
 use crate::{config::LoadedConfig, storage::Store};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
-    process::Command,
 };
-
-/// Stages a run in Git including its raw `logs/`, which projects normally ignore.
-pub fn pin(config: &LoadedConfig, requested: &str) -> Result<String> {
-    let store = Store::open(&config.data_dir)?;
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run not found: {requested}"))?;
-    // Keep enrich/analyze from changing the manifest (and therefore its dependency set)
-    // between resolving the run and staging it.
-    let _lock = store.lock_run(&id)?;
-    let run_dir = store.final_dir(&id);
-    let repo = config.source_repo();
-    let repo = repo.canonicalize().unwrap_or(repo);
-    let run_dir = run_dir.canonicalize().unwrap_or(run_dir);
-    let relative = run_dir
-        .strip_prefix(&repo)
-        .with_context(|| format!("run {} is outside source repository {}", id, repo.display()))?;
-    if !run_dir.join("run.json").is_file() {
-        bail!("run.json not found: {}", relative.display());
-    }
-    if !run_dir.join("logs").is_dir() {
-        bail!("logs not found: {}/logs", relative.display());
-    }
-    // Stage the complete run dependency tree even when the data directory is ignored. `-A`
-    // also removes snapshots and parser logs from an older enrichment generation from the index.
-    git_add(&repo, &["-f", "-A"], &[relative.to_path_buf()])?;
-    Ok(id)
-}
-
-fn git_add(repo: &Path, flags: &[&str], paths: &[std::path::PathBuf]) -> Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("add")
-        .args(flags)
-        .arg("--")
-        .args(paths)
-        .status()
-        .context("cannot run git add")?;
-    if !status.success() {
-        bail!("git add failed with {status}");
-    }
-    Ok(())
-}
 
 const SEGMENTS: &[(&str, &str, &str)] = &[
     (r"^[0-9]+$", ":id", "[0-9]+"),

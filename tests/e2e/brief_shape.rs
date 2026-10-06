@@ -343,3 +343,45 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"db.query.
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("no per-window database rows"));
 }
+
+/// initializeの終わりが分からないrunでは、slpは全体を`whole`にまとめる。そこで`--window load`を
+/// 選んでも、SQLが無かったかのような0件を返さずに`whole`を案内する。
+#[test]
+fn load_window_is_refused_when_the_run_was_not_split() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":1,\"pass\":true}'"]
+
+[[collectors]]
+name = "slp"
+phase = "after"
+transport = "local"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"db.query.calls\",\"value\":3,\"unit\":\"queries\",\"labels\":{\"digest\":\"select 1\",\"engine\":\"mysql\",\"window\":\"whole\"}}'"]
+"#,
+    )
+    .unwrap();
+    let isuscope = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap()
+    };
+    isuscope(&["run", "--hypothesis", "initializeの終わりが分からないrun"]);
+    let refused = isuscope(&["query", "latest", "--view", "database", "--window", "load"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("use --window whole"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let whole = isuscope(&["query", "latest", "--view", "database", "--window", "whole"]);
+    let rows: serde_json::Value = serde_json::from_slice(&whole.stdout).unwrap();
+    assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
+}

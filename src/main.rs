@@ -13,7 +13,7 @@ use isuscope::{
     storage::{RunSummary, Store},
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::{env, fs, path::PathBuf, process::ExitCode};
+use std::{env, path::PathBuf, process::ExitCode};
 
 #[derive(Parser)]
 #[command(name = "isuscope", version, about = "ISUCONのベンチ実行記録ツール")]
@@ -63,11 +63,6 @@ enum Commands {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// runを生ログ（通常はGit管理外の`logs/`）ごとGitへstageします。
-    Pin {
-        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
-        run: String,
-    },
     /// HTTP route正規化の規則候補を生成します。
     Routes {
         #[command(subcommand)]
@@ -88,9 +83,6 @@ enum Commands {
         /// 返すrun数の上限。
         #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
         limit: usize,
-        /// この時点以降に開始したrunだけを返します。`4h`、`30m`、`2d`などの経過時間かRFC 3339時刻。
-        #[arg(long, value_parser = parse_since)]
-        since: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// runの判断材料だけを小さい機械向けJSONで出力します。
     Brief {
@@ -101,7 +93,8 @@ enum Commands {
         #[arg(long, default_value_t = 5, value_parser = parse_list_limit)]
         limit: usize,
     },
-    /// 保存済みindexへ読み取り専用のSQLを実行します。briefとqueryで足りない問いに使います。
+    /// 保存済みindexへ読み取り専用のSQLを実行します。運用画面とbriefの全文案内が使います。
+    #[command(hide = true)]
     Sql {
         /// 実行するSELECT。`--schema`と同時には指定できません。
         #[arg(conflicts_with = "schema", required_unless_present = "schema")]
@@ -147,6 +140,10 @@ enum Commands {
         limit: usize,
     },
     /// 保存済みmetricをSQLiteから絞り込み、意味に沿って構造化JSONで返します。
+    #[command(after_help = "例:
+  isuscope query latest --base BASE_RUN --view http --label route=/api/user/:id --limit 20
+  isuscope query latest --base BASE_RUN --view database --window load --group-by sql-shape --label-contains digest=user_items --limit 20
+  isuscope query latest --scope series --window load --metric-prefix host. --node app1")]
     Query {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
         #[arg(default_value = "latest")]
@@ -206,14 +203,8 @@ enum Commands {
         #[arg(long)]
         base: Option<String>,
         /// 結果の分析本文。skippedでは省略する理由として扱います。
-        #[arg(long, conflicts_with = "analysis_file")]
-        analysis: Option<String>,
-        /// 結果の分析本文をUTF-8 fileから読み込みます。
-        #[arg(long, conflicts_with = "analysis")]
-        analysis_file: Option<PathBuf>,
-        /// 分析を省略する理由（skippedだけ。`--analysis`でも書けます）。
-        #[arg(long, conflicts_with_all = ["analysis", "analysis_file"])]
-        reason: Option<String>,
+        #[arg(long, required = true)]
+        analysis: String,
         /// 同時に採否を記録する変更ID。未作成なら作成します。
         #[arg(long, requires = "decision")]
         change: Option<String>,
@@ -266,14 +257,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ChangeCommand {
-    Create {
-        id: String,
-        #[arg(long)]
-        description: String,
-        /// commitや変更範囲の説明。
-        #[arg(long)]
-        target: Option<String>,
-    },
+    /// 既存の変更へ採否を追記します。変更は`analyze --change`が作ります。
     Decide {
         id: String,
         #[arg(value_enum)]
@@ -285,15 +269,15 @@ enum ChangeCommand {
         #[arg(long)]
         revisit: Option<String>,
     },
+    /// 変更を現在の採否で一覧します。
     List {
         #[arg(long, value_enum)]
         status: Option<isuscope::changes::DecisionStatus>,
         #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
         limit: usize,
     },
-    Show {
-        id: String,
-    },
+    /// 変更の説明と判断の全履歴を出力します。
+    Show { id: String },
 }
 
 #[derive(Subcommand)]
@@ -538,12 +522,6 @@ async fn real_main(cli: Cli) -> Result<bool> {
     let config = LoadedConfig::discover(&current)?;
     match cli.command {
         Commands::Init { .. } | Commands::Lock { .. } => unreachable!(),
-        Commands::Pin { run } => {
-            let id = isuscope::project_tools::pin(&config, &run)?;
-            println!("staged run including raw logs: {id}");
-            println!("review with: git diff --cached --stat");
-            Ok(true)
-        }
         Commands::Routes {
             command: RoutesCommand::Suggest { run, output },
         } => {
@@ -575,8 +553,8 @@ async fn real_main(cli: Cli) -> Result<bool> {
         )
         .await?
         .passed),
-        Commands::List { limit, since } => {
-            list_runs(&config, limit, since)?;
+        Commands::List { limit } => {
+            list_runs(&config, limit)?;
             Ok(true)
         }
         Commands::Brief { run, limit } => {
@@ -690,30 +668,13 @@ async fn real_main(cli: Cli) -> Result<bool> {
             run,
             verdict,
             base,
-            analysis,
-            analysis_file,
-            reason,
+            analysis: body,
             change,
             decision,
             description,
             revisit,
         } => {
             let skipped = matches!(verdict, VerdictArg::Skipped);
-            if reason.is_some() && !skipped {
-                anyhow::bail!("--reason may be used only with the skipped verdict");
-            }
-            let body = match (reason, analysis, analysis_file) {
-                (Some(body), None, None) | (None, Some(body), None) => body,
-                (None, None, Some(path)) => fs::read_to_string(&path)
-                    .with_context(|| format!("cannot read {}", path.display()))?,
-                (None, None, None) if skipped => anyhow::bail!(
-                    "the skipped verdict requires a reason: --reason <text> or --analysis <text>"
-                ),
-                (None, None, None) => anyhow::bail!(
-                    "analysis requires either --analysis <text> or --analysis-file <path>"
-                ),
-                _ => unreachable!("clap enforces conflicting arguments"),
-            };
             if body.trim().is_empty() {
                 anyhow::bail!(if skipped {
                     "the skipped verdict requires a non-empty reason"
@@ -765,11 +726,6 @@ async fn real_main(cli: Cli) -> Result<bool> {
         Commands::Change { command } => {
             let mut store = Store::open(&config.data_dir)?;
             match command {
-                ChangeCommand::Create {
-                    id,
-                    description,
-                    target,
-                } => write_stdout_json(&store.create_change(&id, description, target)?)?,
                 ChangeCommand::Decide {
                     id,
                     status,
@@ -935,25 +891,6 @@ struct MetricSeriesRow {
     labels: BTreeMap<String, String>,
 }
 
-fn parse_since(value: &str) -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
-    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Ok(at.with_timezone(&chrono::Utc));
-    }
-    let invalid = || "since must be a duration such as 30m, 4h, 2d or an RFC 3339 time".to_string();
-    let (amount, unit) = value.split_at(value.len().saturating_sub(1));
-    let amount = amount.parse::<i64>().map_err(|_| invalid())?;
-    let duration = match unit {
-        "m" => chrono::Duration::minutes(amount),
-        "h" => chrono::Duration::hours(amount),
-        "d" => chrono::Duration::days(amount),
-        _ => return Err(invalid()),
-    };
-    if amount <= 0 {
-        return Err(invalid());
-    }
-    Ok(chrono::Utc::now() - duration)
-}
-
 fn parse_list_limit(value: &str) -> std::result::Result<usize, String> {
     let limit = value
         .parse::<usize>()
@@ -1113,6 +1050,7 @@ fn show_query(
                         runner::short_id(&id)
                     );
                 }
+                refuse_unsplit_database_window(&id, &candidate_metrics, window)?;
                 labels.push(("window".into(), window.as_str().into()));
             }
             let options = DatabaseQueryOptions {
@@ -1135,6 +1073,9 @@ fn show_query(
                         "base run {} has no per-window database rows; compare with --window whole",
                         runner::short_id(&base_id)
                     );
+                }
+                if window != SeriesWindowArg::Whole {
+                    refuse_unsplit_database_window(&base_id, &base_metrics, window)?;
                 }
                 let base = query::database_query(base_id, base_metrics, options);
                 write_stdout_json(&query::database_query_diff(base, candidate, limit))?;
@@ -1350,6 +1291,28 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             rows,
         },
     ))?;
+    Ok(())
+}
+
+/// slpはinitializeの終わりが分かったrunだけをinitializeとloadに分け、分からないrunは全体を
+/// `whole`にまとめる。後者で`load`を選ぶと、SQLが無かったかのように0件が返ってしまう。
+/// （loadの0件そのものは、負荷区間のSQLを無くせたrunで起こり得るので、行は`initialize`にある。）
+fn refuse_unsplit_database_window(
+    id: &str,
+    metrics: &[isuscope::model::Metric],
+    window: SeriesWindowArg,
+) -> Result<()> {
+    let has = |name: &str| {
+        metrics
+            .iter()
+            .any(|metric| metric.labels.get("window").map(String::as_str) == Some(name))
+    };
+    if !has(window.as_str()) && has("whole") {
+        bail!(
+            "run {} did not record the end of initialize, so its database rows are not split; use --window whole",
+            runner::short_id(id)
+        );
+    }
     Ok(())
 }
 
@@ -1680,21 +1643,19 @@ struct RunListOutput {
     runs: Vec<RunSummary>,
 }
 
-fn list_runs(
-    config: &LoadedConfig,
-    limit: usize,
-    since: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<()> {
+fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     write_stdout_json(&RunListOutput {
         schema_version: 1,
-        runs: store.list_since(limit, since)?,
+        runs: store.list(limit)?,
     })?;
     Ok(())
 }
 
+/// 機械向けの出力。AIのtool出力には上限があり、超えると真ん中から削られるので字下げを付けない。
+/// 人が読むときは`jq`へ通す。
 fn write_stdout_json(value: &impl serde::Serialize) -> Result<()> {
-    serde_json::to_writer_pretty(std::io::stdout().lock(), value)?;
+    serde_json::to_writer(std::io::stdout().lock(), value)?;
     println!();
     Ok(())
 }
@@ -1741,10 +1702,7 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
     );
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
     brief.review = Some(brief::review(review));
-    // AIのtool出力には上限があり、超えると真ん中から削られる。字下げを付けない。
-    serde_json::to_writer(std::io::stdout().lock(), &brief)?;
-    println!();
-    Ok(())
+    write_stdout_json(&brief)
 }
 
 fn load_diagnostics(

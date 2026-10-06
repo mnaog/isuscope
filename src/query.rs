@@ -48,9 +48,13 @@ pub enum QueryPresence {
     Removed,
 }
 
+/// 出力するのは差分だけ。両側の値は行の`base`と`candidate`にあるので繰り返さない
+/// （片側にしか無い行を並べる大きさには使う）。
 #[derive(Debug, Serialize)]
 pub struct NumericDiff {
+    #[serde(skip)]
     pub base: Option<f64>,
+    #[serde(skip)]
     pub candidate: Option<f64>,
     pub delta: Option<f64>,
     pub delta_percent: Option<f64>,
@@ -485,12 +489,10 @@ pub struct DatabaseQueryRow {
     /// `digest`が切られているときだけ付く、切る前の全文のhash。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest_id: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_capped_option"
-    )]
-    pub sql_shape: Option<String>,
+    /// `--group-by sql-shape`で`digest`へまとめた文の数。`digest`は文の形（shape）になる。
     pub digest_count: usize,
+    /// まとめた元の文。2種類以上あるときだけ出す（1種類なら`digest`と同じ文の繰り返しになる）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub digest_examples: Vec<String>,
     pub calls: f64,
     pub total_ms: f64,
@@ -556,9 +558,8 @@ pub fn database_query(
                 window: summary.window,
                 digest: summary.digest.clone(),
                 digest_id: summary.digest_id,
-                sql_shape: None,
                 digest_count: 1,
-                digest_examples: vec![digest_example(&summary.digest)],
+                digest_examples: Vec::new(),
                 calls: summary.calls,
                 total_ms: summary.total_ms,
                 avg_ms: summary.avg_ms,
@@ -1157,15 +1158,18 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
                     engine,
                     source,
                     window,
-                    digest: shape.clone(),
+                    digest: shape,
                     digest_id,
-                    sql_shape: Some(shape),
                     digest_count: digests.len(),
-                    digest_examples: digests
-                        .into_iter()
-                        .take(3)
-                        .map(|(digest, _)| digest_example(&digest))
-                        .collect(),
+                    digest_examples: if digests.len() > 1 {
+                        digests
+                            .into_iter()
+                            .take(3)
+                            .map(|(digest, _)| digest_example(&digest))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     calls,
                     total_ms,
                     avg_ms: divide(total_ms, calls),
@@ -1295,16 +1299,6 @@ pub(crate) fn serialize_capped<S: serde::Serializer>(
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&capped(value))
-}
-
-fn serialize_capped_option<S: serde::Serializer>(
-    value: &Option<String>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match value {
-        Some(value) => serializer.serialize_str(&capped(value)),
-        None => serializer.serialize_none(),
-    }
 }
 
 fn digest_example(digest: &str) -> String {

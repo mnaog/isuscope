@@ -45,7 +45,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"score.tip
     assert_eq!(brief["score_inputs"]["total_count"], 0, "{brief}");
     isuscope(
         project.path(),
-        &["analyze", "latest", "skipped", "--reason", "fixture"],
+        &["analyze", "latest", "skipped", "--analysis", "fixture"],
     );
 
     assert!(
@@ -92,7 +92,7 @@ command = ["sh", "-c", "printf 'mode=%s\n' \"$ISUSCOPE_RUN_MODE\" >> modes.log; 
     );
     isuscope(
         project.path(),
-        &["analyze", "latest", "skipped", "--reason", "fixture"],
+        &["analyze", "latest", "skipped", "--analysis", "fixture"],
     );
     assert!(
         isuscope(project.path(), &["survey-run", "--hypothesis", "survey"])

@@ -99,7 +99,7 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
             "analyze",
             "latest",
             "skipped",
-            "--reason",
+            "--analysis",
             "practice window ended before analysis",
         ])
         .current_dir(project.path())

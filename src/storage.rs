@@ -351,25 +351,15 @@ impl Store {
         Ok(final_dir)
     }
 
+    /// Newest runs first.
     pub fn list(&self, limit: usize) -> Result<Vec<RunSummary>> {
-        self.list_since(limit, None)
-    }
-
-    /// Newest runs first; `since` keeps only runs started at or after that instant.
-    pub fn list_since(
-        &self,
-        limit: usize,
-        since: Option<chrono::DateTime<Utc>>,
-    ) -> Result<Vec<RunSummary>> {
-        // started_at is stored with to_rfc3339() in UTC, so the same encoding orders correctly.
-        let since = since.map(|value| value.to_rfc3339()).unwrap_or_default();
         let mut statement = self.connection.prepare(
             "SELECT r.id, r.started_at, r.commit_hash, r.dirty, r.mode, r.state, r.score, r.passed, r.note, r.hypothesis, r.analysis_status,
                     (SELECT a.verdict FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1),
                     (SELECT a.body FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1)
-             FROM runs r WHERE r.started_at >= ?2 ORDER BY r.started_at DESC LIMIT ?1",
+             FROM runs r ORDER BY r.started_at DESC LIMIT ?1",
         )?;
-        let rows = statement.query_map(params![limit as i64, since], |row| {
+        let rows = statement.query_map(params![limit as i64], |row| {
             let id: String = row.get(0)?;
             Ok(RunSummary {
                 short_id: crate::runner::short_id(&id).into(),
@@ -386,7 +376,10 @@ impl Store {
                 hypothesis: row.get(9)?,
                 analysis_status: row.get(10)?,
                 latest_analysis_verdict: row.get(11)?,
-                latest_analysis_body: row.get(12)?,
+                // runを見分けるための冒頭だけ。全文は`brief`の`full_text`から読む。
+                latest_analysis_body: row
+                    .get::<_, Option<String>>(12)?
+                    .map(|body| crate::model::excerpt(&body, 120).0),
                 failure: None,
             })
         })?;

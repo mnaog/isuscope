@@ -137,7 +137,7 @@ command = ["sh", "-c", "printf 'broken \\377\\376 line\\n'; printf '%s\\n' '{\"t
     let id = list["runs"][0]["short_id"].as_str().unwrap().to_owned();
     isuscope(
         project.path(),
-        &["analyze", &id, "skipped", "--reason", "fixture"],
+        &["analyze", &id, "skipped", "--analysis", "fixture"],
     );
 
     fs::write(

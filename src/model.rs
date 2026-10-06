@@ -216,6 +216,14 @@ pub fn epoch_seconds(value: f64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros((value * 1_000_000.0).round() as i64)
 }
 
+/// 冒頭`chars`文字（超えたら`…`を付ける）と、切ったかどうか。AI向けの出力で長文を短くする。
+pub fn excerpt(text: &str, chars: usize) -> (String, bool) {
+    match text.char_indices().nth(chars) {
+        Some((end, _)) => (format!("{}…", &text[..end]), true),
+        None => (text.to_owned(), false),
+    }
+}
+
 /// 時刻をマイクロ秒に切り捨てる。区間の境界はcollectorへマイクロ秒で渡し、collectorはそこから
 /// bucketを区切る。境界がナノ秒を持ったままだと、bucketの先頭（マイクロ秒）が境界より数百ナノ秒
 /// 前になり、そのbucketが丸ごと区間から落ちる。記録・転送・比較をこの精度に揃える。

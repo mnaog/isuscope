@@ -26,7 +26,7 @@ isuscope query latest --base BASE_RUN --view database --group-by sql-shape
 isuscope analyze RUN_ID supported --analysis "p95とDB時間が低下し、スコアも改善した"
 ```
 
-run IDは実行結果か`isuscope list`で確認します。`analyze`は更新対象を曖昧にしないため、run ID、一意な短縮ID、または一意なtagを明示します。`run`・`list`・`brief`はrun IDの末尾8文字を`short_id`として表示します（UUIDv7の先頭は近い時刻のrunで重なるため）。仮説や分析の本文でrunに触れるときもこの形にそろえてください。判定は`supported`、`rejected`、`inconclusive`、`skipped`です。`skipped`の理由は`--reason`でも`--analysis`でも書けます。
+run IDは実行結果か`isuscope list`で確認します。`analyze`は更新対象を曖昧にしないため、run ID、一意な短縮ID、または一意なtagを明示します。`run`・`list`・`brief`はrun IDの末尾8文字を`short_id`として表示します（UUIDv7の先頭は近い時刻のrunで重なるため）。仮説や分析の本文でrunに触れるときもこの形にそろえてください。判定は`supported`、`rejected`、`inconclusive`、`skipped`です。`skipped`の理由も`--analysis`に書きます。
 
 ### 仮説の判定と変更の採否
 
@@ -34,27 +34,20 @@ run IDは実行結果か`isuscope list`で確認します。`analyze`は更新�
 
 ```bash
 isuscope analyze RUN_ID inconclusive --base BASE_RUN \
-  --analysis "対象の長時間SQLは減ったが、新規登録が遅くなりスコアは低下"
-isuscope change create user-items-update \
-  --description "既存user_itemsをUPDATEし、不足行のみINSERT" \
-  --target "変更commitまたは変更範囲"
-isuscope change decide user-items-update accepted --run RUN_ID \
-  --reason "長時間SQL抑制を評価して残す。新規登録の追加SELECTは別途改善"
+  --analysis "対象の長時間SQLは減ったが、新規登録が遅くなりスコアは低下" \
+  --change user-items-update --decision accepted \
+  --description "既存user_itemsをUPDATEし、不足行のみINSERT"
+# 後から判断を改めるときは、根拠runを付けて追記する
+isuscope change decide user-items-update provisional --run RUN_ID --run NEXT_RUN \
+  --reason "長時間SQL抑制は残す。新規登録の追加SELECTは別途改善" \
+  --revisit "新規登録のSELECTを減らした後に再評価"
 isuscope brief RUN_ID
 isuscope change list --status provisional
 isuscope change show user-items-update
 ```
 
-分析と採否を同時に決めた場合は、`analyze`で一度に記録できます。
-
-```bash
-isuscope analyze RUN_ID supported --base BASE_RUN \
-  --analysis "アイドル接続が減りスコアも上がった" \
-  --change keepalive-200ms --decision accepted
-```
-
-- 採否の理由には分析本文を、根拠runにはこのrunと`--base`を使います。
-- 変更が未作成なら作成します。説明は`--description`、省略時はrunの仮説です。既存の変更に`--description`を付けるとエラーになります。
+- 変更は、最初に採否を決める`analyze --change`が作ります。説明は`--description`、省略時はrunの仮説で、対象にはrunのcommitを記録します。既存の変更に`--description`を付けるとエラーになります。
+- `analyze`での採否の理由には分析本文を、根拠runにはこのrunと`--base`を使います。
 - `provisional`の`--revisit`不足などは分析を書き込む前に検査し、分析だけが残ることはありません。
 
 - `analyze --base`は比較元の完全なrun IDを保存します。`brief`は各1走のスコア差を表示し、誤差や性能採否は自動判定しません。
@@ -118,28 +111,26 @@ isuscope doctor
 | `doctor` | ベンチを起動せず、設定・command・SSH・時刻・diskを検査する |
 | `survey-run` | 序盤の全体調査を1回行い、行動遷移も収集する |
 | `run` | 標準collectorでベンチを実行する |
-| `list` | 保存済みrunを新しい順にJSONで一覧表示する。`--since 4h`などで開始時刻を絞る |
+| `list` | 保存済みrunを新しい順にJSONで一覧表示する |
 | `lock -- <command>` | 変更系操作の共通lockを取ってcommandを実行する。取得済みの子processでは再取得せず、実行時間を`operation-timing.tsv`へ追記する |
-| `pin <run>` | runを生ログ（`logs/`）ごとGitへstageする |
 | `routes suggest [run]` | 動的IDの残るHTTP routeから`[[routes]]`候補を作る。`--output`で書き出し先を指定する |
 | `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
-| `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 
-`list`、`brief`、`series`、`query`、`sql`は機械処理しやすいJSONを返します。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice、詳細行数）で、全nodeの状況を最初の1画面で見切るためのものです。CPU・コア・iowait・PSI・diskがどれも低かったnodeが2台以上あれば、`quiet_hosts`へ名前と最大値だけをまとめます（負荷を振り分ける余地として読みます）。`cpu`はidle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。`review`は分析・変更の本文を冒頭だけにし、全文を読む命令を`full_text`に添えます。briefはAIのtool出力の上限を超えて途中が削られないよう、字下げの無い1行のJSONで出します（人が読むときは`jq`へ通します）。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取得できます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+`list`、`brief`、`series`、`query`、`change`は機械処理しやすいJSONを返します。`query --base`の行は両runの行と`changes`（各値の`delta`と`delta_percent`）を持ちます。`--group-by sql-shape`の行では`digest`が文の形になり、元の文が2種類以上あるときだけ`digest_examples`に並べます。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice、詳細行数）で、全nodeの状況を最初の1画面で見切るためのものです。CPU・コア・iowait・PSI・diskがどれも低かったnodeが2台以上あれば、`quiet_hosts`へ名前と最大値だけをまとめます（負荷を振り分ける余地として読みます）。`cpu`はidle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。`review`は分析・変更の本文を冒頭だけにし、全文を読む命令を`full_text`に添えます。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは、索引のSQLite（`data_dir`の`isuscope.sqlite3`。既定は`.isuscope/isuscope.sqlite3`）を`sqlite3 -readonly`で直接引きます（`.schema`でtable定義）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・SQLiteで取得できます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
 
-どのmetricがあるかは`sql`で調べます。runごとの件数・単位・時系列の有無と、labelの種類がこれで分かります。
+どのmetricがあるかはSQLiteで調べます。runごとの件数・単位・時系列の有無と、labelの種類がこれで分かります。
 
 ```console
-isuscope sql "SELECT name, COUNT(*) samples, SUM(observed_at IS NOT NULL) timestamped,
+sqlite3 -readonly -header .isuscope/isuscope.sqlite3 "SELECT name, COUNT(*) samples, SUM(observed_at IS NOT NULL) timestamped,
   GROUP_CONCAT(DISTINCT unit) units FROM metrics
   WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1)
-  GROUP BY name ORDER BY samples DESC" --format tsv
-isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metrics m, json_each(m.labels_json) j
-  WHERE m.run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) GROUP BY j.key" --format tsv
+  GROUP BY name ORDER BY samples DESC"
+sqlite3 -readonly -header .isuscope/isuscope.sqlite3 "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metrics m, json_each(m.labels_json) j
+  WHERE m.run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) GROUP BY j.key"
 ```
 
 ```console
@@ -180,7 +171,7 @@ parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","catego
 
 ### 最初のrunで確認すること
 
-`survey-run`を1回通したら、`brief`で次を確かめてから改善へ進みます。`coverage_issues`が空であること、HTTP routeに動的IDが残っていないこと（残っていれば`routes suggest`）、`perf`系collectorが対象nodeで`complete`であること、transitionが0件でないこと（sessionのfieldがある場合）、benchmark stdout/stderrが保存されていることです。collectorが失敗したときは、`isuscope sql "SELECT name, node, status, error FROM collector_runs WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) AND status!='"'"'complete'"'"'" --format tsv`で原因を見て、run directoryの`logs/`にある該当collectorのstderrを開きます。`degraded`はベンチがPASSでもcollectorが失敗した状態です。観測条件を変えたrunは、その前後のscore比較に使いません。
+`survey-run`を1回通したら、`brief`で次を確かめてから改善へ進みます。`coverage_issues`が空であること、HTTP routeに動的IDが残っていないこと（残っていれば`routes suggest`）、`perf`系collectorが対象nodeで`complete`であること、transitionが0件でないこと（sessionのfieldがある場合）、benchmark stdout/stderrが保存されていることです。collectorが失敗したときは、`sqlite3 -readonly -header .isuscope/isuscope.sqlite3 "SELECT name, node, status, error FROM collector_runs WHERE run_id=(SELECT id FROM runs ORDER BY started_at DESC LIMIT 1) AND status!='"'"'complete'"'"'"`で原因を見て、run directoryの`logs/`にある該当collectorのstderrを開きます。`degraded`はベンチがPASSでもcollectorが失敗した状態です。観測条件を変えたrunは、その前後のscore比較に使いません。
 
 ### 得点が何でできているかを確定する
 
