@@ -226,3 +226,42 @@ pub fn run_locked(path: &Path, command: &[String]) -> Result<i32> {
     drop(guard);
     Ok(code)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn a_held_run_marker_is_released_when_dropped() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("run.running");
+        let held = RunMarker::try_hold(&path).unwrap().unwrap();
+        assert!(RunMarker::try_hold(&path).unwrap().is_none());
+        drop(held);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_held_run_gate_blocks_a_second_run() {
+        let dir = tempdir().unwrap();
+        let held = RunGate::try_acquire(dir.path()).unwrap().unwrap();
+        assert!(RunGate::try_acquire(dir.path()).unwrap().is_none());
+        drop(held);
+    }
+
+    #[test]
+    fn a_held_operation_lock_reports_its_owner() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lock-dir");
+        let held = OperationLock::acquire(&path, "deploy").unwrap().unwrap();
+        let busy = OperationLock::acquire(&path, "bench")
+            .err()
+            .unwrap()
+            .downcast::<LockBusy>()
+            .unwrap();
+        assert!(busy.owner.contains("operation=deploy"));
+        drop(held);
+        assert!(!path.join("owner").exists());
+    }
+}

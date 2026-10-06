@@ -224,6 +224,38 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn hashes_files_outside_git_without_excluded_paths_or_symlinked_directories() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("app");
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::create_dir_all(repo.join("target/debug")).unwrap();
+        fs::create_dir_all(repo.join("logs")).unwrap();
+        fs::create_dir_all(dir.path().join("outside")).unwrap();
+        fs::write(repo.join("main.rs"), "main").unwrap();
+        fs::write(repo.join("src/nested/lib.rs"), "lib").unwrap();
+        fs::write(repo.join("target/debug/app"), "binary").unwrap();
+        fs::write(repo.join("logs/access.log"), "log").unwrap();
+        fs::write(dir.path().join("outside/secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("outside"), repo.join("linked")).unwrap();
+        let out = dir.path().join("snapshot");
+        fs::create_dir(&out).unwrap();
+
+        let snapshot = capture_without_git(
+            &repo,
+            &out,
+            &[PathBuf::from("logs")],
+            "not a repository".to_owned(),
+        )
+        .unwrap();
+        let paths: Vec<_> = snapshot
+            .untracked
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(paths, ["main.rs", "src/nested/lib.rs"]);
+    }
+
+    #[test]
     fn captures_commit_and_dirty_patch() {
         let dir = tempdir().unwrap();
         Command::new("git")
