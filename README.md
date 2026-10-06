@@ -70,7 +70,7 @@ isuscope analyze RUN_ID supported --base BASE_RUN \
 
 ## インストール
 
-標準のビルドにはRust 1.99.0を使います。rustup経由の`cargo`はリポジトリの`rust-toolchain.toml`に従ってこの版を選びます。最低対応版はRust 1.88のままで、CIでは1.88.0と1.99.0の両方を検証します。競技用bundleとcoverageも1.99.0でビルドします。
+標準のビルドにはRust 1.99.0を使います。rustup経由の`cargo`はリポジトリの`rust-toolchain.toml`に従ってこの版を選びます。最低対応版はRust 1.89で、CIでは1.89.0と1.99.0の両方を検証します。競技用bundleとcoverageも1.99.0でビルドします。
 
 ```console
 cargo install --path . --locked

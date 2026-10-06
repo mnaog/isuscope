@@ -1,6 +1,6 @@
 //! Exclusive operation lock shared by benchmarks and project scripts.
 //!
-//! The lock is a `lock` file inside the lock directory, held with `flock(LOCK_EX|LOCK_NB)`.
+//! The lock is a `lock` file inside the lock directory, held with [`fs::File::try_lock`].
 //! The kernel releases it when the holder exits, so a crashed holder never leaves a lock behind
 //! and there is no stale-lock reclamation to race over. The `owner` file next to it is written
 //! after the lock is taken and only explains who holds it. The lock file itself is never removed:
@@ -11,9 +11,9 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use std::{
-    env, fmt, fs,
+    env, fmt,
+    fs::{self, TryLockError},
     io::Write,
-    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     process::Command,
     time::Instant,
@@ -73,18 +73,19 @@ impl OperationLock {
             .write(true)
             .open(&lock_path)
             .with_context(|| format!("cannot open {}", lock_path.display()))?;
-        // SAFETY: the descriptor stays owned by `file`, and LOCK_NB never blocks.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::Error(error)) => {
                 return Err(error).with_context(|| format!("cannot lock {}", lock_path.display()));
             }
-            let owner = fs::read_to_string(path.join("owner")).unwrap_or_default();
-            return Err(LockBusy {
-                path: path.to_path_buf(),
-                owner,
+            Err(TryLockError::WouldBlock) => {
+                let owner = fs::read_to_string(path.join("owner")).unwrap_or_default();
+                return Err(LockBusy {
+                    path: path.to_path_buf(),
+                    owner,
+                }
+                .into());
             }
-            .into());
         }
         let pid = std::process::id();
         let owner = format!(
@@ -125,13 +126,12 @@ impl RunMarker {
             .write(true)
             .open(path)
             .with_context(|| format!("cannot open {}", path.display()))?;
-        // SAFETY: the descriptor stays owned by `file`, and LOCK_NB never blocks.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Ok(None);
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("cannot lock {}", path.display()));
             }
-            return Err(error).with_context(|| format!("cannot lock {}", path.display()));
         }
         Ok(Some(Self {
             path: path.to_path_buf(),
@@ -159,13 +159,12 @@ impl RunGate {
     pub fn try_acquire(directory: &Path) -> Result<Option<Self>> {
         let file = fs::File::open(directory)
             .with_context(|| format!("cannot open {}", directory.display()))?;
-        // SAFETY: the descriptor stays owned by `file`, and LOCK_NB never blocks.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Ok(None);
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("cannot lock {}", directory.display()));
             }
-            return Err(error).with_context(|| format!("cannot lock {}", directory.display()));
         }
         Ok(Some(Self { _directory: file }))
     }

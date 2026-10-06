@@ -1322,13 +1322,10 @@ struct AnalysisLock(fs::File);
 
 impl AnalysisLock {
     fn acquire(dir: &Path) -> Result<Self> {
-        use std::os::fd::AsRawFd;
         // Lock the run directory itself so no lock file ends up in version-controlled runs.
         let file = fs::File::open(dir)?;
         // The descriptor owns the lock; closing it also releases it after errors.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
+        file.lock()?;
         // Earlier versions left this file behind in every run.
         let legacy = dir.join(".analysis.lock");
         if legacy.is_file() {
@@ -1340,10 +1337,7 @@ impl AnalysisLock {
 
 impl Drop for AnalysisLock {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = self.0.unlock();
     }
 }
 

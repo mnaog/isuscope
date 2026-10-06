@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [1.88.0, 1.99.0]
+        toolchain: [1.89.0, 1.99.0]
     env:
       RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
 
