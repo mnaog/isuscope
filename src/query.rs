@@ -33,6 +33,11 @@ pub struct MetricQueryOutput {
     pub run_id: String,
     pub view: &'static str,
     pub scope: QueryScope,
+    /// 値を集計した区間（`--scope series`のとき）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// 指定された条件。比較のために持つだけで、出力では繰り返さない。
+    #[serde(skip)]
     pub selection: QuerySelection,
     pub total_count: usize,
     pub truncated: bool,
@@ -48,7 +53,7 @@ pub enum QueryPresence {
     Removed,
 }
 
-/// 出力するのは差分だけ。両側の値は行の`base`と`candidate`にあるので繰り返さない
+/// 主要な値（回数・合計・平均・p95、HTTPはエラー数も）の差分だけ。両側の値は行の`base`と`candidate`にあるので繰り返さない
 /// （片側にしか無い行を並べる大きさには使う）。
 #[derive(Debug, Serialize)]
 pub struct NumericDiff {
@@ -60,13 +65,87 @@ pub struct NumericDiff {
     pub delta_percent: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct QueryDiffRow<T> {
     pub key: BTreeMap<String, String>,
+    /// metric viewのlabel。`key`の`metric`・`unit`と同じ階層に混ぜず、`key.labels`に出す。
+    pub key_labels: Option<BTreeMap<String, String>>,
+    /// 出力の`common`へまとめたので、この行の`key`では繰り返さない名前。
+    pub shared: BTreeSet<String>,
     pub presence: QueryPresence,
     pub base: Option<T>,
     pub candidate: Option<T>,
     pub changes: BTreeMap<String, NumericDiff>,
+}
+
+/// 比較の1行を平らに出す。行を識別する値（`common`へまとめたものを除く）、`presence`、そして値ごとに
+/// 比較元（`_base`）・対象（接尾辞なし）・差（`_delta`、`_delta_percent`）を並べる。差は主要な値だけ。
+impl<T: Serialize> Serialize for QueryDiffRow<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error;
+        let mut identity = serde_json::Map::new();
+        for (name, value) in &self.key {
+            identity.insert(name.clone(), serde_json::Value::String(value.clone()));
+        }
+        if let Some(labels) = &self.key_labels {
+            identity.insert(
+                "labels".into(),
+                serde_json::to_value(labels).map_err(S::Error::custom)?,
+            );
+        }
+        let side =
+            |row: &Option<T>| -> Result<serde_json::Map<String, serde_json::Value>, S::Error> {
+                let Some(row) = row else {
+                    return Ok(serde_json::Map::new());
+                };
+                let mut fields = match serde_json::to_value(row).map_err(S::Error::custom)? {
+                    serde_json::Value::Object(fields) => fields,
+                    _ => serde_json::Map::new(),
+                };
+                fields.retain(|name, value| identity.get(name) != Some(value));
+                Ok(fields)
+            };
+        let base = side(&self.base)?;
+        let candidate = side(&self.candidate)?;
+        let mut row = serde_json::Map::new();
+        for (name, value) in &identity {
+            if !self.shared.contains(name) {
+                row.insert(name.clone(), value.clone());
+            }
+        }
+        row.insert(
+            "presence".into(),
+            serde_json::to_value(self.presence).map_err(S::Error::custom)?,
+        );
+        let names =
+            candidate
+                .keys()
+                .chain(base.keys())
+                .fold(Vec::<&String>::new(), |mut names, name| {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                    names
+                });
+        for name in names {
+            let value = |fields: &serde_json::Map<String, serde_json::Value>| {
+                fields.get(name).cloned().unwrap_or(serde_json::Value::Null)
+            };
+            row.insert(format!("{name}_base"), value(&base));
+            row.insert(name.clone(), value(&candidate));
+            if let Some(change) = self.changes.get(name) {
+                row.insert(
+                    format!("{name}_delta"),
+                    serde_json::to_value(change.delta).map_err(S::Error::custom)?,
+                );
+                row.insert(
+                    format!("{name}_delta_percent"),
+                    serde_json::to_value(change.delta_percent).map_err(S::Error::custom)?,
+                );
+            }
+        }
+        row.serialize(serializer)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +158,9 @@ pub struct QueryDiffOutput<T> {
     pub window: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grouping: Option<&'static str>,
+    /// 出力した全行で同じ`key`の値（1台のDBを1区間で見るときのnode・source・windowなど）。
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub common: BTreeMap<String, String>,
     pub total_count: usize,
     pub truncated: bool,
     pub rows: Vec<QueryDiffRow<T>>,
@@ -110,8 +192,8 @@ pub struct MetricQueryRow {
     pub unit: String,
     pub value: Option<f64>,
     pub aggregation: MetricAggregation,
-    pub exact: bool,
-    pub source_rows: usize,
+    /// まとめた記録の行数（seriesなら時点の数）。
+    pub samples: usize,
     pub labels: BTreeMap<String, String>,
 }
 
@@ -154,8 +236,7 @@ pub fn metric_query(
                 unit,
                 value,
                 aggregation,
-                exact: value.is_some(),
-                source_rows: values.len(),
+                samples: values.len(),
                 labels,
             }
         })
@@ -186,6 +267,7 @@ pub fn metric_query(
         run_id,
         view: "metrics",
         scope: options.scope,
+        window: options.window.clone(),
         selection: QuerySelection {
             window: options.window,
             metrics: options.metrics,
@@ -368,9 +450,7 @@ pub fn metric_query_diff(
             let key = (metric.clone(), unit.clone(), labels.clone());
             let base = base.remove(&key);
             let candidate = candidate.remove(&key);
-            let mut output_key = labels;
-            output_key.insert("metric".into(), metric);
-            output_key.insert("unit".into(), unit);
+            let output_key = BTreeMap::from([("metric".into(), metric), ("unit".into(), unit)]);
             let changes = BTreeMap::from([(
                 "value".into(),
                 numeric_diff(
@@ -380,6 +460,8 @@ pub fn metric_query_diff(
             )]);
             QueryDiffRow {
                 key: output_key,
+                key_labels: Some(labels),
+                shared: BTreeSet::new(),
                 presence: presence(&base, &candidate),
                 base,
                 candidate,
@@ -489,7 +571,8 @@ pub struct DatabaseQueryRow {
     /// `digest`が切られているときだけ付く、切る前の全文のhash。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest_id: Option<String>,
-    /// `--group-by sql-shape`で`digest`へまとめた文の数。`digest`は文の形（shape）になる。
+    /// `--group-by sql-shape`で`digest`へまとめた文の数。`digest`は文の形（shape）になる。1なら出さない。
+    #[serde(skip_serializing_if = "is_one")]
     pub digest_count: usize,
     /// まとめた元の文。2種類以上あるときだけ出す（1種類なら`digest`と同じ文の繰り返しになる）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -686,13 +769,15 @@ pub fn database_query_diff(
                 ("engine".into(), engine),
                 ("source".into(), source),
                 ("window".into(), window.unwrap_or_else(|| "-".into())),
-                (grouping.into(), capped(&digest)),
+                ("digest".into(), capped(&digest)),
             ]);
             if let Some(digest_id) = digest_id {
                 key.insert("digest_id".into(), digest_id);
             }
             QueryDiffRow {
                 key,
+                key_labels: None,
+                shared: BTreeSet::new(),
                 presence: presence(&base, &candidate),
                 base,
                 candidate,
@@ -828,6 +913,8 @@ pub fn http_query_diff(
                     ("method".into(), method),
                     ("route".into(), route),
                 ]),
+                key_labels: None,
+                shared: BTreeSet::new(),
                 presence: presence(&base, &candidate),
                 base,
                 candidate,
@@ -904,6 +991,7 @@ fn database_changes(
         ),
     ]
     .into_iter()
+    .filter(|(name, _, _)| ["calls", "total_ms", "avg_ms", "p95_ms"].contains(name))
     .map(|(name, base, candidate)| (name.into(), numeric_diff(base, candidate)))
     .collect()
 }
@@ -955,6 +1043,7 @@ fn http_changes(
         ),
     ]
     .into_iter()
+    .filter(|(name, _, _)| ["count", "total_ms", "avg_ms", "p95_ms", "errors"].contains(name))
     .map(|(name, base, candidate)| (name.into(), numeric_diff(base, candidate)))
     .collect()
 }
@@ -1013,6 +1102,16 @@ fn finish_diff<T>(
 ) -> QueryDiffOutput<T> {
     let total_count = rows.len();
     rows.truncate(limit);
+    let mut common = BTreeMap::new();
+    if rows.len() > 1 {
+        common = rows[0].key.clone();
+        for row in &rows[1..] {
+            common.retain(|name, value| row.key.get(name) == Some(value));
+        }
+    }
+    for row in &mut rows {
+        row.shared = common.keys().cloned().collect();
+    }
     QueryDiffOutput {
         schema_version: 1,
         view,
@@ -1020,6 +1119,7 @@ fn finish_diff<T>(
         candidate_run_id,
         window: None,
         grouping,
+        common,
         total_count,
         truncated: total_count > rows.len(),
         rows,
@@ -1185,6 +1285,10 @@ fn group_database_shapes(summaries: Vec<report::DatabaseSummary>) -> Vec<Databas
             },
         )
         .collect()
+}
+
+fn is_one(value: &usize) -> bool {
+    *value == 1
 }
 
 fn divide(numerator: f64, denominator: f64) -> Option<f64> {
@@ -1740,14 +1844,39 @@ mod tests {
         let candidate = metric_query(
             "candidate".into(),
             rows(&[("a", 101.0), ("c", 50.0)]),
-            options,
+            options.clone(),
         );
+        let full = metric_query_diff(
+            metric_query(
+                "base".into(),
+                rows(&[("a", 100.0), ("b", 1.0)]),
+                options.clone(),
+            ),
+            metric_query(
+                "candidate".into(),
+                rows(&[("a", 101.0), ("c", 50.0)]),
+                options.clone(),
+            ),
+            10,
+        );
+        // 全行で同じmetricとunitは`common`へまとめ、各行の`key`では繰り返さない。
+        assert_eq!(
+            full.common.get("metric").map(String::as_str),
+            Some("benchmark.scenario.success")
+        );
+        let row = serde_json::to_value(&full.rows[0]).unwrap();
+        assert!(row["key"].get("metric").is_none(), "{row}");
+        assert!(row["candidate"].get("metric").is_none(), "{row}");
         let diff = metric_query_diff(base, candidate, 1);
         assert_eq!(diff.total_count, 3);
         assert!(diff.truncated);
         assert_eq!(diff.rows[0].presence, QueryPresence::Added);
         assert_eq!(
-            diff.rows[0].key.get("scenario").map(String::as_str),
+            diff.rows[0]
+                .key_labels
+                .as_ref()
+                .and_then(|labels| labels.get("scenario"))
+                .map(String::as_str),
             Some("c")
         );
     }

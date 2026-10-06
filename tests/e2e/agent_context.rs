@@ -74,8 +74,7 @@ run this benchmark
         .find(|entry| entry.file_name() != ".incomplete")
         .unwrap()
         .path();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    let manifest: serde_json::Value = parsed(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(
         manifest["agent_context"]["history_path"],
         "docs/codex-history/20260827-200000.md"
@@ -111,7 +110,7 @@ run this benchmark
         .current_dir(project.path())
         .output()
         .unwrap();
-    let context: serde_json::Value = serde_json::from_slice(&context.stdout).unwrap();
+    let context: serde_json::Value = parsed(&context.stdout).unwrap();
     assert_eq!(
         context["rows"][0]["history_path"],
         "docs/codex-history/20260827-200000.md"
@@ -245,8 +244,7 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"isuscope.result\",\"pass\":t
         .find(|entry| entry.file_name() != ".incomplete")
         .unwrap()
         .path();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    let manifest: serde_json::Value = parsed(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(manifest["agent_context"]["agent"], "claude");
     assert_eq!(
         manifest["agent_context"]["history_path"],

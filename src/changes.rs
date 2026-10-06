@@ -77,6 +77,119 @@ pub struct ChangeSummary {
     pub latest_decision: Option<Decision>,
 }
 
+/// 根拠runの1行表記。`短縮ID commit先頭12桁`、未commitの変更があれば` dirty`を付ける。
+pub fn evidence_label(evidence: &Evidence) -> String {
+    let commit = evidence
+        .source
+        .commit_hash
+        .as_deref()
+        .map(|hash| &hash[..12.min(hash.len())])
+        .unwrap_or("no-commit");
+    let dirty = if evidence.source.dirty { " dirty" } else { "" };
+    format!(
+        "{} {commit}{dirty}",
+        crate::runner::short_id(&evidence.run_id)
+    )
+}
+
+/// `change show`・`change list`の出力。保存する記録（[`Change`]・[`Decision`]）から、
+/// 版番号や親と同じ変更ID、根拠runのsource一式を除いたもの。
+#[derive(Debug, Serialize)]
+pub struct ChangeView {
+    pub id: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DecisionView {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub status: DecisionStatus,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revisit: Option<String>,
+    pub evidence: Vec<String>,
+}
+
+impl From<Change> for ChangeView {
+    fn from(change: Change) -> Self {
+        Self {
+            id: change.id,
+            description: change.description,
+            target: change.target,
+            created_at: change.created_at,
+        }
+    }
+}
+
+impl From<Decision> for DecisionView {
+    fn from(decision: Decision) -> Self {
+        Self {
+            evidence: decision.evidence.iter().map(evidence_label).collect(),
+            id: decision.id,
+            created_at: decision.created_at,
+            status: decision.status,
+            reason: decision.reason,
+            revisit: decision.revisit,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangeHistoryView {
+    pub change: ChangeView,
+    pub decisions: Vec<DecisionView>,
+}
+
+/// `change list`の1行。変更と、その最新の判断。
+#[derive(Debug, Serialize)]
+pub struct ChangeSummaryView {
+    pub id: String,
+    pub description: String,
+    pub target: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub status: Option<DecisionStatus>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub reason: Option<String>,
+    pub revisit: Option<String>,
+    pub evidence: Vec<String>,
+}
+
+impl From<ChangeHistory> for ChangeHistoryView {
+    fn from(history: ChangeHistory) -> Self {
+        Self {
+            change: history.change.into(),
+            decisions: history.decisions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<ChangeSummary> for ChangeSummaryView {
+    fn from(summary: ChangeSummary) -> Self {
+        let change = summary.change;
+        let decision = summary.latest_decision.map(DecisionView::from);
+        Self {
+            id: change.id,
+            description: change.description,
+            target: change.target,
+            created_at: change.created_at,
+            status: decision.as_ref().map(|decision| decision.status),
+            decided_at: decision.as_ref().map(|decision| decision.created_at),
+            revisit: decision
+                .as_ref()
+                .and_then(|decision| decision.revisit.clone()),
+            evidence: decision
+                .as_ref()
+                .map(|decision| decision.evidence.clone())
+                .unwrap_or_default(),
+            reason: decision.map(|decision| decision.reason),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct RunReview {
     pub latest_analysis: Option<crate::model::RunAnalysis>,

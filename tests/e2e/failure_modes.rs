@@ -395,7 +395,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"host.cpu_
     .unwrap();
     drop(db);
 
-    let list: serde_json::Value = serde_json::from_slice(&isuscope(&["list"])).unwrap();
+    let list: serde_json::Value = parsed(&isuscope(&["list"])).unwrap();
     assert_eq!(list["runs"][0]["state"], "complete", "{list}");
     assert_eq!(list["runs"][0]["score"], 1234, "{list}");
     let db = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
@@ -449,8 +449,7 @@ command = ["sh", "-c", "(sleep 14; touch survived) & printf '%s\n' '{\"type\":\"
         .find(|entry| entry.file_name() != ".incomplete")
         .expect("the run was saved")
         .path();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    let manifest: serde_json::Value = parsed(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(manifest["benchmark"]["passed"], true, "{manifest}");
     assert!(
         manifest["benchmark"]["messages"]

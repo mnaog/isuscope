@@ -48,7 +48,7 @@ fn brief_shows_every_node_and_keeps_core_labels_apart() {
         .current_dir(project.path())
         .output()
         .unwrap();
-    let brief: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let brief: serde_json::Value = parsed(&output.stdout).unwrap();
 
     // hostsは1 node 1行で、node数が既定の表示件数を超えても全nodeが出る。
     let hosts = brief["hosts"].as_array().unwrap();
@@ -59,11 +59,10 @@ fn brief_shows_every_node_and_keeps_core_labels_apart() {
         .collect::<Vec<_>>();
     assert_eq!(nodes, ["app1", "app2"]);
     for host in hosts {
-        assert_eq!(host["cpu_busy_percent"], 20.0);
+        assert_eq!(host["cpu_busy_avg_percent"], 20.0);
         // 平均50%ではなく、最も詰まっていたコアが出る。
-        assert_eq!(host["busiest_core_peak_percent"], 100.0);
+        assert_eq!(host["busiest_core_max_percent"], 100.0);
         assert_eq!(host["top_services"][0]["service"], "app.service");
-        assert!(host["detail_rows"].as_u64().unwrap() >= 3);
     }
 }
 
@@ -84,8 +83,7 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
         output.stdout
     };
     isuscope(&["run", "--hypothesis", "base", "--tag", "bench:v1"]);
-    let base: serde_json::Value =
-        serde_json::from_slice(&isuscope(&["list", "--limit", "1"])).unwrap();
+    let base: serde_json::Value = parsed(&isuscope(&["list", "--limit", "1"])).unwrap();
     let base_id = base["runs"][0]["id"].as_str().unwrap().to_owned();
     isuscope(&[
         "analyze",
@@ -95,8 +93,7 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
         "比較元として記録する",
     ]);
     isuscope(&["run", "--hypothesis", "candidate", "--tag", "bench:v2"]);
-    let candidate: serde_json::Value =
-        serde_json::from_slice(&isuscope(&["list", "--limit", "1"])).unwrap();
+    let candidate: serde_json::Value = parsed(&isuscope(&["list", "--limit", "1"])).unwrap();
     let candidate_id = candidate["runs"][0]["id"].as_str().unwrap().to_owned();
     isuscope(&[
         "analyze",
@@ -108,8 +105,7 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
         &base_id,
     ]);
 
-    let brief: serde_json::Value =
-        serde_json::from_slice(&isuscope(&["brief", &candidate_id])).unwrap();
+    let brief: serde_json::Value = parsed(&isuscope(&["brief", &candidate_id])).unwrap();
     let conditions = brief["review"]["comparison"]["conditions"]
         .as_array()
         .unwrap();
@@ -191,18 +187,18 @@ printf '{"type":"metric","name":"client.request_gap","value":3,"unit":"ms","labe
         .current_dir(project.path())
         .output()
         .unwrap();
-    let brief: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let brief: serde_json::Value = parsed(&output.stdout).unwrap();
 
     assert_eq!(brief["hosts_window"], "load");
     // initialize中の90%は混ざらない。
     assert_eq!(
-        brief["hosts"][0]["cpu_busy_percent"], 10.0,
+        brief["hosts"][0]["cpu_busy_avg_percent"], 10.0,
         "{}",
         brief["hosts"]
     );
-    assert_eq!(brief["hosts"][0]["cpu_busy_peak_percent"], 10.0);
+    assert_eq!(brief["hosts"][0]["cpu_busy_max_percent"], 10.0);
 
-    let coverage = brief["coverage_issues"]["items"].as_array().unwrap();
+    let coverage = brief["coverage_issues"]["rows"].as_array().unwrap();
     assert!(
         !coverage
             .iter()
@@ -260,10 +256,9 @@ parser = "slp-windows"
         String::from_utf8_lossy(&run.stderr)
     );
 
-    let brief: serde_json::Value =
-        serde_json::from_slice(&isuscope(&["brief", "latest"]).stdout).unwrap();
+    let brief: serde_json::Value = parsed(&isuscope(&["brief", "latest"]).stdout).unwrap();
     assert_eq!(brief["database_window"], "load");
-    let top = &brief["database"]["items"][0];
+    let top = &brief["database"]["rows"][0];
     assert_eq!(top["window"], "load");
     assert!(
         top["digest"].as_str().unwrap().contains("id_generator"),
@@ -274,7 +269,7 @@ parser = "slp-windows"
         "{top}"
     );
     assert!(
-        !brief["database"]["items"]
+        !brief["database"]["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -290,7 +285,7 @@ parser = "slp-windows"
         String::from_utf8_lossy(&series.stderr)
     );
 
-    let initialize: serde_json::Value = serde_json::from_slice(
+    let initialize: serde_json::Value = parsed(
         &isuscope(&[
             "query",
             "latest",
@@ -304,9 +299,12 @@ parser = "slp-windows"
     .unwrap();
     let rows = initialize["rows"].as_array().unwrap();
     assert!(!rows.is_empty());
+    // 全行で同じ区間は`common`に1回だけ出る（1行だけなら行に残る）。
     assert!(
-        rows.iter().all(|row| row["window"] == "initialize"),
-        "{rows:?}"
+        rows.iter().all(|row| {
+            row.get("window").unwrap_or(&initialize["common"]["window"]) == "initialize"
+        }),
+        "{initialize}"
     );
 }
 
@@ -382,6 +380,6 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"db.query.
         String::from_utf8_lossy(&refused.stderr)
     );
     let whole = isuscope(&["query", "latest", "--view", "database", "--window", "whole"]);
-    let rows: serde_json::Value = serde_json::from_slice(&whole.stdout).unwrap();
+    let rows: serde_json::Value = parsed(&whole.stdout).unwrap();
     assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
 }

@@ -118,7 +118,7 @@ command = ["sh", "-c", "printf '%s\\n' '{{\"type\":\"metric\",\"name\":\"benchma
         .output()
         .unwrap();
     assert!(listed.status.success());
-    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let listed: serde_json::Value = parsed(&listed.stdout).unwrap();
     assert_eq!(listed["runs"][0]["note"], "initial parser");
     assert_eq!(listed["runs"][0]["tags"], serde_json::json!(["candidate"]));
 
@@ -256,8 +256,7 @@ fn analysis_written_while_enrich_runs_is_kept() {
         .find(|entry| entry.file_name() != ".incomplete")
         .unwrap()
         .path();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    let manifest: serde_json::Value = parsed(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(
         manifest["analyses"].as_array().unwrap().len(),
         1,
@@ -265,8 +264,7 @@ fn analysis_written_while_enrich_runs_is_kept() {
     );
     assert_eq!(manifest["analysis_status"], "complete");
     assert_eq!(manifest["enrichments"][0]["status"], "complete");
-    let listed: serde_json::Value =
-        serde_json::from_slice(&isuscope_in(project.path(), &["list"]).stdout).unwrap();
+    let listed: serde_json::Value = parsed(&isuscope_in(project.path(), &["list"]).stdout).unwrap();
     assert_eq!(listed["runs"][0]["analysis_status"], "complete", "{listed}");
 }
 
@@ -289,7 +287,7 @@ fn enrich_interrupted_before_the_index_is_reindexed_and_settles_the_state() {
         String::from_utf8_lossy(&run.stderr)
     );
     let listed = |project: &std::path::Path| -> serde_json::Value {
-        serde_json::from_slice(&isuscope_in(project, &["list"]).stdout).unwrap()
+        parsed(&isuscope_in(project, &["list"]).stdout).unwrap()
     };
     assert_eq!(listed(project.path())["runs"][0]["state"], "complete");
 

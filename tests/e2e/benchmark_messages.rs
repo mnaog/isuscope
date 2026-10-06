@@ -57,12 +57,12 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
         "{stdout}"
     );
 
-    let list: Value = serde_json::from_slice(&isuscope(project.path(), &["list"]).stdout).unwrap();
+    let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
     let summary = &list["runs"][0];
     let id = summary["id"].as_str().unwrap();
     assert_eq!(summary["short_id"], &id[id.len() - 8..]);
     assert_eq!(
-        summary["failure"],
+        summary["failure_reason"],
         "validation: GET /user/0/home expected(403) != actual(401)"
     );
 
@@ -75,7 +75,7 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
         "{}",
         String::from_utf8_lossy(&brief.stderr)
     );
-    let brief: Value = serde_json::from_slice(&brief.stdout).unwrap();
+    let brief: Value = parsed(&brief.stdout).unwrap();
     let messages = &brief["benchmark_messages"];
     assert_eq!(
         messages["failure"][0],
@@ -91,10 +91,8 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
     assert_eq!(messages["omitted_count"], 2);
     assert_eq!(brief["run"]["short_id"], summary["short_id"]);
 
-    let manifest: Value = serde_json::from_slice(
-        &fs::read(config_dir.join("runs").join(id).join("run.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: Value =
+        parsed(&fs::read(config_dir.join("runs").join(id).join("run.json")).unwrap()).unwrap();
     let enrichment = &manifest["enrichments"][0];
     assert!(
         enrichment["error"]
@@ -126,13 +124,13 @@ command = ["sh", "-c", "printf 'broken \\377\\376 line\\n'; printf '%s\\n' '{\"t
         "{}",
         String::from_utf8_lossy(&run.stderr)
     );
-    let list: Value = serde_json::from_slice(&isuscope(project.path(), &["list"]).stdout).unwrap();
+    let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
     assert_eq!(list["runs"][0]["score"], 7);
     let query = isuscope(
         project.path(),
         &["query", "latest", "--metric", "benchmark.after_broken"],
     );
-    let query: Value = serde_json::from_slice(&query.stdout).unwrap();
+    let query: Value = parsed(&query.stdout).unwrap();
     assert_eq!(query["total_count"], 1, "{query}");
     let id = list["runs"][0]["short_id"].as_str().unwrap().to_owned();
     isuscope(
@@ -152,9 +150,9 @@ command = ["sh", "-c", "printf 'broken \\377\\376 line\\n'; printf '%s\\n' '{\"t
         stdout.contains("failure   benchmark command exited with"),
         "{stdout}"
     );
-    let list: Value = serde_json::from_slice(&isuscope(project.path(), &["list"]).stdout).unwrap();
+    let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
     assert!(
-        list["runs"][0]["failure"]
+        list["runs"][0]["failure_reason"]
             .as_str()
             .unwrap()
             .starts_with("benchmark command exited with"),
@@ -209,7 +207,7 @@ command = ["true"]
         "{stdout}"
     );
 
-    let list: Value = serde_json::from_slice(&isuscope(project.path(), &["list"]).stdout).unwrap();
+    let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
     let id = list["runs"][0]["id"].as_str().unwrap().to_owned();
     let saved = Command::new("zstd")
         .args(["-dc", "--"])
@@ -229,7 +227,7 @@ command = ["true"]
         project.path(),
         &["query", "latest", "--metric-prefix", "benchmark."],
     );
-    let metrics: Value = serde_json::from_slice(&metrics.stdout).unwrap();
+    let metrics: Value = parsed(&metrics.stdout).unwrap();
     let rows = metrics["rows"].as_array().unwrap();
     assert!(
         !rows
@@ -245,10 +243,8 @@ command = ["true"]
     assert_eq!(seen["value"], 0.0, "{metrics}");
 
     // A rule-side node is never a collector target.
-    let manifest: Value = serde_json::from_slice(
-        &fs::read(config_dir.join("runs").join(&id).join("run.json")).unwrap(),
-    )
-    .unwrap();
+    let manifest: Value =
+        parsed(&fs::read(config_dir.join("runs").join(&id).join("run.json")).unwrap()).unwrap();
     let collectors = manifest["collectors"].as_array().unwrap();
     assert!(
         collectors

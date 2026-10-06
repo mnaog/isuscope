@@ -52,6 +52,7 @@ pub struct RunSummary {
     pub latest_analysis_verdict: Option<String>,
     pub latest_analysis_body: Option<String>,
     /// First parser failure message of a run that did not pass.
+    #[serde(rename = "failure_reason")]
     pub failure: Option<String>,
 }
 

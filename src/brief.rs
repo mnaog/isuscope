@@ -18,7 +18,7 @@ pub struct BriefOutput {
     pub review: Option<BriefReview>,
     pub run: BriefRun,
     pub coverage_issues: BriefSection<CoverageIssueGroup>,
-    pub coverage_info_count: usize,
+    pub coverage_notes_hidden: usize,
     pub benchmark: BriefSection<MetricQueryRow>,
     /// Values read from the system under test to work out what the score is made of.
     /// Collected in `survey-run`, where that question is settled.
@@ -30,7 +30,7 @@ pub struct BriefOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_window: Option<String>,
     pub database: BriefSection<DatabaseSummary>,
-    pub omitted_alternative_database_rows: usize,
+    pub database_rows_filtered_out: usize,
     /// idle taskが待機していた時間（`swapper`の`native_safe_halt`など）は除いて順位を付けます。
     /// `sample_percent`は除く前の全sampleに対する割合のままです。
     pub cpu: BriefSection<CpuSummary>,
@@ -48,7 +48,7 @@ pub struct BriefOutput {
     pub upstreams: BriefSection<UpstreamSummary>,
     pub transitions: BriefSection<Transition>,
     pub artifact_issues: BriefSection<ProfileArtifact>,
-    pub unavailable_artifact_count: usize,
+    pub profiles_unavailable: usize,
     pub warnings: Vec<String>,
 }
 
@@ -57,43 +57,41 @@ pub struct BriefOutput {
 #[derive(Debug, Serialize)]
 pub struct BriefHostNode {
     pub node: String,
-    pub cpu_busy_percent: Option<f64>,
-    pub cpu_busy_peak_percent: Option<f64>,
+    pub cpu_busy_avg_percent: Option<f64>,
+    pub cpu_busy_max_percent: Option<f64>,
     /// 最も詰まっていたコアのピーク。全体に余裕があっても1コアだけ飽和する構成を見落とさない。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub busiest_core_peak_percent: Option<f64>,
+    pub busiest_core_max_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub iowait_percent: Option<f64>,
+    pub iowait_avg_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub steal_percent: Option<f64>,
+    pub steal_avg_percent: Option<f64>,
     /// PSIのうち最も高かったもの（resource名とピーク）。taskが資源待ちで止まった時間の割合。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pressure: Option<BriefPressure>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub load1_peak: Option<f64>,
+    pub load1_max: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_used_peak_bytes: Option<f64>,
+    pub memory_used_max_mib: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_util_peak_percent: Option<f64>,
+    pub disk_util_max_percent: Option<f64>,
     /// CPUを多く使っていたserviceの上位。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub top_services: Vec<BriefService>,
-    /// このnodeの詳細行数。`query`で何件に当たるかの目安。
-    pub detail_rows: usize,
 }
 
 /// どの値も閾値を下回っていたnode。負荷を振り分ける余地として、名前とその中の最大値だけ残す。
 #[derive(Debug, Serialize)]
 pub struct BriefQuietHosts {
     pub nodes: Vec<String>,
-    pub cpu_busy_peak_percent: f64,
-    pub busiest_core_peak_percent: f64,
+    pub cpu_busy_max_percent: f64,
+    pub busiest_core_max_percent: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub iowait_percent: Option<f64>,
+    pub iowait_avg_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pressure_peak_percent: Option<f64>,
+    pub pressure_max_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_util_peak_percent: Option<f64>,
+    pub disk_util_max_percent: Option<f64>,
 }
 
 /// [`crate::changes::RunReview`]から判断に要る部分だけを残したもの。長文は冒頭だけにし、
@@ -112,7 +110,7 @@ pub struct BriefReview {
 pub struct BriefAnalysis {
     pub verdict: crate::model::AnalysisVerdict,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_run: Option<String>,
+    pub base_short_id: Option<String>,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_text: Option<String>,
@@ -120,7 +118,7 @@ pub struct BriefAnalysis {
 
 #[derive(Debug, Serialize)]
 pub struct BriefComparison {
-    pub base_run: String,
+    pub base_short_id: String,
     pub score: crate::diff::ScoreDiff,
     pub conditions: Vec<crate::changes::ComparisonCondition>,
 }
@@ -160,7 +158,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
         let (body, cut) = excerpt(&analysis.body);
         BriefAnalysis {
             verdict: analysis.verdict,
-            base_run: analysis.base_run_id.as_deref().map(short),
+            base_short_id: analysis.base_run_id.as_deref().map(short),
             body,
             full_text: cut.then(|| {
                 format!(
@@ -171,7 +169,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
         }
     });
     let comparison = review.comparison.map(|comparison| BriefComparison {
-        base_run: short(&comparison.base_run_id),
+        base_short_id: short(&comparison.base_run_id),
         score: comparison.score,
         conditions: comparison.conditions,
     });
@@ -209,16 +207,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
                         decision
                             .evidence
                             .iter()
-                            .map(|evidence| {
-                                let commit = evidence
-                                    .source
-                                    .commit_hash
-                                    .as_deref()
-                                    .map(|hash| &hash[..12.min(hash.len())])
-                                    .unwrap_or("no-commit");
-                                let dirty = if evidence.source.dirty { " dirty" } else { "" };
-                                format!("{} {commit}{dirty}", short(&evidence.run_id))
-                            })
+                            .map(crate::changes::evidence_label)
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -243,28 +232,28 @@ pub struct BriefClientNode {
     pub node: String,
     /// 最初の要求から最後の応答までを積んだ同時接続数（遊休中の保持は含まない）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub connections_in_use: Option<f64>,
+    pub connections_in_use_avg: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub connections_in_use_peak: Option<f64>,
+    pub connections_in_use_max: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connections_opened_per_second: Option<f64>,
     /// 応答を返してから同じ接続に次の要求が来るまで（ms）。5秒ごとの分位のうち最も大きい値。
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub request_gap_ms: BTreeMap<String, f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests_per_connection: Option<f64>,
+    pub requests_per_connection_avg: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BriefPressure {
     pub resource: String,
-    pub peak_percent: f64,
+    pub max_percent: f64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BriefService {
     pub service: String,
-    pub cpu_cores_peak: f64,
+    pub cpu_cores_max: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,10 +342,10 @@ pub fn build(
     limit: usize,
 ) -> BriefOutput {
     let run = diagnostics.run;
-    let (coverage_issues, coverage_info_count) = coverage_issues(diagnostics.coverage);
+    let (coverage_issues, coverage_notes_hidden) = coverage_issues(diagnostics.coverage);
     let mut http = diagnostics.http;
     http.iter_mut().for_each(query::round_http_summary);
-    let (mut database, omitted_alternative_database_rows, database_window) =
+    let (mut database, database_rows_filtered_out, database_window) =
         preferred_database(diagnostics.database, &run);
     database.iter_mut().for_each(query::round_database_summary);
     let hosts_window = diagnostics.host_window;
@@ -372,7 +361,7 @@ pub fn build(
     let clients = client_nodes(&diagnostics.client, window_seconds);
     let (hosts, quiet_hosts) = split_quiet_hosts(host_nodes(&diagnostics.host));
     let benchmark_messages = benchmark_messages(&run);
-    let unavailable_artifact_count = diagnostics
+    let profiles_unavailable = diagnostics
         .artifacts
         .iter()
         .filter(|item| item.status == "unavailable")
@@ -396,14 +385,14 @@ pub fn build(
             metric_count: run.metric_count,
         },
         coverage_issues: section(coverage_issues, limit),
-        coverage_info_count,
+        coverage_notes_hidden,
         benchmark: section(by_metric_then_magnitude(benchmark.rows), limit),
         score_inputs: section(score_inputs.rows, limit),
         benchmark_messages,
         http: section(http, limit),
         database_window,
         database: section(database, limit),
-        omitted_alternative_database_rows,
+        database_rows_filtered_out,
         cpu: section(
             diagnostics
                 .cpu
@@ -426,7 +415,7 @@ pub fn build(
                 .collect(),
             limit,
         ),
-        unavailable_artifact_count,
+        profiles_unavailable,
         warnings: benchmark.warnings,
     }
 }
@@ -571,10 +560,10 @@ fn client_nodes(rows: &[HostSummary], window_seconds: Option<f64>) -> Vec<BriefC
                 .collect();
             BriefClientNode {
                 node: node.into(),
-                connections_in_use: find("client.connections_in_use")
+                connections_in_use_avg: find("client.connections_in_use")
                     .and_then(|row| row.value)
                     .map(|value| query::round_to(value, 1)),
-                connections_in_use_peak: find("client.connections_in_use")
+                connections_in_use_max: find("client.connections_in_use")
                     .map(|row| query::round_to(row.peak, 1)),
                 // 新規接続数は加算できる値で、`value`は区間の合計（1 bucketぶんではない）。
                 connections_opened_per_second: find("client.connections_opened")
@@ -582,7 +571,7 @@ fn client_nodes(rows: &[HostSummary], window_seconds: Option<f64>) -> Vec<BriefC
                     .zip(window_seconds)
                     .map(|(total, seconds)| query::round_to(total / seconds, 1)),
                 request_gap_ms,
-                requests_per_connection: find("client.connection_requests_mean")
+                requests_per_connection_avg: find("client.connection_requests_mean")
                     .and_then(|row| row.value)
                     .map(|value| query::round_to(value, 2)),
             }
@@ -613,7 +602,7 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                     .reduce(f64::max)
                     .map(|value| query::round_to(value, 2))
             };
-            let busiest_core_peak_percent =
+            let busiest_core_max_percent =
                 peak("host.core_busy_max_percent").or_else(|| peak("host.core_busy_percent"));
             let pressure = rows
                 .iter()
@@ -627,33 +616,33 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         .trim_start_matches("host.psi_")
                         .trim_end_matches("_some_percent")
                         .into(),
-                    peak_percent: query::round_to(row.peak, 2),
+                    max_percent: query::round_to(row.peak, 2),
                 });
             let mut services = rows
                 .iter()
                 .filter(|row| row.metric == "service.cpu_cores")
                 .map(|row| BriefService {
                     service: row.target.clone(),
-                    cpu_cores_peak: query::round_to(row.peak, 3),
+                    cpu_cores_max: query::round_to(row.peak, 3),
                 })
                 .collect::<Vec<_>>();
-            services.sort_by(|a, b| b.cpu_cores_peak.total_cmp(&a.cpu_cores_peak));
+            services.sort_by(|a, b| b.cpu_cores_max.total_cmp(&a.cpu_cores_max));
             services.truncate(3);
             BriefHostNode {
                 node: node.into(),
-                cpu_busy_percent: average("host.cpu_busy_percent")
+                cpu_busy_avg_percent: average("host.cpu_busy_percent")
                     .or_else(|| average("host.cpu_percent")),
-                cpu_busy_peak_percent: peak("host.cpu_busy_percent")
+                cpu_busy_max_percent: peak("host.cpu_busy_percent")
                     .or_else(|| peak("host.cpu_percent")),
-                busiest_core_peak_percent,
-                iowait_percent: average("host.cpu_iowait_percent"),
-                steal_percent: average("host.cpu_steal_percent"),
+                busiest_core_max_percent,
+                iowait_avg_percent: average("host.cpu_iowait_percent"),
+                steal_avg_percent: average("host.cpu_steal_percent"),
                 pressure,
-                load1_peak: peak("host.load1"),
-                memory_used_peak_bytes: peak("host.memory_used_bytes"),
-                disk_util_peak_percent: peak("host.disk_util_percent"),
+                load1_max: peak("host.load1"),
+                memory_used_max_mib: peak("host.memory_used_bytes")
+                    .map(|bytes| query::round_to(bytes / 1_048_576.0, 1)),
+                disk_util_max_percent: peak("host.disk_util_percent"),
                 top_services: services,
-                detail_rows: rows.len(),
             }
         })
         .collect()
@@ -684,16 +673,16 @@ fn is_idle(row: &CpuSummary) -> bool {
 /// 遊んでいたとは言えないので、まとめずにそのまま出す。1台だけならまとめても短くならない。
 fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<BriefQuietHosts>) {
     let quiet = |node: &BriefHostNode| {
-        node.cpu_busy_peak_percent.is_some_and(|value| value < 25.0)
+        node.cpu_busy_max_percent.is_some_and(|value| value < 25.0)
             && node
-                .busiest_core_peak_percent
+                .busiest_core_max_percent
                 .is_some_and(|value| value < 30.0)
-            && node.iowait_percent.is_none_or(|value| value < 5.0)
+            && node.iowait_avg_percent.is_none_or(|value| value < 5.0)
             && node
                 .pressure
                 .as_ref()
-                .is_none_or(|pressure| pressure.peak_percent < 10.0)
-            && node.disk_util_peak_percent.is_none_or(|value| value < 20.0)
+                .is_none_or(|pressure| pressure.max_percent < 10.0)
+            && node.disk_util_max_percent.is_none_or(|value| value < 20.0)
     };
     let (quiet, busy): (Vec<_>, Vec<_>) = nodes.into_iter().partition(quiet);
     if quiet.len() < 2 {
@@ -704,17 +693,15 @@ fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<B
     }
     let max = |values: &mut dyn Iterator<Item = Option<f64>>| values.flatten().reduce(f64::max);
     let summary = BriefQuietHosts {
-        cpu_busy_peak_percent: max(&mut quiet.iter().map(|node| node.cpu_busy_peak_percent))
+        cpu_busy_max_percent: max(&mut quiet.iter().map(|node| node.cpu_busy_max_percent))
             .unwrap_or_default(),
-        busiest_core_peak_percent: max(&mut quiet
+        busiest_core_max_percent: max(&mut quiet.iter().map(|node| node.busiest_core_max_percent))
+            .unwrap_or_default(),
+        iowait_avg_percent: max(&mut quiet.iter().map(|node| node.iowait_avg_percent)),
+        pressure_max_percent: max(&mut quiet
             .iter()
-            .map(|node| node.busiest_core_peak_percent))
-        .unwrap_or_default(),
-        iowait_percent: max(&mut quiet.iter().map(|node| node.iowait_percent)),
-        pressure_peak_percent: max(&mut quiet
-            .iter()
-            .map(|node| node.pressure.as_ref().map(|pressure| pressure.peak_percent))),
-        disk_util_peak_percent: max(&mut quiet.iter().map(|node| node.disk_util_peak_percent)),
+            .map(|node| node.pressure.as_ref().map(|pressure| pressure.max_percent))),
+        disk_util_max_percent: max(&mut quiet.iter().map(|node| node.disk_util_max_percent)),
         nodes: quiet.into_iter().map(|node| node.node).collect(),
     };
     (busy, Some(summary))
@@ -752,20 +739,19 @@ mod tests {
     fn host(node: &str, busy: f64, core: f64, disk: f64) -> BriefHostNode {
         BriefHostNode {
             node: node.into(),
-            cpu_busy_percent: Some(busy / 2.0),
-            cpu_busy_peak_percent: Some(busy),
-            busiest_core_peak_percent: Some(core),
-            iowait_percent: Some(0.1),
-            steal_percent: None,
+            cpu_busy_avg_percent: Some(busy / 2.0),
+            cpu_busy_max_percent: Some(busy),
+            busiest_core_max_percent: Some(core),
+            iowait_avg_percent: Some(0.1),
+            steal_avg_percent: None,
             pressure: Some(BriefPressure {
                 resource: "io".into(),
-                peak_percent: 2.0,
+                max_percent: 2.0,
             }),
-            load1_peak: None,
-            memory_used_peak_bytes: None,
-            disk_util_peak_percent: Some(disk),
+            load1_max: None,
+            memory_used_max_mib: None,
+            disk_util_max_percent: Some(disk),
             top_services: Vec::new(),
-            detail_rows: 10,
         }
     }
 
@@ -785,7 +771,7 @@ mod tests {
     #[test]
     fn quiet_nodes_are_folded_and_nodes_with_missing_values_are_kept() {
         let mut unknown = host("app5", 3.0, 3.0, 1.0);
-        unknown.busiest_core_peak_percent = None;
+        unknown.busiest_core_max_percent = None;
         let (hosts, quiet) = split_quiet_hosts(vec![
             host("app1", 60.0, 72.0, 100.0),
             host("app2", 5.5, 5.8, 2.8),
@@ -799,8 +785,8 @@ mod tests {
         assert_eq!(names, ["app1", "app5"]);
         let quiet = quiet.unwrap();
         assert_eq!(quiet.nodes, ["app2", "app3"]);
-        assert_eq!(quiet.cpu_busy_peak_percent, 14.4);
-        assert_eq!(quiet.disk_util_peak_percent, Some(6.4));
+        assert_eq!(quiet.cpu_busy_max_percent, 14.4);
+        assert_eq!(quiet.disk_util_max_percent, Some(6.4));
         // 遊んでいたnodeが1台だけなら、まとめずにそのまま出す。
         let (hosts, quiet) = split_quiet_hosts(vec![
             host("app2", 5.0, 5.0, 2.0),
@@ -857,7 +843,7 @@ mod tests {
         let body = "減点が減った。".repeat(60);
         let brief = review(review_with(&body, &body));
         let analysis = brief.latest_analysis.unwrap();
-        assert_eq!(analysis.base_run.as_deref(), Some("224dc72b"));
+        assert_eq!(analysis.base_short_id.as_deref(), Some("224dc72b"));
         assert_eq!(analysis.body.chars().count(), EXCERPT_CHARS + 1);
         assert!(analysis.full_text.unwrap().contains("run_analyses"));
         let change = &brief.changes[0];

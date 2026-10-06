@@ -173,7 +173,7 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         .output()
         .unwrap();
     assert!(restored.status.success());
-    let brief: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+    let brief: serde_json::Value = parsed(&restored.stdout).unwrap();
     assert_eq!(
         brief["run"]["hypothesis"],
         "removing one allocation raises score without errors"
@@ -187,7 +187,7 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         .current_dir(project.path())
         .output()
         .unwrap();
-    let revisions: serde_json::Value = serde_json::from_slice(&revisions.stdout).unwrap();
+    let revisions: serde_json::Value = parsed(&revisions.stdout).unwrap();
     assert_eq!(revisions["rows"][1]["verdict"], "inconclusive");
     assert_eq!(
         revisions["rows"][1]["body"],

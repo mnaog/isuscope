@@ -732,11 +732,20 @@ async fn real_main(cli: Cli) -> Result<bool> {
                     runs,
                     reason,
                     revisit,
-                } => write_stdout_json(&store.decide_change(&id, status, reason, revisit, runs)?)?,
-                ChangeCommand::List { status, limit } => write_stdout_json(
-                    &serde_json::json!({"schema_version": 1, "changes": store.list_changes(status, None, limit)?}),
+                } => write_stdout_json(&isuscope::changes::DecisionView::from(
+                    store.decide_change(&id, status, reason, revisit, runs)?,
+                ))?,
+                ChangeCommand::List { status, limit } => write_stdout_json(&serde_json::json!({
+                    "schema_version": 1,
+                    "changes": store
+                        .list_changes(status, None, limit)?
+                        .into_iter()
+                        .map(isuscope::changes::ChangeSummaryView::from)
+                        .collect::<Vec<_>>(),
+                }))?,
+                ChangeCommand::Show { id } => write_stdout_json(
+                    &isuscope::changes::ChangeHistoryView::from(store.change_history(&id)?),
                 )?,
-                ChangeCommand::Show { id } => write_stdout_json(&store.change_history(&id)?)?,
             }
             Ok(true)
         }
@@ -795,9 +804,12 @@ struct SeriesOptions {
 struct SeriesOutput {
     schema_version: u32,
     run_id: String,
-    benchmark: SeriesInterval,
+    /// `from_seconds`の起点。区間がベンチ全体（`whole`）なら`window`と同じなので出さない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    benchmark: Option<SeriesInterval>,
     window: SeriesWindow,
-    filters: SeriesFilters,
+    /// 完了しなかったcollectorだけ。完了したものは並べない。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     coverage: Vec<SeriesCoverage>,
     #[serde(flatten)]
     data: SeriesData,
@@ -824,19 +836,6 @@ struct SeriesWindow {
 }
 
 #[derive(serde::Serialize)]
-struct SeriesFilters {
-    metrics: Vec<String>,
-    node: Option<String>,
-    labels: Vec<SeriesLabelFilter>,
-}
-
-#[derive(serde::Serialize)]
-struct SeriesLabelFilter {
-    key: String,
-    value: String,
-}
-
-#[derive(serde::Serialize)]
 struct SeriesCoverage {
     collector: String,
     node: String,
@@ -855,10 +854,18 @@ enum SeriesData {
         rows: Vec<OverviewSeriesRow>,
     },
     Metrics {
+        /// metricごとの単位と時系列の集計方法。行では繰り返さない。
+        metrics: BTreeMap<String, SeriesSemantics>,
         total_count: usize,
         truncated: bool,
         rows: Vec<MetricSeriesRow>,
     },
+}
+
+#[derive(serde::Serialize, Clone, PartialEq)]
+struct SeriesSemantics {
+    unit: String,
+    aggregation: MetricAggregation,
 }
 
 #[derive(serde::Serialize)]
@@ -866,17 +873,17 @@ struct OverviewSeriesRow {
     node: String,
     from_seconds: i64,
     to_seconds: i64,
-    cpu_percent_average: Option<f64>,
-    cpu_percent_max: Option<f64>,
-    memory_used_mib_average: Option<f64>,
+    cpu_busy_avg_percent: Option<f64>,
+    cpu_busy_max_percent: Option<f64>,
+    memory_used_avg_mib: Option<f64>,
     load1_max: Option<f64>,
-    disk_util_percent_max: Option<f64>,
-    disk_await_ms_max: Option<f64>,
+    disk_util_max_percent: Option<f64>,
+    disk_await_max_ms: Option<f64>,
     http_requests: Option<f64>,
-    http_p95_ms_max_of_quantile: Option<f64>,
+    http_p95_max_ms: Option<f64>,
     http_errors: Option<f64>,
     db_calls: Option<f64>,
-    db_total_duration_ms: Option<f64>,
+    db_duration_total_ms: Option<f64>,
 }
 
 #[derive(serde::Serialize)]
@@ -886,8 +893,13 @@ struct MetricSeriesRow {
     to_seconds: i64,
     metric: String,
     value: f64,
+    #[serde(skip)]
     unit: String,
+    #[serde(skip)]
     aggregation: MetricAggregation,
+    /// 同じmetric名で単位か集計方法が行ごとに違うときだけ、行に出す。
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    semantics: Option<SeriesSemantics>,
     labels: BTreeMap<String, String>,
 }
 
@@ -1023,7 +1035,7 @@ fn show_query(
                 let base = query::metric_query(base_id, base_metrics, options);
                 write_stdout_json(&query::metric_query_diff(base, candidate, limit))?;
             } else {
-                write_stdout_json(&candidate)?;
+                write_rows_json(&candidate, &["metric", "unit", "aggregation"])?;
             }
         }
         QueryViewArg::Database => {
@@ -1080,7 +1092,7 @@ fn show_query(
                 let base = query::database_query(base_id, base_metrics, options);
                 write_stdout_json(&query::database_query_diff(base, candidate, limit))?;
             } else {
-                write_stdout_json(&candidate)?;
+                write_rows_json(&candidate, &["node", "engine", "source", "window"])?;
             }
         }
         QueryViewArg::Http => {
@@ -1108,7 +1120,7 @@ fn show_query(
                 let base = query::http_query(base_id, base_metrics, options);
                 write_stdout_json(&query::http_query_diff(base, candidate, limit))?;
             } else {
-                write_stdout_json(&candidate)?;
+                write_rows_json(&candidate, &["node", "method"])?;
             }
         }
     }
@@ -1257,20 +1269,20 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
                 node,
                 from_seconds: from,
                 to_seconds: to,
-                cpu_percent_average: average_value(preferred_cpu(&row)),
-                cpu_percent_max: maximum_value(preferred_cpu(&row)),
-                memory_used_mib_average: average_value(&row.memory),
-                load1_max: maximum_value(&row.load),
-                disk_util_percent_max: maximum_value(&row.disk_util),
-                disk_await_ms_max: maximum_value(&row.disk_await),
-                http_requests: observed_sum(
+                cpu_busy_avg_percent: round3(average_value(preferred_cpu(&row))),
+                cpu_busy_max_percent: round3(maximum_value(preferred_cpu(&row))),
+                memory_used_avg_mib: round3(average_value(&row.memory)),
+                load1_max: round3(maximum_value(&row.load)),
+                disk_util_max_percent: round3(maximum_value(&row.disk_util)),
+                disk_await_max_ms: round3(maximum_value(&row.disk_await)),
+                http_requests: round3(observed_sum(
                     row.http_requests,
                     !row.http_p95.is_empty() || row.http_errors != 0.0,
-                ),
-                http_p95_ms_max_of_quantile: maximum_value(&row.http_p95),
-                http_errors: observed_sum(row.http_errors, row.http_requests != 0.0),
-                db_calls: row.database().0,
-                db_total_duration_ms: row.database().1,
+                )),
+                http_p95_max_ms: round3(maximum_value(&row.http_p95)),
+                http_errors: round3(observed_sum(row.http_errors, row.http_requests != 0.0)),
+                db_calls: round3(row.database().0),
+                db_duration_total_ms: round3(row.database().1),
             }
         })
         .collect::<Vec<_>>();
@@ -1367,10 +1379,12 @@ fn series_output(
     SeriesOutput {
         schema_version: 1,
         run_id,
-        benchmark: SeriesInterval {
-            started_at: benchmark_start.to_rfc3339(),
-            finished_at: benchmark_end.to_rfc3339(),
-        },
+        benchmark: ((window_start, window_end) != (benchmark_start, benchmark_end)).then(|| {
+            SeriesInterval {
+                started_at: benchmark_start.to_rfc3339(),
+                finished_at: benchmark_end.to_rfc3339(),
+            }
+        }),
         window: SeriesWindow {
             name: options.window.as_str().into(),
             started_at: window_start.to_rfc3339(),
@@ -1379,18 +1393,6 @@ fn series_output(
             to_seconds: (window_end - benchmark_start).num_seconds(),
             bucket_seconds: options.bucket,
             edges,
-        },
-        filters: SeriesFilters {
-            metrics: options.metrics.clone(),
-            node: options.node.clone(),
-            labels: options
-                .labels
-                .iter()
-                .map(|(key, value)| SeriesLabelFilter {
-                    key: key.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
         },
         coverage,
         data,
@@ -1558,7 +1560,7 @@ fn generic_series_data(
             .push(metric.value);
     }
     let total_count = rows.len();
-    let rows = rows
+    let mut rows = rows
         .into_iter()
         .take(options.limit)
         .map(
@@ -1574,15 +1576,43 @@ fn generic_series_data(
                     from_seconds,
                     to_seconds,
                     metric,
-                    value,
+                    value: query::round_to(value, 3),
                     unit,
                     aggregation,
+                    semantics: None,
                     labels,
                 }
             },
         )
-        .collect();
+        .collect::<Vec<_>>();
+    let mut metrics = BTreeMap::<String, Option<SeriesSemantics>>::new();
+    for row in &rows {
+        let semantics = SeriesSemantics {
+            unit: row.unit.clone(),
+            aggregation: row.aggregation,
+        };
+        metrics
+            .entry(row.metric.clone())
+            .and_modify(|known| {
+                if known.as_ref() != Some(&semantics) {
+                    *known = None;
+                }
+            })
+            .or_insert(Some(semantics));
+    }
+    for row in &mut rows {
+        if metrics.get(&row.metric).is_some_and(Option::is_none) {
+            row.semantics = Some(SeriesSemantics {
+                unit: row.unit.clone(),
+                aggregation: row.aggregation,
+            });
+        }
+    }
     SeriesData::Metrics {
+        metrics: metrics
+            .into_iter()
+            .filter_map(|(name, semantics)| Some((name, semantics?)))
+            .collect(),
         total_count,
         truncated: total_count > options.limit,
         rows,
@@ -1614,6 +1644,7 @@ fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<Serie
     collectors
         .iter()
         .filter(|collector| SERIES_COLLECTORS.contains(&collector.name.as_str()))
+        .filter(|collector| collector.status != "complete")
         .map(|collector| SeriesCoverage {
             collector: collector.name.clone(),
             node: collector.node.clone().unwrap_or_else(|| "local".into()),
@@ -1623,6 +1654,10 @@ fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<Serie
             error: collector.error.clone(),
         })
         .collect()
+}
+
+fn round3(value: Option<f64>) -> Option<f64> {
+    value.map(|value| query::round_to(value, 3))
 }
 
 fn average_value(values: &[f64]) -> Option<f64> {
@@ -1655,9 +1690,240 @@ fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
 /// 機械向けの出力。AIのtool出力には上限があり、超えると真ん中から削られるので字下げを付けない。
 /// 人が読むときは`jq`へ通す。
 fn write_stdout_json(value: &impl serde::Serialize) -> Result<()> {
-    serde_json::to_writer(std::io::stdout().lock(), value)?;
+    let mut value = serde_json::to_value(value)?;
+    integral_numbers(&mut value);
+    tabulate(&mut value);
+    fit_rows(&mut value)?;
+    serde_json::to_writer(std::io::stdout().lock(), &value)?;
     println!();
     Ok(())
+}
+
+/// 行を識別する値のうち全行で同じもの（1台のDBを見るときのnodeなど）を`common`へ1回だけ出し、
+/// 各行では繰り返さない。metric viewでは、全行で同じlabelも`common.labels`へまとめる。
+fn write_rows_json(value: &impl serde::Serialize, identity: &[&str]) -> Result<()> {
+    let mut value = serde_json::to_value(value)?;
+    hoist_common(&mut value, identity);
+    write_stdout_json(&value)
+}
+
+fn hoist_common(value: &mut serde_json::Value, identity: &[&str]) {
+    let Some(rows) = value.get("rows").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if rows.len() < 2 {
+        return;
+    }
+    let shared = |field: &str| {
+        let first = rows[0].get(field)?;
+        rows.iter()
+            .all(|row| row.get(field) == Some(first))
+            .then(|| first.clone())
+    };
+    let mut common = serde_json::Map::new();
+    for field in identity {
+        if let Some(shared) = shared(field) {
+            common.insert((*field).into(), shared);
+        }
+    }
+    let mut labels = serde_json::Map::new();
+    if let Some(first) = rows[0].get("labels").and_then(serde_json::Value::as_object) {
+        for (name, label) in first {
+            if rows
+                .iter()
+                .all(|row| row.get("labels").and_then(|labels| labels.get(name)) == Some(label))
+            {
+                labels.insert(name.clone(), label.clone());
+            }
+        }
+    }
+    if common.is_empty() && labels.is_empty() {
+        return;
+    }
+    if let Some(rows) = value
+        .get_mut("rows")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+            for field in common.keys() {
+                row.remove(field);
+            }
+            if let Some(row_labels) = row
+                .get_mut("labels")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                row_labels.retain(|name, _| !labels.contains_key(name));
+            }
+            if row
+                .get("labels")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                row.remove("labels");
+            }
+        }
+    }
+    if !labels.is_empty() {
+        common.insert("labels".into(), serde_json::Value::Object(labels));
+    }
+    if let Some(fields) = value.as_object_mut() {
+        fields.insert("common".into(), serde_json::Value::Object(common));
+    }
+}
+
+/// 行を持つ出力の大きさの上限。AIのtool出力は上限（Codexで約4500 tokens）を超えると真ん中から
+/// 削られ、どこが欠けたか分からなくなる。超えるときは行を末尾から減らし、減らしたことを伝える。
+/// 運用画面のように全行が要る呼び出しは`ISUSCOPE_OUTPUT_BYTES=0`で外す。
+const OUTPUT_BUDGET_BYTES: usize = 12_000;
+
+fn fit_rows(value: &mut serde_json::Value) -> Result<()> {
+    let budget = match env::var("ISUSCOPE_OUTPUT_BYTES") {
+        Ok(text) => text
+            .parse::<usize>()
+            .context("ISUSCOPE_OUTPUT_BYTES must be a byte count (0 for no limit)")?,
+        Err(_) => OUTPUT_BUDGET_BYTES,
+    };
+    let size = serde_json::to_vec(value)?.len();
+    if budget == 0 || size <= budget {
+        return Ok(());
+    }
+    let Some(rows) = value.get("rows").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    let shown = rows.len();
+    let sizes = rows
+        .iter()
+        .map(|row| serde_json::to_vec(row).map(|bytes| bytes.len() + 1))
+        .collect::<Result<Vec<_>, _>>()?;
+    // 警告の文の分を残しておく。
+    let mut used = size - sizes.iter().sum::<usize>() + 300;
+    let mut kept = 0;
+    for row_size in sizes {
+        if used + row_size > budget {
+            break;
+        }
+        used += row_size;
+        kept += 1;
+    }
+    let kept = kept.max(1);
+    if kept >= shown {
+        return Ok(());
+    }
+    let message = format!(
+        "output capped at {kept} of {shown} rows to fit the tool output limit; narrow it with --node, --label, --label-contains or --metric"
+    );
+    let Some(fields) = value.as_object_mut() else {
+        return Ok(());
+    };
+    if let Some(rows) = fields
+        .get_mut("rows")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        rows.truncate(kept);
+    }
+    fields.insert("truncated".into(), serde_json::Value::Bool(true));
+    match fields
+        .entry("warnings")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+    {
+        serde_json::Value::Array(warnings) => warnings.push(message.into()),
+        other => *other = serde_json::Value::Array(vec![message.into()]),
+    }
+    Ok(())
+}
+
+/// 同じ形の行が並ぶ表は、列名を`columns`に1回だけ置き、各行を値の並びにする。`rows`と`items`は
+/// 同じ階層に`columns`と`rows`を並べ（`common`はその前）、ほかの名前の表は`{columns, rows}`にする。
+fn tabulate(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(tabulate),
+        serde_json::Value::Object(fields) => {
+            fields.values_mut().for_each(tabulate);
+            let has_rows = ["rows", "items"]
+                .iter()
+                .any(|name| fields.get(*name).is_some_and(is_record_list));
+            let mut common = has_rows.then(|| fields.shift_remove("common")).flatten();
+            let mut output = serde_json::Map::new();
+            for (name, field) in std::mem::take(fields) {
+                if (name == "rows" || name == "items") && is_record_list(&field) {
+                    let (columns, rows) = table(field);
+                    if let Some(common) = common.take() {
+                        output.insert("common".into(), common);
+                    }
+                    output.insert("columns".into(), columns);
+                    output.insert("rows".into(), rows);
+                } else if is_record_list(&field)
+                    && field.as_array().is_some_and(|items| !items.is_empty())
+                {
+                    let (columns, rows) = table(field);
+                    output.insert(name, serde_json::json!({"columns": columns, "rows": rows}));
+                } else {
+                    output.insert(name, field);
+                }
+            }
+            *fields = output;
+        }
+        _ => {}
+    }
+}
+
+fn is_record_list(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().all(serde_json::Value::is_object))
+}
+
+fn table(value: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    let records = match value {
+        serde_json::Value::Array(records) => records,
+        _ => Vec::new(),
+    };
+    let mut columns = Vec::<String>::new();
+    for record in &records {
+        for name in record
+            .as_object()
+            .into_iter()
+            .flat_map(|fields| fields.keys())
+        {
+            if !columns.contains(name) {
+                columns.push(name.clone());
+            }
+        }
+    }
+    let rows = records
+        .into_iter()
+        .map(|mut record| {
+            serde_json::Value::Array(
+                columns
+                    .iter()
+                    .map(|name| {
+                        record
+                            .get_mut(name)
+                            .map(serde_json::Value::take)
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    (serde_json::json!(columns), serde_json::Value::Array(rows))
+}
+
+/// 件数のように小数部の無い値を`584.0`ではなく`584`で書く。
+fn integral_numbers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(float) = number.as_f64().filter(|_| number.is_f64())
+                && float.fract() == 0.0
+                && float.abs() < 9.0e15
+            {
+                *value = serde_json::Value::from(float as i64);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(integral_numbers),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(integral_numbers),
+        _ => {}
+    }
 }
 
 fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()> {
@@ -1727,6 +1993,51 @@ fn load_diagnostics(
 #[cfg(test)]
 mod series_tests {
     use super::*;
+
+    #[test]
+    fn shared_identity_moves_to_common_once() {
+        let mut value = serde_json::json!({"rows": [
+            {"node": "app1", "route": "/a", "count": 1, "labels": {"collector": "alp", "quantile": "0.95"}},
+            {"node": "app1", "route": "/b", "count": 2, "labels": {"collector": "alp", "quantile": "0.99"}},
+        ]});
+        hoist_common(&mut value, &["node", "route"]);
+        assert_eq!(value["common"]["node"], "app1");
+        assert_eq!(value["common"]["labels"]["collector"], "alp");
+        assert!(value["common"].get("route").is_none());
+        let row = &value["rows"][0];
+        assert!(row.get("node").is_none());
+        assert_eq!(row["route"], "/a");
+        assert_eq!(row["labels"], serde_json::json!({"quantile": "0.95"}));
+        // 1行だけなら何もまとめない。
+        let mut single = serde_json::json!({"rows": [{"node": "app1"}]});
+        hoist_common(&mut single, &["node"]);
+        assert!(single.get("common").is_none());
+    }
+
+    #[test]
+    fn row_output_is_capped_to_the_budget_and_says_so() {
+        let rows = (0..200)
+            .map(|index| serde_json::json!({"digest": format!("select * from user_present_all_received_history where id = {index}"), "calls": index}))
+            .collect::<Vec<_>>();
+        let mut value = serde_json::json!({"total_count": 200, "truncated": false, "rows": rows});
+        fit_rows(&mut value).unwrap();
+        assert!(serde_json::to_vec(&value).unwrap().len() <= OUTPUT_BUDGET_BYTES);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["total_count"], 200);
+        let kept = value["rows"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < 200);
+        assert!(
+            value["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{kept} of 200"))
+        );
+        // 収まる出力には手を付けない。
+        let mut small = serde_json::json!({"truncated": false, "rows": [{"calls": 1}]});
+        fit_rows(&mut small).unwrap();
+        assert_eq!(small["truncated"], false);
+        assert!(small.get("warnings").is_none());
+    }
 
     #[test]
     fn percent_only_query_loads_its_additive_dependency() {

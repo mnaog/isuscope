@@ -105,7 +105,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .output()
         .unwrap();
     assert!(list.status.success());
-    let list: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let list: serde_json::Value = parsed(&list.stdout).unwrap();
     assert_eq!(list["schema_version"], 1);
     assert_eq!(list["runs"].as_array().unwrap().len(), 1);
     assert_eq!(list["runs"][0]["score"], 12345);
@@ -117,10 +117,10 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .output()
         .unwrap();
     assert!(brief.status.success());
-    let brief: serde_json::Value = serde_json::from_slice(&brief.stdout).unwrap();
+    let brief: serde_json::Value = parsed(&brief.stdout).unwrap();
     assert_eq!(brief["schema_version"], 1);
     assert_eq!(brief["run"]["score"], 12345);
-    assert_eq!(brief["transitions"]["items"][0]["count"], 7);
+    assert_eq!(brief["transitions"]["rows"][0]["count"], 7);
 
     // `report`, `diff` and `ui` were removed; brief, query and sql cover the same data.
     for removed in [
@@ -157,8 +157,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .find(|entry| entry.file_name() != ".incomplete")
         .unwrap()
         .path();
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    let manifest: serde_json::Value = parsed(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
     database
         .execute(
             "UPDATE metrics SET observed_at=?1 WHERE name='cpu'",
@@ -171,13 +170,13 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .output()
         .unwrap();
     assert!(series.status.success());
-    let series: serde_json::Value = serde_json::from_slice(&series.stdout).unwrap();
+    let series: serde_json::Value = parsed(&series.stdout).unwrap();
     assert_eq!(series["schema_version"], 1);
     assert_eq!(series["mode"], "overview");
     assert_eq!(series["window"]["name"], "whole");
     assert_eq!(series["window"]["bucket_seconds"], 5);
     assert_eq!(series["rows"][0]["from_seconds"], 0);
-    assert!(series["rows"][0]["cpu_percent_average"].is_null());
+    assert!(series["rows"][0]["cpu_busy_avg_percent"].is_null());
 
     // What `metrics` used to print is one SQL query over the index.
     let inventory = Command::new(env!("CARGO_BIN_EXE_isuscope"))
@@ -195,7 +194,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         "{}",
         String::from_utf8_lossy(&inventory.stderr)
     );
-    let inventory: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    let inventory: serde_json::Value = parsed(&inventory.stdout).unwrap();
     let cpu = &inventory["rows"][0];
     assert_eq!(cpu["timestamped"], 1);
     assert_eq!(cpu["label"], "collector");
@@ -216,14 +215,14 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .output()
         .unwrap();
     assert!(filtered.status.success());
-    let filtered: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    let filtered: serde_json::Value = parsed(&filtered.stdout).unwrap();
     assert_eq!(filtered["mode"], "metrics");
     assert_eq!(filtered["window"]["bucket_seconds"], 10);
-    assert_eq!(filtered["filters"]["labels"][0]["key"], "collector");
-    assert_eq!(filtered["filters"]["labels"][0]["value"], "calculated");
     assert_eq!(filtered["rows"][0]["metric"], "cpu");
     assert_eq!(filtered["rows"][0]["value"], 12.5);
-    assert_eq!(filtered["rows"][0]["aggregation"], "average");
+    // 単位と集計方法はmetricごとに1回だけ出し、行では繰り返さない。
+    assert_eq!(filtered["metrics"]["cpu"]["aggregation"], "average");
+    assert!(filtered["rows"][0].get("aggregation").is_none());
     assert_eq!(filtered["rows"][0]["labels"]["collector"], "calculated");
 
     database
@@ -246,8 +245,8 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         "{}",
         String::from_utf8_lossy(&load_query.stderr)
     );
-    let load_query: serde_json::Value = serde_json::from_slice(&load_query.stdout).unwrap();
-    assert_eq!(load_query["selection"]["window"], "load");
+    let load_query: serde_json::Value = parsed(&load_query.stdout).unwrap();
+    assert_eq!(load_query["window"], "load");
     assert_eq!(load_query["rows"][0]["value"], 12.5);
     assert_eq!(load_query["rows"][0]["aggregation"], "average");
     assert!(run_dir.join("tooling/config.toml").is_file());

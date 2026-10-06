@@ -46,7 +46,7 @@ command = ["sh", "-c", "sed -E \"s/\\\"timestamp\\\":[0-9]+/\\\"timestamp\\\":$(
             "{args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_default()
+        parsed(&output.stdout).unwrap_or_default()
     };
     isuscope(&["run", "--hypothesis", "base"]);
     let first = isuscope(&["list"])["runs"][0]["id"]
@@ -80,15 +80,8 @@ command = ["sh", "-c", "sed -E \"s/\\\"timestamp\\\":[0-9]+/\\\"timestamp\\\":$(
         .filter_map(|row| row["db_calls"].as_f64())
         .sum::<f64>();
     assert_eq!(calls, expected_calls, "{series}");
-    assert!(
-        series["coverage"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["collector"] == "slp"),
-        "{}",
-        series["coverage"]
-    );
+    // coverageは完了しなかったcollectorだけを並べる。
+    assert!(series.get("coverage").is_none(), "{}", series["coverage"]);
 
     let database = isuscope(&[
         "query", &candidate, "--view", "database", "--window", "load",
@@ -100,7 +93,10 @@ command = ["sh", "-c", "sed -E \"s/\\\"timestamp\\\":[0-9]+/\\\"timestamp\\\":$(
     let comparison = isuscope(&[
         "query", &candidate, "--base", &base, "--view", "database", "--window", "load",
     ]);
-    let changes = &comparison["rows"][0]["changes"];
-    assert!(changes["p99_ms"].is_object(), "{changes}");
-    assert!(changes["max_ms"].is_object(), "{changes}");
+    // p99とmaxは両側の値で比べ、差分は主要な値だけに付ける。
+    let row = &comparison["rows"][0];
+    assert!(row["p99_ms"].is_number(), "{row}");
+    assert!(row["max_ms_base"].is_number(), "{row}");
+    assert!(row["total_ms_delta"].is_number(), "{row}");
+    assert!(row.get("p99_ms_delta").is_none(), "{row}");
 }

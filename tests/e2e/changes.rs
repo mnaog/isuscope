@@ -20,7 +20,7 @@ fn ok(project: &std::path::Path, args: &[&str]) -> String {
 }
 
 fn json(project: &std::path::Path, args: &[&str]) -> Value {
-    serde_json::from_str(&ok(project, args)).unwrap()
+    parsed(ok(project, args).as_bytes()).unwrap()
 }
 
 /// briefがrunを示す短縮形（`isuscope run`が表示するもの）。
@@ -191,7 +191,10 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         brief["review"]["latest_analysis"]["verdict"],
         "inconclusive"
     );
-    assert_eq!(brief["review"]["latest_analysis"]["base_run"], short(&base));
+    assert_eq!(
+        brief["review"]["latest_analysis"]["base_short_id"],
+        short(&base)
+    );
     assert_eq!(brief["review"]["comparison"]["score"]["delta"], -10);
     assert_eq!(brief["review"]["changes"][0]["status"], "accepted");
     assert!(
@@ -235,7 +238,22 @@ fn decisions_are_independent_recoverable_and_concurrent() {
             .len(),
         2
     );
-    assert!(history["decisions"][0]["evidence"][0]["source"]["state_sha256"].is_string());
+    // The saved record keeps each evidence run's source; the output names it in one line.
+    let decision_id = history["decisions"][0]["id"].as_str().unwrap();
+    let record: Value = parsed(
+        &fs::read(p.join(format!(
+            ".isuscope/changes/items/decisions/{decision_id}.json"
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(record["evidence"][0]["source"]["state_sha256"].is_string());
+    assert!(
+        history["decisions"][0]["evidence"][0]
+            .as_str()
+            .unwrap()
+            .starts_with(&candidate[candidate.len() - 8..])
+    );
 
     // Ignore unpublished files left by an interrupted writer.
     fs::write(
@@ -252,7 +270,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     assert_eq!(json(p, &["change", "show", "items"]), history);
     let restored = json(p, &["brief", &candidate]);
     assert_eq!(
-        restored["review"]["latest_analysis"]["base_run"],
+        restored["review"]["latest_analysis"]["base_short_id"],
         short(&base)
     );
     let db = Connection::open(p.join(".isuscope/isuscope.sqlite3")).unwrap();
@@ -403,10 +421,10 @@ fn analyze_records_a_change_decision_with_the_analysis() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|item| item["run_id"].as_str().unwrap().to_owned())
+        .map(|item| item.as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
     assert_eq!(evidence.len(), 2);
-    assert!(evidence[0].ends_with(&candidate) && evidence[1].ends_with(&base));
+    assert!(evidence[0].starts_with(&candidate) && evidence[1].starts_with(short(&base)));
 
     // --description only names a new change.
     let duplicate = cli(

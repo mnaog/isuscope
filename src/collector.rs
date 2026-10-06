@@ -448,7 +448,9 @@ async fn finalize(
                 "failed"
             }
             .into(),
-            exit_code,
+            // isuscopeが止めたcollectorの終了コード（SSH越しのSIGTERMで255など）は、失敗に見えるだけで
+            // 意味を持たない。
+            exit_code: exit_code.filter(|_| !(intentionally_stopped && success)),
             error,
             log_ids: logs.iter().map(|log| log.id.clone()).collect(),
         },

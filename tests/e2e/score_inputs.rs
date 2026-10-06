@@ -40,8 +40,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"score.tip
         .status
         .success()
     );
-    let brief: Value =
-        serde_json::from_slice(&isuscope(project.path(), &["brief", "latest"]).stdout).unwrap();
+    let brief: Value = parsed(&isuscope(project.path(), &["brief", "latest"]).stdout).unwrap();
     assert_eq!(brief["score_inputs"]["total_count"], 0, "{brief}");
     isuscope(
         project.path(),
@@ -60,9 +59,8 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"score.tip
         .status
         .success()
     );
-    let brief: Value =
-        serde_json::from_slice(&isuscope(project.path(), &["brief", "latest"]).stdout).unwrap();
-    let rows = brief["score_inputs"]["items"].as_array().unwrap();
+    let brief: Value = parsed(&isuscope(project.path(), &["brief", "latest"]).stdout).unwrap();
+    let rows = brief["score_inputs"]["rows"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "{brief}");
     assert_eq!(rows[0]["metric"], "score.tip_total");
     assert_eq!(rows[0]["value"], 4200.0);

@@ -52,7 +52,7 @@ emit client.connections_in_use 1 '"node":"app1"' "$(at 5)"
             "{args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_default()
+        parsed(&output.stdout).unwrap_or_default()
     };
     isuscope(&["run", "--hypothesis", "bucket edges"]);
     let requests = |series: &serde_json::Value| {
@@ -80,7 +80,7 @@ emit client.connections_in_use 1 '"node":"app1"' "$(at 5)"
     let brief = isuscope(&["brief", "latest"]);
     assert_eq!(brief["hosts_window"], "load");
     assert_eq!(
-        brief["clients"][0]["connections_in_use_peak"], 10.0,
+        brief["clients"][0]["connections_in_use_max"], 10.0,
         "{}",
         brief["clients"]
     );

@@ -38,7 +38,7 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
         .output()
         .unwrap();
     assert!(scenarios.status.success());
-    let scenarios: serde_json::Value = serde_json::from_slice(&scenarios.stdout).unwrap();
+    let scenarios: serde_json::Value = parsed(&scenarios.stdout).unwrap();
     assert_eq!(scenarios["total_count"], 2);
     assert_eq!(scenarios["rows"][0]["value"], 2.0);
     assert_eq!(scenarios["rows"][1]["value"], 10.0);
@@ -60,7 +60,7 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
         .output()
         .unwrap();
     assert!(database.status.success());
-    let database: serde_json::Value = serde_json::from_slice(&database.stdout).unwrap();
+    let database: serde_json::Value = parsed(&database.stdout).unwrap();
     assert_eq!(database["total_count"], 1);
     assert_eq!(database["rows"][0]["digest_count"], 2);
     assert_eq!(database["rows"][0]["calls"], 10.0);
@@ -91,14 +91,11 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
         .output()
         .unwrap();
     assert!(database_diff.status.success());
-    let database_diff: serde_json::Value = serde_json::from_slice(&database_diff.stdout).unwrap();
+    let database_diff: serde_json::Value = parsed(&database_diff.stdout).unwrap();
     assert_eq!(database_diff["view"], "database");
     assert_eq!(database_diff["total_count"], 1);
     assert_eq!(database_diff["rows"][0]["presence"], "both");
-    assert_eq!(
-        database_diff["rows"][0]["changes"]["total_ms"]["delta"],
-        0.0
-    );
+    assert_eq!(database_diff["rows"][0]["total_ms_delta"], 0.0);
 
     let brief = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["brief", "latest", "--limit", "1"])
@@ -106,10 +103,10 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
         .output()
         .unwrap();
     assert!(brief.status.success());
-    let brief: serde_json::Value = serde_json::from_slice(&brief.stdout).unwrap();
+    let brief: serde_json::Value = parsed(&brief.stdout).unwrap();
     assert_eq!(brief["run"]["score"], 123);
     assert_eq!(brief["run"]["passed"], true);
     assert_eq!(brief["benchmark"]["total_count"], 2);
     assert_eq!(brief["benchmark"]["truncated"], true);
-    assert_eq!(brief["benchmark"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(brief["benchmark"]["rows"].as_array().unwrap().len(), 1);
 }

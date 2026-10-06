@@ -82,7 +82,7 @@ pub struct UpstreamSummary {
     pub retried_requests: f64,
     pub connect_p95_ms: Option<f64>,
     pub header_p95_ms: Option<f64>,
-    pub response_mean_ms: Option<f64>,
+    pub response_avg_ms: Option<f64>,
     pub response_p95_ms: Option<f64>,
 }
 
@@ -196,7 +196,16 @@ pub struct HttpRouteSummary {
     pub errors: f64,
     pub error_rate: Option<f64>,
     pub response_bytes: Option<f64>,
+    /// 0件のclassは出さない。
+    #[serde(serialize_with = "nonzero_counts")]
     pub status_counts: BTreeMap<String, f64>,
+}
+
+fn nonzero_counts<S: serde::Serializer>(
+    counts: &BTreeMap<String, f64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(counts.iter().filter(|(_, count)| **count != 0.0))
 }
 
 pub fn http_routes(metrics: &[Metric]) -> Vec<HttpRouteSummary> {
@@ -447,9 +456,7 @@ pub fn upstream_summaries(summary: &[Metric]) -> Vec<UpstreamSummary> {
             ("http.upstream_response_duration", Some("0.95")) => {
                 row.response_p95_ms = Some(metric.value)
             }
-            ("http.upstream_response_duration_mean", _) => {
-                row.response_mean_ms = Some(metric.value)
-            }
+            ("http.upstream_response_duration_mean", _) => row.response_avg_ms = Some(metric.value),
             _ => {}
         }
     }
@@ -808,7 +815,7 @@ mod tests {
                     retried_requests: 3.0,
                     connect_p95_ms: Some(2.5),
                     header_p95_ms: None,
-                    response_mean_ms: Some(12.0),
+                    response_avg_ms: Some(12.0),
                     response_p95_ms: Some(40.0),
                 },
                 UpstreamSummary {

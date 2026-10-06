@@ -2,6 +2,50 @@ use rusqlite::Connection;
 use std::{fs, process::Command};
 use tempfile::tempdir;
 
+/// isuscopeは表を`columns`と`rows`（値の並び）で出す。テストでは名前付きの行に戻して読む。
+fn parsed(bytes: &[u8]) -> serde_json::Result<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+    untable(&mut value);
+    Ok(value)
+}
+
+fn untable(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(untable),
+        serde_json::Value::Object(fields) => {
+            fields.values_mut().for_each(untable);
+            let columns = fields
+                .get("columns")
+                .and_then(serde_json::Value::as_array)
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .filter_map(|name| name.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                });
+            let (Some(columns), Some(serde_json::Value::Array(rows))) =
+                (columns, fields.get("rows"))
+            else {
+                return;
+            };
+            let records = rows
+                .iter()
+                .map(|row| {
+                    let values = row.as_array().cloned().unwrap_or_default();
+                    serde_json::Value::Object(columns.iter().cloned().zip(values).collect())
+                })
+                .collect::<Vec<_>>();
+            if fields.len() == 2 {
+                *value = serde_json::Value::Array(records);
+            } else {
+                fields.shift_remove("columns");
+                fields.insert("rows".into(), serde_json::Value::Array(records));
+            }
+        }
+        _ => {}
+    }
+}
+
 #[path = "e2e/access_log.rs"]
 mod access_log;
 #[path = "e2e/adapters.rs"]

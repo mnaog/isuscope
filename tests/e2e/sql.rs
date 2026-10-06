@@ -41,7 +41,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
         project.path(),
         &["sql", "SELECT score, state FROM runs ORDER BY started_at"],
     );
-    let rows: Value = serde_json::from_slice(&rows.stdout).unwrap();
+    let rows: Value = parsed(&rows.stdout).unwrap();
     assert_eq!(rows["row_count"], 1);
     assert_eq!(rows["rows"][0]["score"], 42);
     assert_eq!(rows["rows"][0]["state"], "complete");
@@ -75,7 +75,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
         project.path(),
         &["sql", "SELECT COUNT(*) AS runs FROM runs"],
     );
-    let after: Value = serde_json::from_slice(&after.stdout).unwrap();
+    let after: Value = parsed(&after.stdout).unwrap();
     assert_eq!(after["rows"][0]["runs"], 1);
 
     // The removed commands are gone; SQL provides access to the stored data.
