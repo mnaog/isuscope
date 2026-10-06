@@ -16,7 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [1.88.0, stable]
+        toolchain: [1.88.0, 1.99.0]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
 
     steps:
       - name: Check out repository
@@ -85,10 +87,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.88.0
+      - name: Install Rust 1.99.0
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --component llvm-tools-preview
-          rustup default 1.88.0
+          rustup toolchain install 1.99.0 --profile minimal --component llvm-tools-preview
+          rustup default 1.99.0
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2.87.0
@@ -115,10 +117,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.88.0
+      - name: Install Rust 1.99.0
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
 
       - name: Build and verify offline bundle
         run: ./scripts/build-release-bundle.sh
