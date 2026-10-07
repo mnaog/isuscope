@@ -1929,33 +1929,50 @@ fn rows_of_mut<'a>(
     }
 }
 
+/// 表にするfield。形ではなく名前で決めるのは、空の配列でも表の形（`columns`と`rows`）で出し、
+/// 件数で出力の形が変わらないようにするため。行の中の短いlist（hostの`top_services`など）は、
+/// 表を入れ子にすると読みにくいのでオブジェクトの並びのまま残す。
+const TABLE_FIELDS: &[&str] = &[
+    "rows",
+    "items",
+    "runs",
+    "changes",
+    "decisions",
+    "conditions",
+    "hosts",
+    "clients",
+];
+
 /// 同じ形の行が並ぶ表は、列名を`columns`に1回だけ置き、各行を値の並びにする。`rows`と`items`は
 /// 同じ階層に`columns`と`rows`を並べ（`common`はその前）、ほかの名前の表は`{columns, rows}`にする。
 fn tabulate(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(items) => items.iter_mut().for_each(tabulate),
         serde_json::Value::Object(fields) => {
-            fields.values_mut().for_each(tabulate);
+            let is_table = |name: &str, field: &serde_json::Value| {
+                TABLE_FIELDS.contains(&name) && is_record_list(field)
+            };
             let has_rows = ["rows", "items"]
                 .iter()
-                .any(|name| fields.get(*name).is_some_and(is_record_list));
+                .any(|name| fields.get(*name).is_some_and(|field| is_table(name, field)));
             let mut common = has_rows.then(|| fields.shift_remove("common")).flatten();
             let mut output = serde_json::Map::new();
-            for (name, field) in std::mem::take(fields) {
-                if (name == "rows" || name == "items") && is_record_list(&field) {
-                    let (columns, rows) = table(field);
+            for (name, mut field) in std::mem::take(fields) {
+                if !is_table(&name, &field) {
+                    tabulate(&mut field);
+                    output.insert(name, field);
+                    continue;
+                }
+                tabulate(&mut field);
+                let (columns, rows) = table(field);
+                if name == "rows" || name == "items" {
                     if let Some(common) = common.take() {
                         output.insert("common".into(), common);
                     }
                     output.insert("columns".into(), columns);
                     output.insert("rows".into(), rows);
-                } else if is_record_list(&field)
-                    && field.as_array().is_some_and(|items| !items.is_empty())
-                {
-                    let (columns, rows) = table(field);
-                    output.insert(name, serde_json::json!({"columns": columns, "rows": rows}));
                 } else {
-                    output.insert(name, field);
+                    output.insert(name, serde_json::json!({"columns": columns, "rows": rows}));
                 }
             }
             *fields = output;
@@ -2112,6 +2129,30 @@ fn load_diagnostics(
 #[cfg(test)]
 mod series_tests {
     use super::*;
+
+    #[test]
+    fn named_tables_keep_their_shape_when_empty() {
+        let mut value = serde_json::json!({
+            "hosts": [],
+            "clients": [{"node": "app1", "connections_in_use_max": 4}],
+            "items": [],
+            "top": [{"service": "nginx"}],
+        });
+        tabulate(&mut value);
+        assert_eq!(
+            value["hosts"],
+            serde_json::json!({"columns": [], "rows": []})
+        );
+        assert_eq!(
+            value["clients"],
+            serde_json::json!({"columns": ["node", "connections_in_use_max"], "rows": [["app1", 4]]})
+        );
+        assert_eq!(value["columns"], serde_json::json!([]));
+        assert_eq!(value["rows"], serde_json::json!([]));
+        assert!(value.get("items").is_none());
+        // 名前の無いlistはオブジェクトの並びのまま。
+        assert_eq!(value["top"], serde_json::json!([{"service": "nginx"}]));
+    }
 
     #[test]
     fn shared_identity_moves_to_common_once() {
