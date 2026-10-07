@@ -1831,7 +1831,7 @@ struct RowCap {
 
 const QUERY_CAP: RowCap = RowCap {
     field: "rows",
-    hint: "narrow it with --node, --label, --label-contains, --metric or --limit",
+    hint: "narrow it with --node, --label, --label-contains or --limit (and --metric in the metric view)",
     shown_count: None,
 };
 const SERIES_CAP: RowCap = RowCap {
