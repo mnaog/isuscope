@@ -73,7 +73,7 @@ pub struct QueryDiffRow<T> {
     pub key_labels: Option<BTreeMap<String, String>>,
     /// 出力の`common`へまとめたので、この行の`key`では繰り返さない名前。
     pub shared: BTreeSet<String>,
-    /// 値の列の出し方。viewごとに[`finish_diff`]が決め、`--all-columns`で[`DiffColumns::All`]になる。
+    /// 値の列の出し方。viewごとに`finish_diff`が決め、`--all-columns`で[`DiffColumns::All`]になる。
     pub columns: DiffColumns,
     pub presence: QueryPresence,
     pub base: Option<T>,
