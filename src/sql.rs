@@ -6,7 +6,7 @@ use crate::config::LoadedConfig;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -22,7 +22,8 @@ pub struct SqlOutput {
     pub row_count: usize,
     /// True when `--limit` cut the result; the query itself decides what is interesting.
     pub truncated: bool,
-    pub rows: Vec<Value>,
+    /// Values in `columns` order, exactly as stored: no rounding, and REAL stays a float.
+    pub rows: Vec<Vec<Value>>,
 }
 
 pub fn database_path(config: &LoadedConfig) -> std::path::PathBuf {
@@ -81,11 +82,11 @@ pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput
             truncated = true;
             break;
         }
-        let mut object = Map::new();
-        for (index, column) in columns.iter().enumerate() {
-            object.insert(column.clone(), value_of(row.get_ref(index)?));
-        }
-        rows.push(Value::Object(object));
+        rows.push(
+            (0..columns.len())
+                .map(|index| row.get_ref(index).map(value_of))
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
     }
     Ok(SqlOutput {
         schema_version: 1,
@@ -110,13 +111,12 @@ fn value_of(value: ValueRef<'_>) -> Value {
 pub fn write_tsv(output: &SqlOutput, mut writer: impl std::io::Write) -> Result<()> {
     writeln!(writer, "{}", output.columns.join("\t"))?;
     for row in &output.rows {
-        let cells = output
-            .columns
+        let cells = row
             .iter()
-            .map(|column| match row.get(column) {
-                Some(Value::Null) | None => String::new(),
-                Some(Value::String(text)) => text.replace(['\t', '\n'], " "),
-                Some(value) => value.to_string(),
+            .map(|value| match value {
+                Value::Null => String::new(),
+                Value::String(text) => text.replace(['\t', '\n'], " "),
+                value => value.to_string(),
             })
             .collect::<Vec<_>>();
         writeln!(writer, "{}", cells.join("\t"))?;

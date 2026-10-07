@@ -47,6 +47,28 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
     assert_eq!(rows["rows"][0]["state"], "complete");
     assert_eq!(rows["truncated"], false);
 
+    // SQL returns stored values as they are: no rounding, REAL stays a float, and an empty
+    // result still names its columns.
+    let raw = isuscope(
+        project.path(),
+        &[
+            "sql",
+            "SELECT 1700000000.123456 AS at, 1.0 AS one, 0.00012345 AS small",
+        ],
+    );
+    let raw = String::from_utf8_lossy(&raw.stdout);
+    assert!(
+        raw.contains(r#""rows":[[1700000000.123456,1.0,0.00012345]]"#),
+        "{raw}"
+    );
+    let empty = isuscope(
+        project.path(),
+        &["sql", "SELECT id, score FROM runs WHERE 0"],
+    );
+    let empty: Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(empty["columns"], serde_json::json!(["id", "score"]));
+    assert_eq!(empty["rows"], serde_json::json!([]));
+
     // The limit says so instead of printing everything.
     let limited = isuscope(
         project.path(),

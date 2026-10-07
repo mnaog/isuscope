@@ -573,7 +573,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             let query = query.context("a SELECT statement or --schema is required")?;
             let output = isuscope::sql::query(&config, &query, limit)?;
             match format {
-                isuscope::sql::SqlFormat::Json => write_stdout_json(&output)?,
+                isuscope::sql::SqlFormat::Json => write_sql_json(&output)?,
                 isuscope::sql::SqlFormat::Tsv => {
                     isuscope::sql::write_tsv(&output, std::io::stdout().lock())?
                 }
@@ -734,14 +734,17 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 } => write_stdout_json(&isuscope::changes::DecisionView::from(
                     store.decide_change(&id, status, reason, revisit, runs)?,
                 ))?,
-                ChangeCommand::List { status, limit } => write_stdout_json(&serde_json::json!({
-                    "schema_version": 1,
-                    "changes": store
-                        .list_changes(status, None, limit)?
-                        .into_iter()
-                        .map(isuscope::changes::ChangeSummaryView::from)
-                        .collect::<Vec<_>>(),
-                }))?,
+                ChangeCommand::List { status, limit } => write_capped_json(
+                    &serde_json::json!({
+                        "schema_version": 1,
+                        "changes": store
+                            .list_changes(status, None, limit)?
+                            .into_iter()
+                            .map(isuscope::changes::ChangeSummaryView::from)
+                            .collect::<Vec<_>>(),
+                    }),
+                    &CHANGE_LIST_CAP,
+                )?,
                 ChangeCommand::Show { id } => write_stdout_json(
                     &isuscope::changes::ChangeHistoryView::from(store.change_history(&id)?),
                 )?,
@@ -1032,7 +1035,10 @@ fn show_query(
                     });
                 }
                 let base = query::metric_query(base_id, base_metrics, options);
-                write_stdout_json(&query::metric_query_diff(base, candidate, limit))?;
+                write_capped_json(
+                    &query::metric_query_diff(base, candidate, limit),
+                    &QUERY_CAP,
+                )?;
             } else {
                 write_rows_json(&candidate, &["metric", "unit", "aggregation"])?;
             }
@@ -1089,7 +1095,10 @@ fn show_query(
                     refuse_unsplit_database_window(&base_id, &base_metrics, window)?;
                 }
                 let base = query::database_query(base_id, base_metrics, options);
-                write_stdout_json(&query::database_query_diff(base, candidate, limit))?;
+                write_capped_json(
+                    &query::database_query_diff(base, candidate, limit),
+                    &QUERY_CAP,
+                )?;
             } else {
                 write_rows_json(&candidate, &["node", "engine", "source", "window"])?;
             }
@@ -1117,7 +1126,7 @@ fn show_query(
                 let base_metrics =
                     store.query_metrics(&base_id, &[], Some("http."), Some(false))?;
                 let base = query::http_query(base_id, base_metrics, options);
-                write_stdout_json(&query::http_query_diff(base, candidate, limit))?;
+                write_capped_json(&query::http_query_diff(base, candidate, limit), &QUERY_CAP)?;
             } else {
                 write_rows_json(&candidate, &["node", "method"])?;
             }
@@ -1199,17 +1208,20 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         .collect::<Vec<_>>();
     if !options.metrics.is_empty() {
         let data = generic_series_data(start, requested_start, requested_end, &options, metrics);
-        write_stdout_json(&series_output(
-            id,
-            start,
-            end,
-            requested_start,
-            requested_end,
-            &options,
-            edges,
-            series_coverage(&manifest.collectors),
-            data,
-        ))?;
+        write_capped_json(
+            &series_output(
+                id,
+                start,
+                end,
+                requested_start,
+                requested_end,
+                &options,
+                edges,
+                series_coverage(&manifest.collectors),
+                data,
+            ),
+            &SERIES_CAP,
+        )?;
         return Ok(());
     }
     let mut rows = BTreeMap::<(String, i64), BucketRow>::new();
@@ -1287,21 +1299,24 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         .collect::<Vec<_>>();
     let total_count = rows.len();
     rows.truncate(options.limit);
-    write_stdout_json(&series_output(
-        id,
-        start,
-        end,
-        requested_start,
-        requested_end,
-        &options,
-        edges,
-        series_coverage(&manifest.collectors),
-        SeriesData::Overview {
-            total_count,
-            truncated: total_count > options.limit,
-            rows,
-        },
-    ))?;
+    write_capped_json(
+        &series_output(
+            id,
+            start,
+            end,
+            requested_start,
+            requested_end,
+            &options,
+            edges,
+            series_coverage(&manifest.collectors),
+            SeriesData::Overview {
+                total_count,
+                truncated: total_count > options.limit,
+                rows,
+            },
+        ),
+        &SERIES_CAP,
+    )?;
     Ok(())
 }
 
@@ -1679,21 +1694,45 @@ struct RunListOutput {
 
 fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
-    write_stdout_json(&RunListOutput {
-        schema_version: 1,
-        runs: store.list(limit)?,
-    })?;
+    write_capped_json(
+        &RunListOutput {
+            schema_version: 1,
+            runs: store.list(limit)?,
+        },
+        &LIST_CAP,
+    )?;
     Ok(())
 }
 
 /// 機械向けの出力。AIのtool出力には上限があり、超えると真ん中から削られるので字下げを付けない。
 /// 人が読むときは`jq`へ通す。
 fn write_stdout_json(value: &impl serde::Serialize) -> Result<()> {
-    let mut value = serde_json::to_value(value)?;
-    integral_numbers(&mut value);
+    write_json(serde_json::to_value(value)?, None)
+}
+
+/// 行を返す出力。約[`OUTPUT_BUDGET_BYTES`]を超えるなら`cap`の行を末尾から減らす。
+fn write_capped_json(value: &impl serde::Serialize, cap: &RowCap) -> Result<()> {
+    write_json(serde_json::to_value(value)?, Some(cap))
+}
+
+fn write_json(mut value: serde_json::Value, cap: Option<&RowCap>) -> Result<()> {
+    round_numbers(&mut value);
     tabulate(&mut value);
-    fit_rows(&mut value)?;
-    serde_json::to_writer(std::io::stdout().lock(), &value)?;
+    if let Some(cap) = cap {
+        fit_rows(&mut value, cap)?;
+    }
+    print_json(&value)
+}
+
+/// `sql`は保存値をそのまま返す。丸めも表への組み替えもせず（行は最初から値の並び）、大きさだけ抑える。
+fn write_sql_json(output: &isuscope::sql::SqlOutput) -> Result<()> {
+    let mut value = serde_json::to_value(output)?;
+    fit_rows(&mut value, &SQL_CAP)?;
+    print_json(&value)
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    serde_json::to_writer(std::io::stdout().lock(), value)?;
     println!();
     Ok(())
 }
@@ -1703,7 +1742,7 @@ fn write_stdout_json(value: &impl serde::Serialize) -> Result<()> {
 fn write_rows_json(value: &impl serde::Serialize, identity: &[&str]) -> Result<()> {
     let mut value = serde_json::to_value(value)?;
     hoist_common(&mut value, identity);
-    write_stdout_json(&value)
+    write_json(value, Some(&QUERY_CAP))
 }
 
 fn hoist_common(value: &mut serde_json::Value, identity: &[&str]) {
@@ -1781,7 +1820,42 @@ fn hoist_common(value: &mut serde_json::Value, identity: &[&str]) {
 /// 運用画面のように全行が要る呼び出しは`ISUSCOPE_OUTPUT_BYTES=0`で外す。
 const OUTPUT_BUDGET_BYTES: usize = 12_000;
 
-fn fit_rows(value: &mut serde_json::Value) -> Result<()> {
+/// 行を減らす対象と、減らしたときに勧める絞り方。
+struct RowCap {
+    /// トップレベルの行の配列。表にした後の`{columns, rows}`でもよい。
+    field: &'static str,
+    hint: &'static str,
+    /// 減らした後の行数で書き換えるfield（`sql`の`row_count`）。
+    shown_count: Option<&'static str>,
+}
+
+const QUERY_CAP: RowCap = RowCap {
+    field: "rows",
+    hint: "narrow it with --node, --label, --label-contains, --metric or --limit",
+    shown_count: None,
+};
+const SERIES_CAP: RowCap = RowCap {
+    field: "rows",
+    hint: "the last rows (later metrics and buckets) were dropped; narrow it with --metric, --node, --label or --from/--to",
+    shown_count: None,
+};
+const SQL_CAP: RowCap = RowCap {
+    field: "rows",
+    hint: "narrow it with WHERE or LIMIT",
+    shown_count: Some("row_count"),
+};
+const LIST_CAP: RowCap = RowCap {
+    field: "runs",
+    hint: "lower --limit",
+    shown_count: None,
+};
+const CHANGE_LIST_CAP: RowCap = RowCap {
+    field: "changes",
+    hint: "filter it with --status or lower --limit",
+    shown_count: None,
+};
+
+fn fit_rows(value: &mut serde_json::Value, cap: &RowCap) -> Result<()> {
     let budget = match env::var("ISUSCOPE_OUTPUT_BYTES") {
         Ok(text) => text
             .parse::<usize>()
@@ -1792,7 +1866,7 @@ fn fit_rows(value: &mut serde_json::Value) -> Result<()> {
     if budget == 0 || size <= budget {
         return Ok(());
     }
-    let Some(rows) = value.get("rows").and_then(serde_json::Value::as_array) else {
+    let Some(rows) = rows_of(value, cap.field) else {
         return Ok(());
     };
     let shown = rows.len();
@@ -1815,18 +1889,19 @@ fn fit_rows(value: &mut serde_json::Value) -> Result<()> {
         return Ok(());
     }
     let message = format!(
-        "output capped at {kept} of {shown} rows to fit the tool output limit; narrow it with --node, --label, --label-contains or --metric"
+        "output capped at {kept} of {shown} rows to fit the tool output limit; {}",
+        cap.hint
     );
+    if let Some(rows) = rows_of_mut(value, cap.field) {
+        rows.truncate(kept);
+    }
     let Some(fields) = value.as_object_mut() else {
         return Ok(());
     };
-    if let Some(rows) = fields
-        .get_mut("rows")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        rows.truncate(kept);
-    }
     fields.insert("truncated".into(), serde_json::Value::Bool(true));
+    if let Some(count) = cap.shown_count {
+        fields.insert(count.into(), kept.into());
+    }
     match fields
         .entry("warnings")
         .or_insert_with(|| serde_json::Value::Array(Vec::new()))
@@ -1835,6 +1910,23 @@ fn fit_rows(value: &mut serde_json::Value) -> Result<()> {
         other => *other = serde_json::Value::Array(vec![message.into()]),
     }
     Ok(())
+}
+
+fn rows_of<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a Vec<serde_json::Value>> {
+    match value.get(field)? {
+        serde_json::Value::Array(rows) => Some(rows),
+        table => table.get("rows")?.as_array(),
+    }
+}
+
+fn rows_of_mut<'a>(
+    value: &'a mut serde_json::Value,
+    field: &str,
+) -> Option<&'a mut Vec<serde_json::Value>> {
+    match value.get_mut(field)? {
+        serde_json::Value::Array(rows) => Some(rows),
+        table => table.get_mut("rows")?.as_array_mut(),
+    }
 }
 
 /// 同じ形の行が並ぶ表は、列名を`columns`に1回だけ置き、各行を値の並びにする。`rows`と`items`は
@@ -1916,7 +2008,7 @@ fn table(value: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
 
 /// 小数は3桁まで（0.001未満は有効数字3桁）に丸め、件数のように小数部の無い値は`584.0`ではなく
 /// `584`で書く。
-fn integral_numbers(value: &mut serde_json::Value) {
+fn round_numbers(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Number(number) => {
             let Some(float) = number.as_f64().filter(|_| number.is_f64()) else {
@@ -1934,8 +2026,8 @@ fn integral_numbers(value: &mut serde_json::Value) {
                 serde_json::Number::from_f64(float).map_or(serde_json::Value::Null, Into::into)
             };
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(integral_numbers),
-        serde_json::Value::Object(fields) => fields.values_mut().for_each(integral_numbers),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(round_numbers),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(round_numbers),
         _ => {}
     }
 }
@@ -2047,7 +2139,7 @@ mod series_tests {
             .map(|index| serde_json::json!({"digest": format!("select * from user_present_all_received_history where id = {index}"), "calls": index}))
             .collect::<Vec<_>>();
         let mut value = serde_json::json!({"total_count": 200, "truncated": false, "rows": rows});
-        fit_rows(&mut value).unwrap();
+        fit_rows(&mut value, &QUERY_CAP).unwrap();
         assert!(serde_json::to_vec(&value).unwrap().len() <= OUTPUT_BUDGET_BYTES);
         assert_eq!(value["truncated"], true);
         assert_eq!(value["total_count"], 200);
@@ -2061,9 +2153,32 @@ mod series_tests {
         );
         // 収まる出力には手を付けない。
         let mut small = serde_json::json!({"truncated": false, "rows": [{"calls": 1}]});
-        fit_rows(&mut small).unwrap();
+        fit_rows(&mut small, &QUERY_CAP).unwrap();
         assert_eq!(small["truncated"], false);
         assert!(small.get("warnings").is_none());
+    }
+
+    #[test]
+    fn caps_reach_nested_tables_and_correct_the_shown_count() {
+        let rows = (0..400)
+            .map(|index| serde_json::json!([format!("run-{index:040}"), index]))
+            .collect::<Vec<_>>();
+        // `list`の`runs`は表にした後`{columns, rows}`になる。
+        let mut list = serde_json::json!({"runs": {"columns": ["id", "score"], "rows": rows}});
+        fit_rows(&mut list, &LIST_CAP).unwrap();
+        let kept = list["runs"]["rows"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < 400);
+        assert_eq!(list["truncated"], true);
+        assert!(list["warnings"][0].as_str().unwrap().contains("--limit"));
+        // `sql`の`row_count`は返した行数に合わせる。
+        let mut sql =
+            serde_json::json!({"columns": ["id", "score"], "row_count": 400, "rows": rows});
+        fit_rows(&mut sql, &SQL_CAP).unwrap();
+        assert_eq!(
+            sql["row_count"].as_u64().unwrap() as usize,
+            sql["rows"].as_array().unwrap().len()
+        );
+        assert!(sql["warnings"][0].as_str().unwrap().contains("WHERE"));
     }
 
     #[test]
