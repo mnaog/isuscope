@@ -410,6 +410,13 @@ impl Store {
         Ok(runs)
     }
 
+    /// [`Self::resolve_id`]で見つからなければ、確かめ方を添えたerrorにする。`role`は`run`か`base run`。
+    pub fn require_id(&self, requested: &str, role: &str) -> Result<String> {
+        self.resolve_id(requested)?.with_context(|| {
+            format!("{role} `{requested}` was not found; list runs with `isuscope list`")
+        })
+    }
+
     pub fn resolve_id(&self, requested: &str) -> Result<Option<String>> {
         if requested == "latest" {
             return self

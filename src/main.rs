@@ -101,8 +101,8 @@ enum Commands {
         /// indexのCREATE文を出力します。
         #[arg(long)]
         schema: bool,
-        /// 返す行数の上限。
-        #[arg(long, default_value_t = 200)]
+        /// 返す行数の上限（`query`・`series`と同じ既定値）。出力は約12KBでも切ります。
+        #[arg(long, default_value_t = 100)]
         limit: usize,
         /// 出力形式。
         #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
@@ -143,8 +143,8 @@ enum Commands {
         /// bucket幅（秒）。
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=3600))]
         bucket: u64,
-        /// 出力行数の上限。高cardinalityなperf seriesのJSON肥大化を防ぎます。
-        #[arg(long, default_value_t = 1000)]
+        /// 返す行数の上限（`query`・`sql`と同じ既定値）。出力は約12KBでも切ります。
+        #[arg(long, default_value_t = 100)]
         limit: usize,
     },
     /// 保存済みmetricをSQLiteから絞り込み、意味に沿って構造化JSONで返します。
@@ -703,15 +703,9 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 });
             }
             let mut store = Store::open(&config.data_dir)?;
-            let id = store
-                .resolve_id(&run)?
-                .with_context(|| format!("run `{run}` was not found"))?;
+            let id = store.require_id(&run, "run")?;
             let base = base
-                .map(|requested| {
-                    store
-                        .resolve_id(&requested)?
-                        .with_context(|| format!("base run '{requested}' was not found"))
-                })
+                .map(|requested| store.require_id(&requested, "base run"))
                 .transpose()?;
             // Validate the decision before appending, so a rejected decision leaves no analysis.
             let decision = match (change, decision) {
@@ -848,6 +842,7 @@ struct SeriesOutput {
     coverage: Vec<SeriesCoverage>,
     #[serde(flatten)]
     data: SeriesData,
+    warnings: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -976,15 +971,9 @@ fn show_query(
     limit: usize,
 ) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run `{requested}` was not found"))?;
+    let id = store.require_id(requested, "run")?;
     let base_id = base_requested
-        .map(|requested| {
-            store
-                .resolve_id(requested)?
-                .with_context(|| format!("base run `{requested}` was not found"))
-        })
+        .map(|requested| store.require_id(requested, "base run"))
         .transpose()?;
     let query_limit = base_id.as_ref().map_or(limit, |_| usize::MAX);
     // database viewの区間はnode上で集計した行のlabelなので、`--scope run`のまま選べる。
@@ -1035,7 +1024,18 @@ fn show_query(
                 group_by,
                 limit: query_limit,
             };
-            let candidate = query::metric_query(id, candidate_metrics, options.clone());
+            let mut candidate = query::metric_query(id.clone(), candidate_metrics, options.clone());
+            if candidate.total_count == 0
+                && let Some(hint) = empty_metric_hint(
+                    &store,
+                    &id,
+                    &options.metrics,
+                    options.metric_prefix.as_deref(),
+                    matches!(scope, QueryScopeArg::Series),
+                )?
+            {
+                candidate.warnings.push(hint);
+            }
             if let Some(base_id) = base_id {
                 let mut base_metrics = store.query_metrics(
                     &base_id,
@@ -1189,9 +1189,7 @@ fn needs_cpu_sample_counts(
 
 fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run `{requested}` was not found"))?;
+    let id = store.require_id(requested, "run")?;
     let manifest = store.load(&id)?;
     // 境界はbucketの先頭と同じマイクロ秒に揃える（ナノ秒を持った古いrunでも最初のbucketを落とさない）。
     let start =
@@ -1222,17 +1220,17 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
             manifest
                 .benchmark
                 .initialize_started_at
-                .context("run has no initialize-started checkpoint")?,
+                .with_context(|| missing_window(&id, "start", options.window))?,
             manifest
                 .benchmark
                 .initialize_finished_at
-                .context("run has no initialize-finished checkpoint")?,
+                .with_context(|| missing_window(&id, "end", options.window))?,
         ),
         SeriesWindowArg::Load => (
             manifest
                 .benchmark
                 .initialize_finished_at
-                .context("run has no initialize-finished checkpoint")?,
+                .with_context(|| missing_window(&id, "end", options.window))?,
             end,
         ),
     };
@@ -1250,20 +1248,30 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         .collect::<Vec<_>>();
     if !options.metrics.is_empty() || options.metric_prefix.is_some() {
         let data = generic_series_data(start, requested_start, requested_end, &options, metrics);
-        write_capped_json(
-            &series_output(
-                id,
-                start,
-                end,
-                requested_start,
-                requested_end,
-                &options,
-                edges,
-                series_coverage(&manifest.collectors),
-                data,
-            ),
-            &SERIES_CAP,
-        )?;
+        let empty = matches!(&data, SeriesData::Metrics { total_count: 0, .. });
+        let mut output = series_output(
+            id.clone(),
+            start,
+            end,
+            requested_start,
+            requested_end,
+            &options,
+            edges,
+            series_coverage(&manifest.collectors),
+            data,
+        );
+        if empty
+            && let Some(hint) = empty_metric_hint(
+                &store,
+                &id,
+                &options.metrics,
+                options.metric_prefix.as_deref(),
+                true,
+            )?
+        {
+            output.warnings.push(hint);
+        }
+        write_capped_json(&output, &SERIES_CAP)?;
         return Ok(());
     }
     let mut rows = BTreeMap::<(String, i64), BucketRow>::new();
@@ -1367,6 +1375,62 @@ fn columns<T>(diff: query::QueryDiffOutput<T>, all: bool) -> query::QueryDiffOut
     if all { diff.with_all_columns() } else { diff }
 }
 
+/// 選んだmetricが1行も無いときの理由と次の一手。もう一方の形（run集約か時系列か）にあれば
+/// そちらのコマンドを、絞り込みで消えたならそう伝え、run自体に無ければ名前の一覧を引くSQLを示す。
+fn empty_metric_hint(
+    store: &Store,
+    id: &str,
+    metrics: &[String],
+    prefix: Option<&str>,
+    timed: bool,
+) -> Result<Option<String>> {
+    let selector = match (metrics, prefix) {
+        ([], None) => return Ok(None),
+        ([], Some(prefix)) => format!("--metric-prefix {prefix}"),
+        (names, _) => names
+            .iter()
+            .map(|name| format!("--metric {name}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let short = runner::short_id(id);
+    if !store
+        .query_metrics(id, metrics, prefix, Some(timed))?
+        .is_empty()
+    {
+        return Ok(Some(format!(
+            "`{selector}` exists in run {short}, but no row matched the other filters (--node, --source, --label, --label-contains, --window)"
+        )));
+    }
+    if !store
+        .query_metrics(id, metrics, prefix, Some(!timed))?
+        .is_empty()
+    {
+        return Ok(Some(if timed {
+            format!(
+                "`{selector}` has only run totals in run {short}, no time series; see `isuscope query {short} {selector}`"
+            )
+        } else {
+            format!(
+                "`{selector}` has only a time series in run {short}; see `isuscope series {short} {selector}`"
+            )
+        }));
+    }
+    Ok(Some(format!(
+        "no metric matched `{selector}` in run {short}; list names with `isuscope sql \"SELECT DISTINCT name FROM metrics WHERE run_id LIKE '%{short}' ORDER BY name\"`"
+    )))
+}
+
+/// initializeの始まりか終わりを記録していないrunで、その区間を選んだとき。どのrunか、何が無いか、
+/// どうすればよいかを1文で伝える（`query`のDB区間の拒否と同じ形）。
+fn missing_window(id: &str, edge: &str, window: SeriesWindowArg) -> String {
+    format!(
+        "run {} did not record the {edge} of initialize, so --window {} is unavailable; use --window whole",
+        runner::short_id(id),
+        window.as_str()
+    )
+}
+
 /// slpはinitializeの終わりが分かったrunだけをinitializeとloadに分け、分からないrunは全体を
 /// `whole`にまとめる。後者で`load`を選ぶと、SQLが無かったかのように0件が返ってしまう。
 /// （loadの0件そのものは、負荷区間のSQLを無くせたrunで起こり得るので、行は`initialize`にある。）
@@ -1405,17 +1469,17 @@ fn named_window(
             manifest
                 .benchmark
                 .initialize_started_at
-                .context("run has no initialize-started checkpoint")?,
+                .with_context(|| missing_window(&manifest.id, "start", window))?,
             manifest
                 .benchmark
                 .initialize_finished_at
-                .context("run has no initialize-finished checkpoint")?,
+                .with_context(|| missing_window(&manifest.id, "end", window))?,
         ),
         SeriesWindowArg::Load => (
             manifest
                 .benchmark
                 .initialize_finished_at
-                .context("run has no initialize-finished checkpoint")?,
+                .with_context(|| missing_window(&manifest.id, "end", window))?,
             benchmark_end,
         ),
     };
@@ -1457,6 +1521,7 @@ fn series_output(
         },
         coverage,
         data,
+        warnings: Vec::new(),
     }
 }
 
@@ -2266,9 +2331,7 @@ fn load_diagnostics(
     store: &Store,
     requested: &str,
 ) -> Result<RunDiagnostics> {
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run `{requested}` was not found"))?;
+    let id = store.require_id(requested, "run")?;
     let latest_logs = (store.resolve_id("latest")?.as_deref() == Some(id.as_str()))
         .then(|| config.data_dir.join("latest/logs"));
     Ok(report::diagnose(

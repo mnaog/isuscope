@@ -515,10 +515,10 @@ impl Store {
     pub fn change_history(&self, id: &str) -> Result<ChangeHistory> {
         validate_id(id)?;
         let dir = self.data_dir.join("changes").join(id);
-        let change: Change = serde_json::from_slice(
-            &fs::read(dir.join("change.json"))
-                .with_context(|| format!("change '{id}' was not found"))?,
-        )?;
+        if !dir.join("change.json").is_file() {
+            bail!("change `{id}` was not found; list changes with `isuscope change list`");
+        }
+        let change: Change = serde_json::from_slice(&fs::read(dir.join("change.json"))?)?;
         let mut decisions = Vec::new();
         let records = dir.join("decisions");
         if records.is_dir() {
@@ -562,9 +562,7 @@ impl Store {
         }
         let mut evidence = Vec::new();
         for requested in runs {
-            let run_id = self
-                .resolve_id(&requested)?
-                .with_context(|| format!("run '{requested}' was not found"))?;
+            let run_id = self.require_id(&requested, "run")?;
             if !self.final_dir(&run_id).is_dir() {
                 bail!("evidence run must be finalized");
             }

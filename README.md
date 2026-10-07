@@ -128,6 +128,8 @@ isuscope doctor
 - 区間は`window`（`whole`・`initialize`・`load`）という名前で出します。`series`の実際の時刻とbucketは`range`です。
 - 比較は、比較元を`_base`、今回を接尾辞なし、差を`_delta`と`_delta_percent`で書きます。briefのスコアの比較も同じです。
 - `warnings`はどの出力にもあり、無ければ空です。briefの`next`も同じです。
+- 結果が空のときは、理由と次のコマンドを`warnings`に出します（時系列が無くrun集約だけある、絞り込みで消えた、名前が無い）。errorも、どのrunか・どうすればよいかを添えます。
+- 行を返すコマンド（`query`・`series`・`sql`）の`--limit`の既定値は100です。
 - commitは先頭12桁です。
 - 絞り込みの引数（`--metric`・`--metric-prefix`・`--source`・`--node`・`--label`・`--label-contains`）は`query`と`series`で同じ意味です。
 
