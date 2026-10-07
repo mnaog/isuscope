@@ -121,6 +121,18 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert_eq!(brief["schema_version"], 2);
     assert_eq!(brief["run"]["score"], 12345);
     assert_eq!(brief["transitions"]["rows"][0]["count"], 7);
+    // 分析がまだのrunでは、次に使うコマンドとして`analyze`を示す。
+    let short = brief["run"]["short_id"].as_str().unwrap();
+    assert!(
+        brief["next"][0]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("isuscope analyze {short} ")),
+        "{}",
+        brief["next"]
+    );
+    // 切っていない欄には`more`を付けない。
+    assert!(brief["http"].get("more").is_none(), "{}", brief["http"]);
 
     // `report`, `diff` and `ui` were removed; brief, query and sql cover the same data.
     for removed in [

@@ -191,6 +191,17 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         brief["review"]["latest_analysis"]["verdict"],
         "inconclusive"
     );
+    // 比較元があれば、比較に使うコマンドを示す。分析済みなので`analyze`は出さない。
+    let next = brief["next"].as_array().unwrap();
+    assert_eq!(next.len(), 2, "{next:?}");
+    assert_eq!(
+        next[0],
+        format!(
+            "isuscope query {} --base {} --view http --limit 20",
+            short(&candidate),
+            short(&base)
+        )
+    );
     assert_eq!(
         brief["review"]["latest_analysis"]["base_short_id"],
         short(&base)

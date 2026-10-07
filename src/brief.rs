@@ -49,6 +49,10 @@ pub struct BriefOutput {
     pub transitions: BriefSection<BriefTransition>,
     pub artifact_issues: BriefSection<ProfileArtifact>,
     pub profiles_unavailable: usize,
+    /// 作業の流れで次に使えるコマンド。分析がまだのrunの`analyze`と、比較元があるときの比較。
+    /// 推測の助言は入れず、runの状態だけで決める。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -360,7 +364,19 @@ pub fn benchmark_messages(run: &RunManifest) -> BriefBenchmarkMessages {
 pub struct BriefSection<T> {
     pub total_count: usize,
     pub truncated: bool,
+    /// 切ったときだけ付く、残りの行を見るコマンド。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more: Option<String>,
     pub items: Vec<T>,
+}
+
+impl<T> BriefSection<T> {
+    fn more(mut self, command: impl FnOnce() -> String) -> Self {
+        if self.truncated {
+            self.more = Some(command());
+        }
+        self
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -419,6 +435,9 @@ pub fn build(
         .iter()
         .filter(|item| item.status == "unavailable")
         .count();
+    let short = crate::runner::short_id(&run.id).to_owned();
+    let short = short.as_str();
+    let database_window_flag = window_flag(database_window.as_deref());
     BriefOutput {
         schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
         review: None,
@@ -437,14 +456,19 @@ pub fn build(
             dirty: run.source.dirty,
             metric_count: run.metric_count,
         },
-        coverage_issues: section(coverage_issues, limit),
+        coverage_issues: section(coverage_issues, limit).more(|| collector_failures(short)),
         coverage_notes_hidden,
-        benchmark: section(by_metric_then_magnitude(benchmark.rows), limit),
-        score_inputs: section(score_inputs.rows, limit),
+        benchmark: section(by_metric_then_magnitude(benchmark.rows), limit)
+            .more(|| format!("isuscope query {short} --metric-prefix benchmark. --limit 20")),
+        score_inputs: section(score_inputs.rows, limit)
+            .more(|| format!("isuscope query {short} --metric-prefix score. --limit 20")),
         benchmark_messages,
-        http: section(http, limit),
+        http: section(http, limit)
+            .more(|| format!("isuscope query {short} --view http --limit 20")),
         database_window,
-        database: section(database, limit),
+        database: section(database, limit).more(|| {
+            format!("isuscope query {short} --view database{database_window_flag} --limit 20")
+        }),
         database_rows_filtered_out,
         cpu: section(
             diagnostics
@@ -453,16 +477,23 @@ pub fn build(
                 .filter(|row| !is_idle(row))
                 .collect(),
             limit,
-        ),
+        )
+        .more(|| format!("isuscope query {short} --metric cpu.sample_percent --limit 20")),
         hosts_window,
         hosts,
         quiet_hosts,
         clients,
-        upstreams: section(diagnostics.upstreams, limit),
+        upstreams: section(diagnostics.upstreams, limit)
+            .more(|| format!("isuscope query {short} --metric-prefix http.upstream_ --limit 20")),
         transitions: section(
             transitions(diagnostics.transitions, &diagnostics.transition_order),
             limit,
-        ),
+        )
+        .more(|| {
+            format!(
+                "isuscope sql \"SELECT from_route, to_route, count, p50_ms, p95_ms FROM transitions WHERE run_id LIKE '%{short}' ORDER BY count DESC\""
+            )
+        }),
         artifact_issues: section(
             diagnostics
                 .artifacts
@@ -470,8 +501,10 @@ pub fn build(
                 .filter(|item| item.status == "failed")
                 .collect(),
             limit,
-        ),
+        )
+        .more(|| collector_failures(short)),
         profiles_unavailable,
+        next: Vec::new(),
         warnings,
     }
 }
@@ -765,12 +798,52 @@ fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<B
     (busy, Some(summary))
 }
 
+/// briefが要約したDBの区間を`query`でも選ぶ。区間を持たない古いrunでは付けない。
+fn window_flag(window: Option<&str>) -> String {
+    window
+        .map(|window| format!(" --window {window}"))
+        .unwrap_or_default()
+}
+
+/// 完了しなかったcollectorとそのerrorの全件。
+fn collector_failures(short: &str) -> String {
+    format!(
+        "isuscope sql \"SELECT name, node, phase, status, error FROM collector_runs WHERE run_id LIKE '%{short}' AND status != 'complete'\" --format tsv"
+    )
+}
+
+/// runの状態から、次に使えるコマンドを決める。分析がまだなら`analyze`、比較元があればHTTPとDBの比較。
+/// どの表を見るべきかのような推測はしない。
+pub fn next_steps(brief: &mut BriefOutput) {
+    let short = brief.run.short_id.clone();
+    if brief.run.analysis_status == crate::model::AnalysisStatus::Pending.as_str() {
+        brief.next.push(format!(
+            "isuscope analyze {short} <supported|rejected|inconclusive|skipped> --analysis \"<結果と根拠>\""
+        ));
+    }
+    if let Some(base) = brief
+        .review
+        .as_ref()
+        .and_then(|review| review.comparison.as_ref())
+        .map(|comparison| comparison.base_short_id.clone())
+    {
+        brief.next.push(format!(
+            "isuscope query {short} --base {base} --view http --limit 20"
+        ));
+        brief.next.push(format!(
+            "isuscope query {short} --base {base} --view database{} --limit 20",
+            window_flag(brief.database_window.as_deref())
+        ));
+    }
+}
+
 fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
     let total_count = items.len();
     items.truncate(limit);
     BriefSection {
         total_count,
         truncated: total_count > items.len(),
+        more: None,
         items,
     }
 }
@@ -1233,5 +1306,15 @@ mod tests {
             "{:?}",
             brief.warnings
         );
+    }
+
+    #[test]
+    fn more_is_offered_only_for_a_truncated_section() {
+        let cut = section(vec![1, 2, 3], 2).more(|| "isuscope query x".into());
+        assert_eq!(cut.more.as_deref(), Some("isuscope query x"));
+        let whole = section(vec![1, 2], 2).more(|| unreachable!("not truncated"));
+        assert!(whole.more.is_none());
+        assert_eq!(window_flag(Some("load")), " --window load");
+        assert_eq!(window_flag(None), "");
     }
 }

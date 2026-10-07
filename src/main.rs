@@ -2092,6 +2092,7 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
     );
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
     brief.review = Some(brief::review(review));
+    brief::next_steps(&mut brief);
     let mut brief = serde_json::to_value(&brief)?;
     for (section, columns) in BRIEF_COLUMNS {
         if let Some(items) = brief
