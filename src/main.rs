@@ -150,6 +150,10 @@ enum Commands {
         /// 同じselectorを適用して比較する基準run。
         #[arg(long)]
         base: Option<String>,
+        /// `--base`の比較ですべての値の列を出します。既定は判断に使う列（主要な値の今回と差の割合、
+        /// エラー数・検査行数の前後）だけです。
+        #[arg(long, requires = "base")]
+        all_columns: bool,
         /// 汎用metric行またはdatabase集約を選びます。
         #[arg(long, value_enum, default_value_t = QueryViewArg::Metrics)]
         view: QueryViewArg,
@@ -610,6 +614,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         Commands::Query {
             run,
             base,
+            all_columns,
             view,
             scope,
             window,
@@ -626,6 +631,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 &config,
                 &run,
                 base.as_deref(),
+                all_columns,
                 view,
                 scope,
                 window,
@@ -930,6 +936,7 @@ fn show_query(
     config: &LoadedConfig,
     requested: &str,
     base_requested: Option<&str>,
+    all_columns: bool,
     view: QueryViewArg,
     scope: QueryScopeArg,
     window: SeriesWindowArg,
@@ -1036,7 +1043,10 @@ fn show_query(
                 }
                 let base = query::metric_query(base_id, base_metrics, options);
                 write_capped_json(
-                    &query::metric_query_diff(base, candidate, limit),
+                    &columns(
+                        query::metric_query_diff(base, candidate, limit),
+                        all_columns,
+                    ),
                     &QUERY_CAP,
                 )?;
             } else {
@@ -1096,7 +1106,10 @@ fn show_query(
                 }
                 let base = query::database_query(base_id, base_metrics, options);
                 write_capped_json(
-                    &query::database_query_diff(base, candidate, limit),
+                    &columns(
+                        query::database_query_diff(base, candidate, limit),
+                        all_columns,
+                    ),
                     &QUERY_CAP,
                 )?;
             } else {
@@ -1126,7 +1139,10 @@ fn show_query(
                 let base_metrics =
                     store.query_metrics(&base_id, &[], Some("http."), Some(false))?;
                 let base = query::http_query(base_id, base_metrics, options);
-                write_capped_json(&query::http_query_diff(base, candidate, limit), &QUERY_CAP)?;
+                write_capped_json(
+                    &columns(query::http_query_diff(base, candidate, limit), all_columns),
+                    &QUERY_CAP,
+                )?;
             } else {
                 write_rows_json(&candidate, &["node", "method"])?;
             }
@@ -1318,6 +1334,11 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         &SERIES_CAP,
     )?;
     Ok(())
+}
+
+/// `--all-columns`ならすべての値の列を出す。既定は[`query::DiffColumns::Compact`]。
+fn columns<T>(diff: query::QueryDiffOutput<T>, all: bool) -> query::QueryDiffOutput<T> {
+    if all { diff.with_all_columns() } else { diff }
 }
 
 /// slpはinitializeの終わりが分かったrunだけをinitializeとloadに分け、分からないrunは全体を

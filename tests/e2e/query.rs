@@ -95,7 +95,12 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
     assert_eq!(database_diff["view"], "database");
     assert_eq!(database_diff["total_count"], 1);
     assert_eq!(database_diff["rows"][0]["presence"], "both");
-    assert_eq!(database_diff["rows"][0]["total_ms_delta"], 0.0);
+    assert_eq!(database_diff["rows"][0]["total_ms_delta_percent"], 0.0);
+    // p95を出せない理由は両側で同じなので、比較でも1回だけ残る。
+    assert_eq!(
+        database_diff["rows"][0]["unavailable"]["p95_ms"],
+        "scalar quantiles cannot be merged across digests"
+    );
 
     let brief = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["brief", "latest", "--limit", "1"])

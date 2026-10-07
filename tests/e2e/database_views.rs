@@ -93,7 +93,28 @@ command = ["sh", "-c", "sed -E \"s/\\\"timestamp\\\":[0-9]+/\\\"timestamp\\\":$(
     let comparison = isuscope(&[
         "query", &candidate, "--base", &base, "--view", "database", "--window", "load",
     ]);
-    // p99とmaxは両側の値で比べ、差分は主要な値だけに付ける。
+    // 既定の比較は判断に使う列だけ。主要な値は今回と差の割合、検査行数は前後の値。
+    let row = &comparison["rows"][0];
+    assert!(row["total_ms"].is_number(), "{row}");
+    assert!(row["total_ms_delta_percent"].is_number(), "{row}");
+    assert!(row["lock_ms_delta_percent"].is_number(), "{row}");
+    assert!(row.get("rows_examined_per_call_base").is_some(), "{row}");
+    assert!(
+        row.get("total_ms_base").is_none() && row.get("p99_ms").is_none(),
+        "{row}"
+    );
+    // `--all-columns`ではp99とmaxも両側の値で比べ、差分は主要な値だけに付ける。
+    let comparison = isuscope(&[
+        "query",
+        &candidate,
+        "--base",
+        &base,
+        "--view",
+        "database",
+        "--window",
+        "load",
+        "--all-columns",
+    ]);
     let row = &comparison["rows"][0];
     assert!(row["p99_ms"].is_number(), "{row}");
     assert!(row["max_ms_base"].is_number(), "{row}");

@@ -72,14 +72,27 @@ pub struct QueryDiffRow<T> {
     pub key_labels: Option<BTreeMap<String, String>>,
     /// 出力の`common`へまとめたので、この行の`key`では繰り返さない名前。
     pub shared: BTreeSet<String>,
+    /// 値の列の出し方。viewごとに[`finish_diff`]が決め、`--all-columns`で[`DiffColumns::All`]になる。
+    pub columns: DiffColumns,
     pub presence: QueryPresence,
     pub base: Option<T>,
     pub candidate: Option<T>,
     pub changes: BTreeMap<String, NumericDiff>,
 }
 
-/// 比較の1行を平らに出す。行を識別する値（`common`へまとめたものを除く）、`presence`、そして値ごとに
-/// 比較元（`_base`）・対象（接尾辞なし）・差（`_delta`、`_delta_percent`）を並べる。差は主要な値だけ。
+/// 比較の値の列の出し方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffColumns {
+    /// 判断に使う列だけ。主要な値（`changes`）は今回の値と差の割合、`pairs`の値（0からの増減や
+    /// 前後の値そのものが判断材料になるもの）は比較元と今回を並べ、ほかの数値は出さない。文字列などの
+    /// 数値でない値は1回だけ出す。列が多いと、値の並びを列名へ対応させるときに読み違えやすい。
+    Compact { pairs: &'static [&'static str] },
+    /// すべての値の比較元と今回、主要な値の差と差の割合。
+    All,
+}
+
+/// 比較の1行を平らに出す。行を識別する値（`common`へまとめたものを除く）、`presence`、そして値の列を
+/// [`DiffColumns`]に従って並べる。比較元は`_base`、今回は接尾辞なし、差は`_delta`と`_delta_percent`。
 impl<T: Serialize> Serialize for QueryDiffRow<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::Error;
@@ -131,20 +144,56 @@ impl<T: Serialize> Serialize for QueryDiffRow<T> {
             let value = |fields: &serde_json::Map<String, serde_json::Value>| {
                 fields.get(name).cloned().unwrap_or(serde_json::Value::Null)
             };
-            row.insert(format!("{name}_base"), value(&base));
-            row.insert(name.clone(), value(&candidate));
-            if let Some(change) = self.changes.get(name) {
-                row.insert(
-                    format!("{name}_delta"),
-                    serde_json::to_value(change.delta).map_err(S::Error::custom)?,
-                );
-                row.insert(
-                    format!("{name}_delta_percent"),
-                    serde_json::to_value(change.delta_percent).map_err(S::Error::custom)?,
-                );
+            let change = self.changes.get(name);
+            let delta = |value: Option<f64>| serde_json::to_value(value).map_err(S::Error::custom);
+            match self.columns {
+                DiffColumns::All => {
+                    row.insert(format!("{name}_base"), value(&base));
+                    row.insert(name.clone(), value(&candidate));
+                    if let Some(change) = change {
+                        row.insert(format!("{name}_delta"), delta(change.delta)?);
+                        row.insert(
+                            format!("{name}_delta_percent"),
+                            delta(change.delta_percent)?,
+                        );
+                    }
+                }
+                DiffColumns::Compact { pairs } => {
+                    let either = candidate.get(name).or_else(|| base.get(name));
+                    if either.is_some_and(|value| value.is_string() || value.is_array()) {
+                        // 集計方法やSQLの例のような説明の値。1回だけ（今回の側を優先）。
+                        row.insert(name.clone(), either.cloned().unwrap_or_default());
+                    } else if either.is_some_and(serde_json::Value::is_object) {
+                        // p95を出せない理由のように両側で同じものは1回出し、status別件数のように
+                        // 両側で違う内訳は判断に使わないので出さない。
+                        let (before, after) = (base.get(name), candidate.get(name));
+                        if before.is_none() || after.is_none() || before == after {
+                            row.insert(name.clone(), either.cloned().unwrap_or_default());
+                        }
+                    } else if pairs.contains(&name.as_str()) {
+                        row.insert(format!("{name}_base"), value(&base));
+                        row.insert(name.clone(), value(&candidate));
+                    } else if let Some(change) = change {
+                        row.insert(name.clone(), value(&candidate));
+                        row.insert(
+                            format!("{name}_delta_percent"),
+                            delta(change.delta_percent)?,
+                        );
+                    }
+                }
             }
         }
         row.serialize(serializer)
+    }
+}
+
+impl<T> QueryDiffOutput<T> {
+    /// `--all-columns`。すべての値の比較元・今回と、主要な値の差を出す。
+    pub fn with_all_columns(mut self) -> Self {
+        for row in &mut self.rows {
+            row.columns = DiffColumns::All;
+        }
+        self
     }
 }
 
@@ -462,6 +511,7 @@ pub fn metric_query_diff(
                 key: output_key,
                 key_labels: Some(labels),
                 shared: BTreeSet::new(),
+                columns: DiffColumns::All,
                 presence: presence(&base, &candidate),
                 base,
                 candidate,
@@ -778,6 +828,7 @@ pub fn database_query_diff(
                 key,
                 key_labels: None,
                 shared: BTreeSet::new(),
+                columns: DiffColumns::All,
                 presence: presence(&base, &candidate),
                 base,
                 candidate,
@@ -915,6 +966,7 @@ pub fn http_query_diff(
                 ]),
                 key_labels: None,
                 shared: BTreeSet::new(),
+                columns: DiffColumns::All,
                 presence: presence(&base, &candidate),
                 base,
                 candidate,
@@ -991,7 +1043,7 @@ fn database_changes(
         ),
     ]
     .into_iter()
-    .filter(|(name, _, _)| ["calls", "total_ms", "avg_ms", "p95_ms"].contains(name))
+    .filter(|(name, _, _)| ["calls", "total_ms", "avg_ms", "p95_ms", "lock_ms"].contains(name))
     .map(|(name, base, candidate)| (name.into(), numeric_diff(base, candidate)))
     .collect()
 }
@@ -1109,8 +1161,14 @@ fn finish_diff<T>(
             common.retain(|name, value| row.key.get(name) == Some(value));
         }
     }
+    let pairs: &'static [&'static str] = match view {
+        "http" => &["errors"],
+        "database" => &["rows_examined_per_call"],
+        _ => &[],
+    };
     for row in &mut rows {
         row.shared = common.keys().cloned().collect();
+        row.columns = DiffColumns::Compact { pairs };
     }
     QueryDiffOutput {
         schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
@@ -1464,6 +1522,52 @@ fn is_identifier(value: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_comparison_keeps_only_the_columns_judged_by() {
+        let row = |count: f64, errors: f64, classes: serde_json::Value| {
+            serde_json::json!({
+                "route": "/a", "count": count, "p99_ms": 9.0, "errors": errors,
+                "aggregation": "sum", "status_counts": classes,
+                "unavailable": {"p50_ms": "not reported"},
+            })
+        };
+        let mut diff = QueryDiffRow {
+            key: BTreeMap::from([("route".into(), "/a".into())]),
+            key_labels: None,
+            shared: BTreeSet::new(),
+            columns: DiffColumns::Compact { pairs: &["errors"] },
+            presence: QueryPresence::Both,
+            base: Some(row(100.0, 0.0, serde_json::json!({"2xx": 100}))),
+            candidate: Some(row(150.0, 5.0, serde_json::json!({"2xx": 145, "5xx": 5}))),
+            changes: BTreeMap::from([
+                ("count".into(), numeric_diff(Some(100.0), Some(150.0))),
+                ("errors".into(), numeric_diff(Some(0.0), Some(5.0))),
+            ]),
+        };
+        let compact = serde_json::to_value(&diff).unwrap();
+        let names = compact.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "route",
+                "presence",
+                "count",
+                "count_delta_percent",
+                "errors_base",
+                "errors",
+                "aggregation",
+                "unavailable",
+            ],
+            "{compact}"
+        );
+        assert_eq!(compact["count_delta_percent"], 50.0);
+        diff.columns = DiffColumns::All;
+        let all = serde_json::to_value(&diff).unwrap();
+        assert_eq!(all["p99_ms_base"], 9.0);
+        assert_eq!(all["count_delta"], 50.0);
+        assert_eq!(all["status_counts"]["5xx"], 5);
+    }
 
     #[test]
     fn sql_shape_keeps_truncated_statements_apart() {
