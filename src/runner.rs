@@ -268,10 +268,10 @@ pub async fn execute(
     println!("run       {}", short_id(&id));
     println!(
         "result    {}",
-        if manifest.benchmark.passed == Some(true) {
-            "PASS"
-        } else {
-            "FAIL"
+        match manifest.benchmark.passed {
+            Some(true) => "PASS",
+            Some(false) => "FAIL",
+            None => "UNKNOWN",
         }
     );
     println!(

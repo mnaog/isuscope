@@ -833,6 +833,125 @@ timeout_seconds = 30
 # ISUSCOPE_DISCOVERY_SESSION_KEYはisuscope起動前に環境変数で渡し、configへ秘密値を書きません。
 
 [[collectors]]
+# アプリのjournal、nginxのerror log、kernelのwarning以上を、ベンチの前後の差分だけ読みます。
+# ここでは位置だけを記録します（journalはcursor、error logはfileの大きさ）。
+name = "app-log-mark"
+phase = "before"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -eu
+marker=/tmp/isuscope-{run_id}.app-log.marker
+: > "$marker"
+journal=journalctl
+sudo -n true 2>/dev/null && journal="sudo -n journalctl"
+if command -v journalctl >/dev/null 2>&1; then
+  cursor=$($journal -n 1 --show-cursor -q -o cat --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p' | tail -n 1)
+  test -z "$cursor" || printf 'journal %s\n' "$cursor" >> "$marker"
+fi
+log=$(dirname @@NGINX_ACCESS_LOG@@)/error.log
+if set -- $( (stat -c '%d %i %s' "$log" || sudo -n stat -c '%d %i %s' "$log") 2>/dev/null ); then
+  test $# -ne 3 || printf 'nginx %s %s %s\n' "$1" "$2" "$3" >> "$marker"
+fi
+test -s "$marker" || { rm -f "$marker"; exit 75; }
+''']
+timeout_seconds = 15
+unavailable_exit_codes = [75]
+
+[[collectors]]
+# 差分の行を、数字を含む語を`<N>`へ置き換えた型ごとに数え、多い順に10型と1行の実例を返します。
+# appのunitは、errorやtimeout、失敗などの語を含む行だけを数えます（access logのような通常の行を除く）。
+# 生のlogは運びません。
+name = "app-log-delta"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -eu
+marker=/tmp/isuscope-{run_id}.app-log.marker
+work=/tmp/isuscope-{run_id}.app-log.work
+trap 'rm -f "$marker" "$work"' EXIT
+test -r "$marker" || exit 75
+units='{service_units}'
+journal=journalctl
+sudo -n true 2>/dev/null && journal="sudo -n journalctl"
+tab=$(printf '\t')
+# stdinの行を型ごとに数える。1行目は「#、全行数、数えた行数、型の上限で数えきれなかった行数」。
+summarize() {
+  LC_ALL=C awk -v filter="$1" '
+    function cut(text, size) {
+      if (length(text) <= size) return text
+      text = substr(text, 1, size)
+      sub(/[\300-\377][\200-\277]*$/, "", text)
+      return text
+    }
+    { lines++ }
+    filter == "errors" && tolower($0) !~ /error|panic|fatal|exception|warn|timed out|timeout|refused|deadlock|too many|failed|killed|denied|unavailable|失敗|エラー/ { next }
+    {
+      counted++
+      # 先頭の日時は型からも実例からも外す。
+      line = $0
+      sub(/^[0-9][0-9][0-9][0-9][-\/][0-9][0-9][-\/][0-9][0-9][T ][0-9:.,]*Z?[ \t]*/, "", line)
+      shape = line
+      # 数字を含む語（ID、UUID、時間、IP、行番号）はまとめて<N>にする。
+      gsub(/[A-Za-z0-9_.-]*[0-9][A-Za-z0-9_.-]*/, "<N>", shape)
+      gsub(/[\001-\037]+/, " ", shape)
+      gsub(/  +/, " ", shape)
+      shape = cut(shape, 160)
+      if (!(shape in count)) {
+        if (shapes >= 5000) { overflow++; next }
+        shapes++
+        example = line
+        gsub(/[\001-\037]+/, " ", example)
+        sample[shape] = cut(example, 240)
+      }
+      count[shape]++
+    }
+    END {
+      printf "#\t%d\t%d\t%d\n", lines, counted, overflow
+      for (shape in count) printf "%d\t%s\t%s\n", count[shape], shape, sample[shape]
+    }'
+}
+# summarizeの結果を、多い順の10型までmetricにする。
+report() {
+  summarize "$2" > "$work"
+  header=$(head -n 1 "$work")
+  tail -n +2 "$work" | sort -t "$tab" -k1,1nr | head -n 10 | LC_ALL=C awk -F '\t' -v source="$1" -v header="$header" '
+    function json(text) {
+      gsub(/\\/, "\\\\", text)
+      gsub(/"/, "\\\"", text)
+      return "\"" text "\""
+    }
+    BEGIN { split(header, total, "\t") }
+    {
+      shown += $1
+      printf "{\"type\":\"metric\",\"name\":\"log.error_lines\",\"value\":%.0f,\"unit\":\"lines\",\"labels\":{\"source\":%s,\"pattern\":%s,\"example\":%s}}\n", $1, json(source), json($2), json($3)
+    }
+    END {
+      if (total[2] > 0)
+        printf "{\"type\":\"metric\",\"name\":\"log.lines\",\"value\":%.0f,\"unit\":\"lines\",\"labels\":{\"source\":%s}}\n", total[2], json(source)
+      if (total[3] - shown > 0)
+        printf "{\"type\":\"metric\",\"name\":\"log.error_lines_omitted\",\"value\":%.0f,\"unit\":\"lines\",\"labels\":{\"source\":%s}}\n", total[3] - shown, json(source)
+    }'
+}
+cursor=$(sed -n 's/^journal //p' "$marker")
+if test -n "$cursor"; then
+  for unit in $units; do
+    $journal --after-cursor="$cursor" -u "$unit" -o cat -q --no-pager 2>/dev/null | report "$unit" errors
+  done
+  $journal --after-cursor="$cursor" -k -p warning -o cat -q --no-pager 2>/dev/null | report kernel all
+fi
+log=$(dirname @@NGINX_ACCESS_LOG@@)/error.log
+set -- $(sed -n 's/^nginx //p' "$marker")
+if test $# -eq 3 && now=$( (stat -c '%d %i %s' "$log" || sudo -n stat -c '%d %i %s' "$log") 2>/dev/null ); then
+  start=1
+  # 同じfileが前より大きければ続きから、rotateされていれば今のfileの先頭から読む。
+  test "$now" = "${now#$1 $2 }" || test "${now##* }" -lt "$3" || start=$(( $3 + 1 ))
+  (tail -c +"$start" "$log" 2>/dev/null || sudo -n tail -c +"$start" "$log") | report nginx-error all
+fi
+''']
+timeout_seconds = 60
+unavailable_exit_codes = [75]
+
+[[collectors]]
 # SQLが遅い理由の切り分け用。実行中thread、行lock待ち、log flush待ち、buffer poolの読み込みを
 # 2秒ごとに見る。累積counterは区間差分、現在値はそのまま。Performance Schemaは使わない。
 name = "mysql-status"
@@ -1147,4 +1266,108 @@ fi
 ''']
 parser = "slp-windows"
 timeout_seconds = 120
+unavailable_exit_codes = [75]
+
+[[collectors]]
+# SQLが遅い理由を、どのfile・tableで待ったかまで分けます。Performance Schemaの累積値を
+# ベンチの前と後に1回ずつ読み、差を取るので、ベンチ中には何もしません。
+name = "mysql-io-mark"
+phase = "before"
+transport = "ssh"
+roles = ["db", "mysql"]
+command = ["sh", "-c", '''
+set -eu
+command -v mysql >/dev/null 2>&1 || exit 75
+command -v sudo >/dev/null 2>&1 || exit 75
+snapshot=/tmp/isuscope-{run_id}.mysql-io.before
+sudo -n mysql -N -B --force -e "
+SHOW GLOBAL STATUS LIKE 'Uptime';
+SELECT 'F', FILE_NAME, SUM_TIMER_READ, SUM_TIMER_WRITE, SUM_NUMBER_OF_BYTES_READ, SUM_NUMBER_OF_BYTES_WRITE FROM performance_schema.file_summary_by_instance WHERE COUNT_STAR > 0;
+SELECT 'T', CONCAT(OBJECT_SCHEMA, '.', OBJECT_NAME), SUM_TIMER_FETCH, SUM_TIMER_INSERT + SUM_TIMER_UPDATE + SUM_TIMER_DELETE, COUNT_FETCH, COUNT_INSERT + COUNT_UPDATE + COUNT_DELETE FROM performance_schema.table_io_waits_summary_by_table WHERE COUNT_STAR > 0 AND OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys');
+" > "$snapshot" 2>/dev/null || true
+grep -q '^Uptime' "$snapshot" || { rm -f "$snapshot"; exit 75; }
+grep -q '^F' "$snapshot" || { rm -f "$snapshot"; echo "performance_schema has no file I/O rows; is performance_schema enabled?" >&2; exit 75; }
+''']
+timeout_seconds = 15
+unavailable_exit_codes = [75]
+
+[[collectors]]
+# 前後の差をfile・tableごとのmetricにします。時間はps（Performance Schemaの単位）をmsへ直します。
+# あわせてbuffer poolの大きさとtableの大きさを読みます（`information_schema_stats_expiry`を0にして、
+# 取り込み直後でも古い統計を返さないようにする）。間でmysqldが再起動したら差を出さずにunavailable。
+name = "mysql-io-delta"
+phase = "after"
+transport = "ssh"
+roles = ["db", "mysql"]
+command = ["sh", "-c", '''
+set -eu
+before=/tmp/isuscope-{run_id}.mysql-io.before
+after=/tmp/isuscope-{run_id}.mysql-io.after
+trap 'rm -f "$before" "$after"' EXIT
+test -r "$before" || exit 75
+sudo -n mysql -N -B --force -e "
+SHOW GLOBAL STATUS LIKE 'Uptime';
+SELECT 'F', FILE_NAME, SUM_TIMER_READ, SUM_TIMER_WRITE, SUM_NUMBER_OF_BYTES_READ, SUM_NUMBER_OF_BYTES_WRITE FROM performance_schema.file_summary_by_instance WHERE COUNT_STAR > 0;
+SELECT 'T', CONCAT(OBJECT_SCHEMA, '.', OBJECT_NAME), SUM_TIMER_FETCH, SUM_TIMER_INSERT + SUM_TIMER_UPDATE + SUM_TIMER_DELETE, COUNT_FETCH, COUNT_INSERT + COUNT_UPDATE + COUNT_DELETE FROM performance_schema.table_io_waits_summary_by_table WHERE COUNT_STAR > 0 AND OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys');
+SHOW GLOBAL VARIABLES WHERE Variable_name IN ('datadir', 'innodb_buffer_pool_size');
+SET SESSION information_schema_stats_expiry = 0;
+SELECT 'S', CONCAT(TABLE_SCHEMA, '.', TABLE_NAME), IFNULL(DATA_LENGTH, 0) + IFNULL(INDEX_LENGTH, 0) FROM information_schema.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys', 'information_schema');
+" > "$after" 2>/dev/null || true
+grep -q '^Uptime' "$after" || exit 75
+LC_ALL=C awk -F '\t' '
+  function json(text) { gsub(/\\/, "\\\\", text); gsub(/"/, "\\\"", text); return "\"" text "\"" }
+  function metric(name, value, unit, key, label) {
+    printf "{\"type\":\"metric\",\"name\":\"%s\",\"value\":%.3f,\"unit\":\"%s\",\"labels\":{\"engine\":\"mysql\",\"%s\":%s}}\n", name, value, unit, key, json(label)
+  }
+  # 累積値の差。小さくなっていれば数え直された（fileを閉じて開き直した）ので、今の値をそのまま使う。
+  function grew(now, then) { return now >= then ? now - then : now }
+  FNR == 1 { side++ }
+  side == 1 && $1 == "Uptime" { uptime_before = $2; next }
+  side == 1 && ($1 == "F" || $1 == "T") { for (i = 3; i <= 6; i++) old[$1, $2, i] = $i; next }
+  side == 2 && $1 == "Uptime" { uptime_after = $2; next }
+  side == 2 && $1 == "datadir" { datadir = $2; next }
+  side == 2 && $1 == "innodb_buffer_pool_size" { buffer_pool = $2; next }
+  side == 2 && $1 == "S" { tables += $3; size[$2] = $3; next }
+  side == 2 && ($1 == "F" || $1 == "T") {
+    for (i = 3; i <= 6; i++) delta[$1, $2, i] = grew($i + 0, old[$1, $2, i] + 0)
+    seen[$1, $2] = 1
+    next
+  }
+  END {
+    if (uptime_after + 0 < uptime_before + 0) {
+      print "mysqld restarted during the run; its I/O counters were reset" > "/dev/stderr"
+      exit 75
+    }
+    for (pair in seen) {
+      split(pair, part, SUBSEP)
+      kind = part[1]; name = part[2]
+      if (delta[kind, name, 3] + delta[kind, name, 4] + delta[kind, name, 5] + delta[kind, name, 6] == 0) continue
+      if (kind == "F") {
+        if (datadir != "" && index(name, datadir) == 1) name = substr(name, length(datadir) + 1)
+        # InnoDB自身のfileは番号ごとに分かれるので、種類ごとに1行へまとめる。
+        if (name ~ /^#innodb_redo\// || name ~ /(^|\/)ib_logfile[0-9]+$/) name = "#innodb_redo"
+        else if (name ~ /\.b?dblwr$/) name = "#innodb_dblwr"
+        else if (name ~ /(^|\/)undo_[0-9]+(\.ibu)?$/) name = "#innodb_undo"
+        else if (name ~ /^#innodb_temp\//) name = "#innodb_temp"
+        for (i = 3; i <= 6; i++) file[name, i] += delta[kind, part[2], i]
+        files[name] = 1
+      } else {
+        metric("db.table.read_time", delta[kind, name, 3] / 1e9, "ms", "table", name)
+        metric("db.table.write_time", delta[kind, name, 4] / 1e9, "ms", "table", name)
+        metric("db.table.rows_read", delta[kind, name, 5], "rows", "table", name)
+        metric("db.table.rows_written", delta[kind, name, 6], "rows", "table", name)
+      }
+    }
+    for (name in files) {
+      metric("db.file.read_wait", file[name, 3] / 1e9, "ms", "file", name)
+      metric("db.file.write_wait", file[name, 4] / 1e9, "ms", "file", name)
+      metric("db.file.read_bytes", file[name, 5], "bytes", "file", name)
+      metric("db.file.write_bytes", file[name, 6], "bytes", "file", name)
+    }
+    for (name in size) metric("db.table.size", size[name], "bytes", "table", name)
+    if (buffer_pool != "") printf "{\"type\":\"metric\",\"name\":\"db.memory.buffer_pool\",\"value\":%.0f,\"unit\":\"bytes\",\"labels\":{\"engine\":\"mysql\"}}\n", buffer_pool
+    if (buffer_pool != "") printf "{\"type\":\"metric\",\"name\":\"db.memory.tables\",\"value\":%.0f,\"unit\":\"bytes\",\"labels\":{\"engine\":\"mysql\"}}\n", tables
+  }' "$before" "$after"
+''']
+timeout_seconds = 30
 unavailable_exit_codes = [75]

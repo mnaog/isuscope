@@ -405,3 +405,67 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"db.query.
     let rows: serde_json::Value = parsed(&whole.stdout).unwrap();
     assert_eq!(rows["rows"].as_array().unwrap().len(), 1);
 }
+
+/// briefが出力の上限を超えるときは、欄を消さずに全部の表の行数をそろえて減らす。
+#[test]
+fn brief_cuts_every_table_to_fit_the_output_limit() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":100,\"pass\":true}'"]
+
+[[collectors]]
+name = "app-log-delta"
+phase = "after"
+transport = "local"
+command = ["sh", "-c", """
+pad=$(printf '%0200d' 0)
+for i in 1 2 3 4 5 6 7 8; do
+  printf '{"type":"metric","name":"log.error_lines","value":%d,"unit":"lines","labels":{"node":"app1","source":"isu.service","pattern":"e%d","example":"error %d %s"}}\n' "$i" "$i" "$i" "$pad"
+  printf '{"type":"metric","name":"db.file.read_wait","value":%d,"unit":"ms","labels":{"node":"app1","engine":"mysql","file":"isucon/table%d.ibd"}}\n' "$i" "$i"
+done
+"""]
+"#,
+    )
+    .unwrap();
+    let isuscope = |args: &[&str], budget: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_isuscope"));
+        command.args(args).current_dir(project.path());
+        if let Some(budget) = budget {
+            command.env("ISUSCOPE_OUTPUT_BYTES", budget);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    isuscope(&["run", "--hypothesis", "brief fits the tool output"], None);
+
+    let full = isuscope(&["brief", "latest"], Some("0"));
+    let whole = parsed(&full).unwrap();
+    assert_eq!(whole["logs"]["rows"].as_array().unwrap().len(), 5);
+    assert!(whole["warnings"].as_array().unwrap().is_empty());
+
+    let budget = full.len() - 600;
+    let cut = isuscope(&["brief", "latest"], Some(&budget.to_string()));
+    assert!(cut.len() <= budget, "{} > {budget}", cut.len());
+    let cut = parsed(&cut).unwrap();
+    let logs = &cut["logs"];
+    let rows = logs["rows"].as_array().unwrap().len();
+    assert!((1..5).contains(&rows), "{logs}");
+    assert_eq!(cut["database_io"]["rows"].as_array().unwrap().len(), rows);
+    assert_eq!(logs["truncated"], true);
+    assert_eq!(logs["total_count"], 8);
+    assert!(logs["more"].as_str().unwrap().contains("log.error_lines"));
+    assert!(
+        cut["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains(&format!("cut to {rows} rows (asked for 5) to fit")),
+        "{cut}"
+    );
+}

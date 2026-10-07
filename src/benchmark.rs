@@ -223,12 +223,12 @@ async fn execute_command(
         ));
     }
     let duplicate_result = observation.protocol_result_count > 1;
+    // 判定はadapterが`pass`で伝えたものだけを使う。終了コードとscoreから推測すると、判定の抽出を
+    // 書き漏らしたadapterのFAILもPASSとして記録され、採否の比較に紛れ込む。
     let passed = if interrupted || !status.success() || duplicate_result {
         Some(false)
     } else {
-        observation
-            .passed
-            .or(Some(status.success() && observation.score.is_some()))
+        observation.passed
     };
     Ok(BenchmarkExecution {
         result: BenchmarkResult {
@@ -253,6 +253,11 @@ async fn execute_command(
                 ))
             } else if !status.success() {
                 Some(format!("benchmark command exited with {status}"))
+            } else if passed.is_none() {
+                Some(
+                    "benchmark adapter reported no `pass` in its isuscope.result; fix .isuscope/benchmark.sh to emit the benchmark's own verdict"
+                        .into(),
+                )
             } else {
                 None
             },

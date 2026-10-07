@@ -183,8 +183,38 @@ impl<T: Serialize> Serialize for QueryDiffRow<T> {
                     }
                 }
             }
+            if name == "total_ms"
+                && let Some((count, by_count, by_avg)) = self.total_split()
+            {
+                row.insert(format!("total_ms_delta_by_{count}"), delta(Some(by_count))?);
+                row.insert("total_ms_delta_by_avg".into(), delta(Some(by_avg))?);
+            }
         }
         row.serialize(serializer)
+    }
+}
+
+impl<T> QueryDiffRow<T> {
+    /// 合計時間の差を、回数の増減による分（比較元の平均のまま回数だけ変わった分）と、1回あたりの
+    /// 時間の増減による分（今回の回数で平均が変わった分）に分ける。2つの和は合計時間の差に一致する。
+    /// 回数の名前（DBは`calls`、HTTPは`count`）と2つの分を返す。両側に1回以上ある行だけ。
+    fn total_split(&self) -> Option<(&'static str, f64, f64)> {
+        let count = ["calls", "count"]
+            .into_iter()
+            .find(|name| self.changes.contains_key(*name))?;
+        let calls = self.changes.get(count)?;
+        let total = self.changes.get("total_ms")?;
+        let (base_calls, calls) = calls.base.zip(calls.candidate)?;
+        let (base_total, total) = total.base.zip(total.candidate)?;
+        if base_calls <= 0.0 || calls <= 0.0 {
+            return None;
+        }
+        let by_count = (calls - base_calls) * base_total / base_calls;
+        Some((
+            count,
+            round_to(by_count, 3),
+            round_to(total - base_total - by_count, 3),
+        ))
     }
 }
 
@@ -1572,6 +1602,37 @@ mod tests {
         assert_eq!(all["p99_ms_base"], 9.0);
         assert_eq!(all["count_delta"], 50.0);
         assert_eq!(all["status_counts"]["5xx"], 5);
+    }
+
+    #[test]
+    fn total_change_is_split_into_calls_and_per_call_time() {
+        // 1万回×10msが2万回×6msになると、合計は100秒から120秒へ増えるが、1回あたりは速くなっている。
+        let row = |calls: f64, total_ms: f64| serde_json::json!({"digest": "SELECT 1", "calls": calls, "total_ms": total_ms});
+        let mut diff = QueryDiffRow {
+            key: BTreeMap::from([("digest".into(), "SELECT 1".into())]),
+            key_labels: None,
+            shared: BTreeSet::new(),
+            columns: DiffColumns::Compact { pairs: &[] },
+            presence: QueryPresence::Both,
+            base: Some(row(10_000.0, 100_000.0)),
+            candidate: Some(row(20_000.0, 120_000.0)),
+            changes: BTreeMap::from([
+                ("calls".into(), numeric_diff(Some(10_000.0), Some(20_000.0))),
+                (
+                    "total_ms".into(),
+                    numeric_diff(Some(100_000.0), Some(120_000.0)),
+                ),
+            ]),
+        };
+        let compact = serde_json::to_value(&diff).unwrap();
+        assert_eq!(compact["total_ms_delta_by_calls"], 100_000.0, "{compact}");
+        assert_eq!(compact["total_ms_delta_by_avg"], -80_000.0, "{compact}");
+
+        // 片側にしか無い行や、比較元が0回の行には、回数あたりの時間が無いので出さない。
+        diff.changes
+            .insert("calls".into(), numeric_diff(Some(0.0), Some(20_000.0)));
+        let added = serde_json::to_value(&diff).unwrap();
+        assert!(added.get("total_ms_delta_by_calls").is_none(), "{added}");
     }
 
     #[test]

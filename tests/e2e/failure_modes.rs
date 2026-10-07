@@ -11,7 +11,7 @@ fn latest_cache_failure_does_not_fail_a_saved_run() {
         r#"
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "printf 'スコア: 1\n'"]
+command = ["sh", "-c", "printf 'スコア: 1\n{\"type\":\"isuscope.result\",\"pass\":true}\n'"]
 "#,
     )
     .unwrap();
@@ -45,7 +45,7 @@ fn unavailable_during_collector_is_not_misreported_as_complete() {
         r#"
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "sleep 0.1; printf 'スコア: 1\n'"]
+command = ["sh", "-c", "sleep 0.1; printf 'スコア: 1\n{\"type\":\"isuscope.result\",\"pass\":true}\n'"]
 
 [[collectors]]
 name = "missing-offcpu"
@@ -125,7 +125,7 @@ fn unavailable_optional_collector_does_not_degrade_run() {
         r#"
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "printf 'スコア: 1\n'"]
+command = ["sh", "-c", "printf 'スコア: 1\n{\"type\":\"isuscope.result\",\"pass\":true}\n'"]
 
 [[collectors]]
 name = "retired-mysql"
@@ -172,7 +172,7 @@ fn required_collector_is_matched_by_name_and_phase() {
         r#"
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "touch benchmark-ran; printf 'スコア: 1\n'"]
+command = ["sh", "-c", "touch benchmark-ran; printf 'スコア: 1\n{\"type\":\"isuscope.result\",\"pass\":true}\n'"]
 
 [[collectors]]
 name = "same-name"
@@ -480,4 +480,47 @@ command = ["sh", "-c", "(sleep 14; touch survived) & printf '%s\n' '{\"type\":\"
     // collectorのprocess groupに残った孫は落とされている。
     std::thread::sleep(std::time::Duration::from_secs(5));
     assert!(!project.path().join("survived").exists());
+}
+
+#[test]
+fn score_without_a_verdict_is_not_recorded_as_pass() {
+    // 多くのbenchmarkerはFAILでもexit 0でscoreを出す。adapterが`pass`を伝えなければ推測しない。
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf 'スコア: 0\n'"]
+"#,
+    )
+    .unwrap();
+
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args([
+            "run",
+            "--hypothesis",
+            "the verdict comes from the benchmark",
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("result    UNKNOWN"), "{stdout}");
+    assert!(stdout.contains("reported no `pass`"), "{stdout}");
+
+    let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
+    let (score, passed, analysis): (i64, Option<bool>, String) = database
+        .query_row(
+            "SELECT score, passed, analysis_status FROM runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(score, 0);
+    assert_eq!(passed, None);
+    assert_eq!(analysis, "not_required");
 }

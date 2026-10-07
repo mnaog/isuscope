@@ -151,7 +151,8 @@ enum Commands {
     #[command(after_help = "例:
   isuscope query latest --base BASE_RUN --view http --label route=/api/user/:id --limit 20
   isuscope query latest --base BASE_RUN --view database --window load --group-by sql-shape --label-contains digest=user_items --limit 20
-  isuscope query latest --scope series --window load --metric-prefix host. --node app1")]
+  isuscope query latest --scope series --window load --metric-prefix host. --node app1
+  isuscope query latest --metric db.table.read_time --metric db.table.write_time --group-by table")]
     Query {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
         #[arg(default_value = "latest")]
@@ -2010,13 +2011,18 @@ const CHANGE_LIST_CAP: RowCap = RowCap {
     hint: "filter it with --status or lower --limit",
 };
 
-fn fit_rows(value: &mut serde_json::Value, cap: &RowCap) -> Result<()> {
-    let budget = match env::var("ISUSCOPE_OUTPUT_BYTES") {
+/// 出力の大きさの上限。`ISUSCOPE_OUTPUT_BYTES`で変えられ、0なら上限なし。
+fn output_budget() -> Result<usize> {
+    Ok(match env::var("ISUSCOPE_OUTPUT_BYTES") {
         Ok(text) => text
             .parse::<usize>()
             .context("ISUSCOPE_OUTPUT_BYTES must be a byte count (0 for no limit)")?,
         Err(_) => OUTPUT_BUDGET_BYTES,
-    };
+    })
+}
+
+fn fit_rows(value: &mut serde_json::Value, cap: &RowCap) -> Result<()> {
+    let budget = output_budget()?;
     let size = serde_json::to_vec(value)?.len();
     if budget == 0 || size <= budget {
         return Ok(());
@@ -2214,9 +2220,48 @@ fn round_numbers(value: &mut serde_json::Value) {
     }
 }
 
+/// briefには表が十数個あり、各表を`--limit`行にしても、全体が出力の上限を超えることがある。
+/// 超えたら全部の表の行数をそろえて減らして作り直す。減らした表には`truncated`と`more`が付くので、
+/// 欄が丸ごと消えたり途中が黙って欠けたりはしない。
 fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
-    let diagnostics = load_diagnostics(config, &store, requested)?;
+    let budget = output_budget()?;
+    let mut brief = build_brief(config, &store, requested, limit)?;
+    let mut shown = limit;
+    loop {
+        let mut value = brief_json(&brief)?;
+        round_numbers(&mut value);
+        tabulate(&mut value);
+        let size = serde_json::to_vec(&value)?.len();
+        if budget == 0 || size <= budget || shown <= 1 {
+            if shown < limit
+                && let Some(warnings) = value
+                    .get_mut("warnings")
+                    .and_then(serde_json::Value::as_array_mut)
+            {
+                let fit = if size <= budget || budget == 0 {
+                    "to fit the tool output limit"
+                } else {
+                    "and it is still over the tool output limit"
+                };
+                warnings.push(serde_json::Value::String(format!(
+                    "brief: each table was cut to {shown} rows (asked for {limit}) {fit}; a cut table's `more` shows the rest"
+                )));
+            }
+            return print_json(&value);
+        }
+        shown -= 1;
+        brief.cut_tables(shown);
+    }
+}
+
+fn build_brief(
+    config: &LoadedConfig,
+    store: &Store,
+    requested: &str,
+    limit: usize,
+) -> Result<brief::BriefOutput> {
+    let diagnostics = load_diagnostics(config, store, requested)?;
     let review = store.run_review(&diagnostics.run)?;
     let id = diagnostics.run.id.clone();
     let id_for_score = id.clone();
@@ -2255,9 +2300,19 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
         },
     );
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
+    let mut extra = Vec::new();
+    for prefix in ["log.", "db.file.", "db.memory."] {
+        extra.extend(store.query_metrics(&brief.summary.id, &[], Some(prefix), Some(false))?);
+    }
+    brief::attach_logs_and_database_io(&mut brief, &extra, limit);
     brief.review = Some(brief::review(review));
     brief::next_steps(&mut brief);
-    let mut brief = serde_json::to_value(&brief)?;
+    Ok(brief)
+}
+
+/// briefの表を判断に使う列だけにし、全行で同じ値を`common`へまとめる。
+fn brief_json(brief: &brief::BriefOutput) -> Result<serde_json::Value> {
+    let mut brief = serde_json::to_value(brief)?;
     for (section, columns) in BRIEF_COLUMNS {
         if let Some(items) = brief
             .get_mut(*section)
@@ -2276,12 +2331,14 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
         ("database", &["node", "engine", "source", "window"][..]),
         ("cpu", &["node", "source"][..]),
         ("upstreams", &["node"][..]),
+        ("logs", &["node", "source"][..]),
+        ("database_io", &["node"][..]),
     ] {
         if let Some(section) = brief.get_mut(section) {
             hoist_common(section, identity);
         }
     }
-    write_stdout_json(&brief)
+    Ok(brief)
 }
 
 /// briefの表に残す列と、その順序（行を識別する列を先に）。briefは順位を見て判断するための

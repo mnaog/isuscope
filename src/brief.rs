@@ -1,5 +1,5 @@
 use crate::{
-    model::{BenchmarkMessageKind, RunManifest, Transition},
+    model::{BenchmarkMessageKind, Metric, RunManifest, Transition},
     query::{self, MetricQueryOutput, MetricQueryRow},
     report::{
         CoverageSummary, CpuSummary, DatabaseSummary, HostSummary, HttpRouteSummary,
@@ -30,10 +30,16 @@ pub struct BriefOutput {
     pub score_inputs: BriefSection<MetricQueryRow>,
     /// Parser-kept benchmark output lines: why it failed and what the errors were.
     pub benchmark_messages: BriefBenchmarkMessages,
+    /// ベンチの間にアプリ（`service_units`）・nginxのerror log・kernelが出したエラーの型。多い順。
+    pub logs: BriefSection<BriefLogPattern>,
     pub http: BriefSection<HttpRouteSummary>,
     /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
     pub database_rows_filtered_out: usize,
+    /// MySQLがfileの読み書きで待った時間の長い順。ベンチの前後の差なのでinitializeも含む。
+    pub database_io: BriefSection<BriefDatabaseFile>,
+    /// buffer poolの大きさと、tableのdataとindexの合計（ベンチ後）。
+    pub database_memory: BriefSection<BriefDatabaseMemory>,
     /// idle taskが待機していた時間（`swapper`の`native_safe_halt`など）は除いて順位を付けます。
     /// `sample_percent`は除く前の全sampleに対する割合のままです。
     pub cpu: BriefSection<CpuSummary>,
@@ -56,6 +62,24 @@ pub struct BriefOutput {
     /// `run`の終了時に出る）。無ければ空。
     pub next: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+impl BriefOutput {
+    /// 順位を見る表を、どれも`rows`行までにする。briefが出力の上限を超えるときに使う。
+    /// node単位の表（`hosts`・`clients`・`database_memory`）は全nodeを見切るためのものなので切らない。
+    pub fn cut_tables(&mut self, rows: usize) {
+        self.coverage_issues.cut(rows);
+        self.benchmark.cut(rows);
+        self.score_inputs.cut(rows);
+        self.logs.cut(rows);
+        self.http.cut(rows);
+        self.database.cut(rows);
+        self.database_io.cut(rows);
+        self.cpu.cut(rows);
+        self.upstreams.cut(rows);
+        self.transitions.cut(rows);
+        self.artifact_issues.cut(rows);
+    }
 }
 
 /// nodeごとの1行。全nodeの状況を最初の画面で見切れるようにするための要約で、
@@ -382,6 +406,9 @@ pub struct BriefSection<T> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub more: Option<String>,
     pub items: Vec<T>,
+    /// 残りの行を見るコマンド。後で[`BriefOutput::cut_tables`]が切ったときに`more`へ出す。
+    #[serde(skip)]
+    more_command: Option<String>,
 }
 
 impl<T> BriefSection<T> {
@@ -391,11 +418,141 @@ impl<T> BriefSection<T> {
     }
 
     fn more(mut self, command: impl FnOnce() -> String) -> Self {
+        let command = command();
         if self.truncated {
-            self.more = Some(command());
+            self.more = Some(command.clone());
         }
+        self.more_command = Some(command);
         self
     }
+
+    fn cut(&mut self, rows: usize) {
+        if self.items.len() > rows {
+            self.items.truncate(rows);
+            self.truncated = true;
+            self.more = self.more_command.clone();
+        }
+    }
+}
+
+/// logの1つの型（数字を含む語を`<N>`へ置き換えた行）。briefには型の最初の1行だけを出す。
+/// 型そのものはほぼ同じ文の繰り返しになるので、`query --metric log.error_lines`で見る。
+#[derive(Debug, Serialize)]
+pub struct BriefLogPattern {
+    pub node: String,
+    pub source: String,
+    pub count: u64,
+    pub example: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefDatabaseFile {
+    pub node: String,
+    pub file: String,
+    pub read_wait_ms: f64,
+    pub write_wait_ms: f64,
+    pub read_mib: f64,
+    pub write_mib: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefDatabaseMemory {
+    pub node: String,
+    pub buffer_pool_mib: f64,
+    pub tables_mib: f64,
+}
+
+/// journaldの`RateLimitBurst`の既定値。
+const JOURNAL_RATE_LIMIT_BURST: f64 = 10_000.0;
+
+/// `app-log-delta`と`mysql-io-delta`のmetric（`log.`・`db.file.`・`db.memory.`）から、
+/// `logs`・`database_io`・`database_memory`の欄を作る。
+pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let short = brief.run.clone();
+
+    let mut logs = Vec::new();
+    for metric in metrics {
+        let (node, source) = (label(metric, "node"), label(metric, "source"));
+        match metric.name.as_str() {
+            "log.error_lines" => logs.push(BriefLogPattern {
+                node,
+                source,
+                count: metric.value as u64,
+                example: label(metric, "example"),
+            }),
+            "log.error_lines_omitted" => brief.warnings.push(format!(
+                "logs: {} more error lines from {source} on {node} were outside its 10 most frequent patterns",
+                metric.value
+            )),
+            // journaldは1 unitあたり既定で30秒に10000行までしか残さない。捨てたことを知らせる
+            // `Suppressed`の行は区間が明けて次の行が来たときに出るので、runの終わりには数えられない。
+            "log.lines" if metric.value >= JOURNAL_RATE_LIMIT_BURST && source != "nginx-error" => {
+                brief.warnings.push(format!(
+                    "logs: {source} on {node} wrote {} lines; journald keeps about {JOURNAL_RATE_LIMIT_BURST} lines per 30s per unit by default, so its error counts may be low",
+                    metric.value
+                ))
+            }
+            _ => {}
+        }
+    }
+    logs.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.node.cmp(&b.node)));
+    brief.logs = section(logs, limit).more(|| {
+        format!("isuscope query {short} --metric log.error_lines --group-by source --group-by pattern --limit 20")
+    });
+
+    let mut files = BTreeMap::<(String, String), BriefDatabaseFile>::new();
+    let mut memory = BTreeMap::<String, BriefDatabaseMemory>::new();
+    for metric in metrics {
+        let node = label(metric, "node");
+        if let Some(field) = metric.name.strip_prefix("db.file.") {
+            let file = label(metric, "file");
+            let row = files
+                .entry((node.clone(), file.clone()))
+                .or_insert_with(|| BriefDatabaseFile {
+                    node,
+                    file,
+                    read_wait_ms: 0.0,
+                    write_wait_ms: 0.0,
+                    read_mib: 0.0,
+                    write_mib: 0.0,
+                });
+            match field {
+                "read_wait" => row.read_wait_ms += metric.value,
+                "write_wait" => row.write_wait_ms += metric.value,
+                "read_bytes" => row.read_mib += metric.value / MIB,
+                "write_bytes" => row.write_mib += metric.value / MIB,
+                _ => {}
+            }
+        } else if let Some(field) = metric.name.strip_prefix("db.memory.") {
+            let row = memory
+                .entry(node.clone())
+                .or_insert_with(|| BriefDatabaseMemory {
+                    node,
+                    buffer_pool_mib: 0.0,
+                    tables_mib: 0.0,
+                });
+            match field {
+                "buffer_pool" => row.buffer_pool_mib = metric.value / MIB,
+                "tables" => row.tables_mib = metric.value / MIB,
+                _ => {}
+            }
+        }
+    }
+    let mut files = files
+        .into_values()
+        .filter(|row| row.read_wait_ms + row.write_wait_ms > 0.0)
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| {
+        (b.read_wait_ms + b.write_wait_ms).total_cmp(&(a.read_wait_ms + a.write_wait_ms))
+    });
+    brief.database_io = section(files, limit).more(|| {
+        format!(
+            "isuscope query {short} --metric db.file.read_wait --metric db.file.write_wait --group-by file --limit 20"
+        )
+    });
+    brief.database_memory = section(memory.into_values().collect(), usize::MAX);
 }
 
 #[derive(Debug, Serialize)]
@@ -483,6 +640,7 @@ pub fn build(
         score_inputs: section(score_inputs.rows, limit)
             .more(|| format!("isuscope query {short} --metric-prefix score. --limit 20")),
         benchmark_messages,
+        logs: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
         database: section(database, limit)
@@ -491,6 +649,8 @@ pub fn build(
                 format!("isuscope query {short} --view database{database_window_flag} --limit 20")
             }),
         database_rows_filtered_out,
+        database_io: section(Vec::new(), limit),
+        database_memory: section(Vec::new(), usize::MAX),
         cpu: section(
             diagnostics
                 .cpu
@@ -861,6 +1021,7 @@ fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
         window: None,
         more: None,
         items,
+        more_command: None,
     }
 }
 
@@ -1327,9 +1488,99 @@ mod tests {
     fn more_is_offered_only_for_a_truncated_section() {
         let cut = section(vec![1, 2, 3], 2).more(|| "isuscope query x".into());
         assert_eq!(cut.more.as_deref(), Some("isuscope query x"));
-        let whole = section(vec![1, 2], 2).more(|| unreachable!("not truncated"));
+        let mut whole = section(vec![1, 2], 2).more(|| "isuscope query y".into());
         assert!(whole.more.is_none());
+        // briefが出力の上限を超えて後から切った表にも、残りを見るコマンドを出す。
+        whole.cut(1);
+        assert!(whole.truncated);
+        assert_eq!(whole.more.as_deref(), Some("isuscope query y"));
         assert_eq!(window_flag(Some("load")), " --window load");
         assert_eq!(window_flag(None), "");
+    }
+
+    #[test]
+    fn logs_and_database_io_rank_by_count_and_wait() {
+        let diagnostics = crate::report::diagnose(
+            test_run(),
+            Vec::new(),
+            Vec::new(),
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+        );
+        let options = || query::MetricQueryOptions {
+            scope: query::QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: None,
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        };
+        let empty = || query::metric_query("run".into(), Vec::new(), options());
+        let mut brief = build(diagnostics, empty(), empty(), 5);
+        let metric = |name: &str, value: f64, labels: &[(&str, &str)]| Metric {
+            name: name.into(),
+            value,
+            unit: String::new(),
+            timestamp: None,
+            labels: labels
+                .iter()
+                .chain(&[("node", "app1")])
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        };
+        let file = |name: &str, field: &str, value: f64| {
+            metric(&format!("db.file.{field}"), value, &[("file", name)])
+        };
+        attach_logs_and_database_io(
+            &mut brief,
+            &[
+                metric(
+                    "log.error_lines",
+                    3.0,
+                    &[("source", "isu"), ("example", "a")],
+                ),
+                metric(
+                    "log.error_lines",
+                    40.0,
+                    &[("source", "nginx-error"), ("example", "b")],
+                ),
+                metric("log.lines", 37_500.0, &[("source", "isu")]),
+                metric("log.lines", 41.0, &[("source", "nginx-error")]),
+                file("isucon/users.ibd", "read_wait", 2.0),
+                file("isucon/user_presents.ibd", "read_wait", 51_100.0),
+                file(
+                    "isucon/user_presents.ibd",
+                    "read_bytes",
+                    452.0 * 1_048_576.0,
+                ),
+                // 待たなかったfileは読み書きがあっても出さない。
+                file("undo_001", "write_bytes", 1_048_576.0),
+                metric("db.memory.buffer_pool", 134_217_728.0, &[]),
+                metric("db.memory.tables", 563_101_696.0, &[]),
+            ],
+            5,
+        );
+        let logs = &brief.logs.items;
+        assert_eq!(
+            (logs[0].source.as_str(), logs[0].count),
+            ("nginx-error", 40)
+        );
+        assert_eq!(logs[1].count, 3);
+        // 1万行を超えたunitだけ、journaldが捨てた可能性を知らせる。
+        assert_eq!(brief.warnings.len(), 1, "{:?}", brief.warnings);
+        assert!(brief.warnings[0].contains("isu on app1 wrote 37500 lines"));
+        let files = &brief.database_io.items;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].file, "isucon/user_presents.ibd");
+        assert_eq!(files[0].read_mib, 452.0);
+        let memory = &brief.database_memory.items[0];
+        assert_eq!(
+            (memory.buffer_pool_mib, memory.tables_mib),
+            (128.0, 537.015625)
+        );
     }
 }

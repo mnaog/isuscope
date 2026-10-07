@@ -54,6 +54,8 @@ mod adapters;
 mod agent_context;
 #[path = "e2e/analysis.rs"]
 mod analysis;
+#[path = "e2e/app_logs.rs"]
+mod app_logs;
 #[path = "e2e/benchmark_messages.rs"]
 mod benchmark_messages;
 #[path = "e2e/brief_shape.rs"]

@@ -12,7 +12,7 @@ fn enrich_replaces_parser_metrics_and_survives_reindexing() {
                 r#"
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "printf 'viewer completed: 10\nscore: 123\n'"]
+command = ["sh", "-c", "printf 'viewer completed: 10\nscore: 123\n{{\"type\":\"isuscope.result\",\"pass\":true}}\n'"]
 score_pattern = "score: ([0-9]+)"
 
 [[benchmark.parsers]]
@@ -164,7 +164,7 @@ fn write_parser_config(config_dir: &std::path::Path, parser: &str) {
             r#"
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "printf 'score: 123\n'"]
+command = ["sh", "-c", "printf 'score: 123\n{{\"type\":\"isuscope.result\",\"pass\":true}}\n'"]
 score_pattern = "score: ([0-9]+)"
 
 [[benchmark.parsers]]

@@ -13,6 +13,8 @@ set -euo pipefail
 #      {"type":"isuscope.result","score":12345,"pass":true,"messages":[]}
 #   3. 結果を取得できた場合は、ベンチ判定がfailでもexit 0にする。passで判定を伝える。
 #      起動・認証・poll・parseなどアダプター自体の失敗時だけnon-zeroで終了する。
+#      passはベンチ自身の判定（ISUCON12なら`[PASSED]: true`）から作る。終了コードからは作らない。
+#      passが無いrunはPASSと推測せず、判定不明（UNKNOWN）として記録する。
 #
 # 任意のinitialize境界:
 #   printf '%s\n' '{"type":"isuscope.event","name":"initialize-started"}'
