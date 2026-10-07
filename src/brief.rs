@@ -46,7 +46,7 @@ pub struct BriefOutput {
     pub clients: Vec<BriefClientNode>,
     /// Per backend, when the access log carries `$upstream_addr` and the upstream times.
     pub upstreams: BriefSection<UpstreamSummary>,
-    pub transitions: BriefSection<Transition>,
+    pub transitions: BriefSection<BriefTransition>,
     pub artifact_issues: BriefSection<ProfileArtifact>,
     pub profiles_unavailable: usize,
     pub warnings: Vec<String>,
@@ -92,6 +92,47 @@ pub struct BriefQuietHosts {
     pub pressure_max_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_util_max_percent: Option<f64>,
+}
+
+/// 遷移1件と、その順序がどこまで確かか。順序の値は遷移helperが記録したrunだけに付く。
+#[derive(Debug, Serialize)]
+pub struct BriefTransition {
+    pub from_route: String,
+    pub to_route: String,
+    pub count: i64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    /// 前の要求が終わる前に次の要求が始まった回数（並行して出た要求で、遷移とは限らない）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlap_count: Option<f64>,
+    /// 開始時刻が同じか、開始時刻を推定できない旧形式のlogで、順序が決まらなかった回数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguous_count: Option<f64>,
+}
+
+fn transitions(
+    transitions: Vec<Transition>,
+    order: &crate::report::TransitionOrder,
+) -> Vec<BriefTransition> {
+    transitions
+        .into_iter()
+        .map(|transition| {
+            let edge = order
+                .edges
+                .get(&(transition.from_route.clone(), transition.to_route.clone()))
+                .copied()
+                .unwrap_or_default();
+            BriefTransition {
+                from_route: transition.from_route,
+                to_route: transition.to_route,
+                count: transition.count,
+                p50_ms: transition.p50_ms,
+                p95_ms: transition.p95_ms,
+                overlap_count: edge.overlap_count,
+                ambiguous_count: edge.ambiguous_count,
+            }
+        })
+        .collect()
 }
 
 /// [`crate::changes::RunReview`]から判断に要る部分だけを残したもの。長文は冒頭だけにし、
@@ -361,13 +402,23 @@ pub fn build(
     let clients = client_nodes(&diagnostics.client, window_seconds);
     let (hosts, quiet_hosts) = split_quiet_hosts(host_nodes(&diagnostics.host));
     let benchmark_messages = benchmark_messages(&run);
+    let mut warnings = benchmark.warnings;
+    if let Some(legacy) = diagnostics
+        .transition_order
+        .legacy_events
+        .filter(|count| *count > 0.0)
+    {
+        warnings.push(format!(
+            "{legacy} transition requests had no msec/reqtime in the access log; they are ordered by completion second and counted in ambiguous_count"
+        ));
+    }
     let profiles_unavailable = diagnostics
         .artifacts
         .iter()
         .filter(|item| item.status == "unavailable")
         .count();
     BriefOutput {
-        schema_version: 1,
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
         review: None,
         run: BriefRun {
             short_id: crate::runner::short_id(&run.id).into(),
@@ -406,7 +457,10 @@ pub fn build(
         quiet_hosts,
         clients,
         upstreams: section(diagnostics.upstreams, limit),
-        transitions: section(diagnostics.transitions, limit),
+        transitions: section(
+            transitions(diagnostics.transitions, &diagnostics.transition_order),
+            limit,
+        ),
         artifact_issues: section(
             diagnostics
                 .artifacts
@@ -416,7 +470,7 @@ pub fn build(
             limit,
         ),
         profiles_unavailable,
-        warnings: benchmark.warnings,
+        warnings,
     }
 }
 
@@ -998,6 +1052,7 @@ mod tests {
             upstreams: Vec::new(),
             artifacts: Vec::new(),
             transitions: Vec::new(),
+            transition_order: Default::default(),
         };
         let mut brief = build(diagnostics, empty(), empty(), 5);
         let long = "受取履歴の旧単発SELECTは995回・合計373401.675ms。".repeat(20);
@@ -1113,5 +1168,68 @@ mod tests {
         assert_eq!(issues[0].nodes, ["app2", "app3"]);
         assert_eq!(issues[0].occurrences, 2);
         assert_eq!(info_count, 1);
+    }
+
+    #[test]
+    fn transitions_carry_how_certain_their_order_is() {
+        let metric = |name: &str, value: f64, edge: Option<(&str, &str)>| crate::model::Metric {
+            name: name.into(),
+            value,
+            unit: String::new(),
+            timestamp: None,
+            labels: edge
+                .map(|(from, to)| {
+                    BTreeMap::from([("from".into(), from.into()), ("to".into(), to.into())])
+                })
+                .unwrap_or_default(),
+        };
+        let transition = |from: &str, to: &str| Transition {
+            from_route: from.into(),
+            to_route: to.into(),
+            count: 10,
+            p50_ms: Some(5.0),
+            p95_ms: Some(9.0),
+        };
+        let diagnostics = crate::report::diagnose(
+            test_run(),
+            vec![
+                metric("transition.legacy_events", 3.0, None),
+                metric("transition.overlap_count", 2.0, Some(("GET /", "GET /a"))),
+                metric("transition.ambiguous_count", 0.0, Some(("GET /", "GET /a"))),
+            ],
+            vec![
+                transition("GET /", "GET /a"),
+                transition("GET /a", "GET /b"),
+            ],
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+        );
+        let options = || query::MetricQueryOptions {
+            scope: query::QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: None,
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        };
+        let empty = || query::metric_query("run".into(), Vec::new(), options());
+        let brief = build(diagnostics, empty(), empty(), 5);
+        let rows = &brief.transitions.items;
+        assert_eq!(rows[0].overlap_count, Some(2.0));
+        assert_eq!(rows[0].ambiguous_count, Some(0.0));
+        // 順序の記録が無い遷移には付けない。
+        assert_eq!(rows[1].overlap_count, None);
+        assert!(
+            brief
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("3 transition requests had no msec")),
+            "{:?}",
+            brief.warnings
+        );
     }
 }

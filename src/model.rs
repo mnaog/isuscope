@@ -216,6 +216,10 @@ pub fn epoch_seconds(value: f64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros((value * 1_000_000.0).round() as i64)
 }
 
+/// 機械向け出力（`list`・`brief`・`series`・`query`・`sql`・`change list`/`show`）のJSONの版。
+/// 保存するfile（run.jsonや変更の記録）の版とは別に数える。2は表を`columns`と`rows`で出す形。
+pub const OUTPUT_SCHEMA_VERSION: u32 = 2;
+
 /// 冒頭`chars`文字（超えたら`…`を付ける）と、切ったかどうか。AI向けの出力で長文を短くする。
 pub fn excerpt(text: &str, chars: usize) -> (String, bool) {
     match text.char_indices().nth(chars) {

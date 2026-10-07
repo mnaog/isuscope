@@ -263,7 +263,7 @@ pub fn metric_query(
         .collect();
 
     MetricQueryOutput {
-        schema_version: 1,
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
         run_id,
         view: "metrics",
         scope: options.scope,
@@ -678,7 +678,7 @@ pub fn database_query(
         .into_iter()
         .collect();
     DatabaseQueryOutput {
-        schema_version: 1,
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
         run_id,
         view: "database",
         grouping: if options.sql_shape {
@@ -857,7 +857,7 @@ pub fn http_query(
     let total_count = rows.len();
     rows.truncate(options.limit);
     HttpQueryOutput {
-        schema_version: 1,
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
         run_id,
         view: "http",
         total_count,
@@ -1113,7 +1113,7 @@ fn finish_diff<T>(
         row.shared = common.keys().cloned().collect();
     }
     QueryDiffOutput {
-        schema_version: 1,
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
         view,
         base_run_id,
         candidate_run_id,

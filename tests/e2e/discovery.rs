@@ -106,7 +106,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .unwrap();
     assert!(list.status.success());
     let list: serde_json::Value = parsed(&list.stdout).unwrap();
-    assert_eq!(list["schema_version"], 1);
+    assert_eq!(list["schema_version"], 2);
     assert_eq!(list["runs"].as_array().unwrap().len(), 1);
     assert_eq!(list["runs"][0]["score"], 12345);
     assert_eq!(list["runs"][0]["analysis_status"], "pending");
@@ -118,7 +118,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .unwrap();
     assert!(brief.status.success());
     let brief: serde_json::Value = parsed(&brief.stdout).unwrap();
-    assert_eq!(brief["schema_version"], 1);
+    assert_eq!(brief["schema_version"], 2);
     assert_eq!(brief["run"]["score"], 12345);
     assert_eq!(brief["transitions"]["rows"][0]["count"], 7);
 
@@ -171,7 +171,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .unwrap();
     assert!(series.status.success());
     let series: serde_json::Value = parsed(&series.stdout).unwrap();
-    assert_eq!(series["schema_version"], 1);
+    assert_eq!(series["schema_version"], 2);
     assert_eq!(series["mode"], "overview");
     assert_eq!(series["window"]["name"], "whole");
     assert_eq!(series["window"]["bucket_seconds"], 5);

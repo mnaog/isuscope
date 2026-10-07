@@ -89,7 +89,7 @@ pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput
         );
     }
     Ok(SqlOutput {
-        schema_version: 1,
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
         row_count: rows.len(),
         columns,
         truncated,

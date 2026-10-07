@@ -736,7 +736,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 ))?,
                 ChangeCommand::List { status, limit } => write_capped_json(
                     &serde_json::json!({
-                        "schema_version": 1,
+                        "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
                         "changes": store
                             .list_changes(status, None, limit)?
                             .into_iter()
@@ -1391,7 +1391,7 @@ fn series_output(
     data: SeriesData,
 ) -> SeriesOutput {
     SeriesOutput {
-        schema_version: 1,
+        schema_version: isuscope::model::OUTPUT_SCHEMA_VERSION,
         run_id,
         benchmark: ((window_start, window_end) != (benchmark_start, benchmark_end)).then(|| {
             SeriesInterval {
@@ -1696,7 +1696,7 @@ fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     write_capped_json(
         &RunListOutput {
-            schema_version: 1,
+            schema_version: isuscope::model::OUTPUT_SCHEMA_VERSION,
             runs: store.list(limit)?,
         },
         &LIST_CAP,

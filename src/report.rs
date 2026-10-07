@@ -20,6 +20,46 @@ pub struct RunDiagnostics {
     pub upstreams: Vec<UpstreamSummary>,
     pub artifacts: Vec<ProfileArtifact>,
     pub transitions: Vec<Transition>,
+    pub transition_order: TransitionOrder,
+}
+
+/// 遷移helperが残した順序の確からしさ。遷移（from, to）ごとの`transition.overlap_count`と
+/// `transition.ambiguous_count`、開始時刻を推定できなかった要求の数（`transition.legacy_events`）。
+/// helperが順序を記録する前のrunでは空。
+#[derive(Debug, Default)]
+pub struct TransitionOrder {
+    pub edges: BTreeMap<(String, String), TransitionEdgeOrder>,
+    pub legacy_events: Option<f64>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TransitionEdgeOrder {
+    pub overlap_count: Option<f64>,
+    pub ambiguous_count: Option<f64>,
+}
+
+fn transition_order(metrics: &[Metric]) -> TransitionOrder {
+    let mut order = TransitionOrder::default();
+    for metric in metrics {
+        let add = |slot: &mut Option<f64>| *slot.get_or_insert(0.0) += metric.value;
+        match metric.name.as_str() {
+            "transition.legacy_events" => add(&mut order.legacy_events),
+            name @ ("transition.overlap_count" | "transition.ambiguous_count") => {
+                let (Some(from), Some(to)) = (metric.labels.get("from"), metric.labels.get("to"))
+                else {
+                    continue;
+                };
+                let edge = order.edges.entry((from.clone(), to.clone())).or_default();
+                add(if name == "transition.overlap_count" {
+                    &mut edge.overlap_count
+                } else {
+                    &mut edge.ambiguous_count
+                });
+            }
+            _ => {}
+        }
+    }
+    order
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -155,6 +195,7 @@ pub fn diagnose(
             .then_with(|| a.upstream.cmp(&b.upstream))
     });
     let artifacts = profile_artifacts(&run.collectors, &run_logs, latest_logs.as_deref());
+    let transition_order = transition_order(&summary_metrics);
     RunDiagnostics {
         run,
         coverage,
@@ -167,6 +208,7 @@ pub fn diagnose(
         upstreams,
         artifacts,
         transitions,
+        transition_order,
     }
 }
 

@@ -140,6 +140,7 @@ impl From<Decision> for DecisionView {
 
 #[derive(Debug, Serialize)]
 pub struct ChangeHistoryView {
+    pub schema_version: u32,
     pub change: ChangeView,
     pub decisions: Vec<DecisionView>,
 }
@@ -161,6 +162,7 @@ pub struct ChangeSummaryView {
 impl From<ChangeHistory> for ChangeHistoryView {
     fn from(history: ChangeHistory) -> Self {
         Self {
+            schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
             change: history.change.into(),
             decisions: history.decisions.into_iter().map(Into::into).collect(),
         }
