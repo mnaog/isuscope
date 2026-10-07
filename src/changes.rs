@@ -100,12 +100,14 @@ pub struct ChangeView {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    #[serde(serialize_with = "crate::model::serialize_display_time")]
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DecisionView {
     pub id: String,
+    #[serde(serialize_with = "crate::model::serialize_display_time")]
     pub created_at: DateTime<Utc>,
     pub status: DecisionStatus,
     pub reason: String,
@@ -151,8 +153,10 @@ pub struct ChangeSummaryView {
     pub id: String,
     pub description: String,
     pub target: Option<String>,
+    #[serde(serialize_with = "crate::model::serialize_display_time")]
     pub created_at: DateTime<Utc>,
     pub status: Option<DecisionStatus>,
+    #[serde(serialize_with = "crate::model::serialize_display_time_option")]
     pub decided_at: Option<DateTime<Utc>>,
     pub reason: Option<String>,
     pub revisit: Option<String>,

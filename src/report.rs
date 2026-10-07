@@ -238,9 +238,13 @@ pub struct HttpRouteSummary {
     pub errors: f64,
     pub error_rate: Option<f64>,
     pub response_bytes: Option<f64>,
-    /// 0件のclassは出さない。
-    #[serde(serialize_with = "nonzero_counts")]
+    /// 0件のclassは出さない。どのclassも0件なら欄ごと出さない。
+    #[serde(serialize_with = "nonzero_counts", skip_serializing_if = "all_zero")]
     pub status_counts: BTreeMap<String, f64>,
+}
+
+fn all_zero(counts: &BTreeMap<String, f64>) -> bool {
+    counts.values().all(|count| *count == 0.0)
 }
 
 fn nonzero_counts<S: serde::Serializer>(

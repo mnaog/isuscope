@@ -1395,14 +1395,14 @@ fn series_output(
         run_id,
         benchmark: ((window_start, window_end) != (benchmark_start, benchmark_end)).then(|| {
             SeriesInterval {
-                started_at: benchmark_start.to_rfc3339(),
-                finished_at: benchmark_end.to_rfc3339(),
+                started_at: isuscope::model::display_time(benchmark_start),
+                finished_at: isuscope::model::display_time(benchmark_end),
             }
         }),
         window: SeriesWindow {
             name: options.window.as_str().into(),
-            started_at: window_start.to_rfc3339(),
-            finished_at: window_end.to_rfc3339(),
+            started_at: isuscope::model::display_time(window_start),
+            finished_at: isuscope::model::display_time(window_end),
             from_seconds: (window_start - benchmark_start).num_seconds(),
             to_seconds: (window_end - benchmark_start).num_seconds(),
             bucket_seconds: options.bucket,
@@ -1789,8 +1789,9 @@ fn hoist_common(value: &mut serde_json::Value, identity: &[&str]) {
         .and_then(serde_json::Value::as_array_mut)
     {
         for row in rows.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+            // `preserve_order`の`remove`は末尾の列を空いた位置へ移すので、順序を保つ`shift_remove`を使う。
             for field in common.keys() {
-                row.remove(field);
+                row.shift_remove(field);
             }
             if let Some(row_labels) = row
                 .get_mut("labels")
@@ -1803,7 +1804,7 @@ fn hoist_common(value: &mut serde_json::Value, identity: &[&str]) {
                 .and_then(serde_json::Value::as_object)
                 .is_some_and(serde_json::Map::is_empty)
             {
-                row.remove("labels");
+                row.shift_remove("labels");
             }
         }
     }
@@ -2092,6 +2093,17 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
     brief.review = Some(brief::review(review));
     let mut brief = serde_json::to_value(&brief)?;
+    for (section, columns) in BRIEF_COLUMNS {
+        if let Some(items) = brief
+            .get_mut(*section)
+            .and_then(|section| section.get_mut("items"))
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            items
+                .iter_mut()
+                .for_each(|row| select_columns(row, columns));
+        }
+    }
     for (section, identity) in [
         ("benchmark", &["unit", "aggregation", "samples"][..]),
         ("score_inputs", &["unit", "aggregation", "samples"][..]),
@@ -2105,6 +2117,49 @@ fn show_brief(config: &LoadedConfig, requested: &str, limit: usize) -> Result<()
         }
     }
     write_stdout_json(&brief)
+}
+
+/// briefの表に残す列と、その順序（行を識別する列を先に）。briefは順位を見て判断するための
+/// ものなので主要な値だけにし、分位・最大・行数などの残りは`query`で見る。列が多いと、値の並びを
+/// 列名へ対応させるときに読み違えやすい。
+const BRIEF_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "http",
+        &[
+            "node", "method", "route", "count", "total_ms", "avg_ms", "p95_ms", "errors",
+        ],
+    ),
+    (
+        "database",
+        &[
+            "node",
+            "engine",
+            "source",
+            "window",
+            "digest",
+            "digest_id",
+            "calls",
+            "total_ms",
+            "avg_ms",
+            "p95_ms",
+            "lock_ms",
+            "rows_examined_per_call",
+        ],
+    ),
+];
+
+/// `columns`にある列だけを、その順に並べ直す。
+fn select_columns(row: &mut serde_json::Value, columns: &[&str]) {
+    let Some(fields) = row.as_object_mut() else {
+        return;
+    };
+    let mut selected = serde_json::Map::new();
+    for column in columns {
+        if let Some(value) = fields.shift_remove(*column) {
+            selected.insert((*column).into(), value);
+        }
+    }
+    *fields = selected;
 }
 
 fn load_diagnostics(
@@ -2166,6 +2221,11 @@ mod series_tests {
         assert!(value["common"].get("route").is_none());
         let row = &value["rows"][0];
         assert!(row.get("node").is_none());
+        // 残った列は元の順のまま（末尾の列が前へ動かない）。
+        assert_eq!(
+            row.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["route", "count", "labels"]
+        );
         assert_eq!(row["route"], "/a");
         assert_eq!(row["labels"], serde_json::json!({"quantile": "0.95"}));
         // 1行だけなら何もまとめない。

@@ -38,6 +38,7 @@ pub struct RunSummary {
     pub id: String,
     /// The form printed by `run` and accepted everywhere a run is named.
     pub short_id: String,
+    /// JSTのミリ秒まで（[`crate::model::display_time`]）。
     pub started_at: String,
     /// 先頭12桁（ほかの出力の短縮commitと同じ）。完全な値は`brief`の`run`にある。
     #[serde(serialize_with = "short_commit")]
@@ -377,7 +378,7 @@ impl Store {
             Ok(RunSummary {
                 short_id: crate::runner::short_id(&id).into(),
                 id,
-                started_at: row.get(1)?,
+                started_at: crate::model::display_stored_time(&row.get::<_, String>(1)?),
                 commit_hash: row.get(2)?,
                 dirty: row.get(3)?,
                 mode: row.get(4)?,

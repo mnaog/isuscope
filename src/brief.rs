@@ -237,7 +237,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
                 status: decision.as_ref().map(|decision| decision.status.as_str()),
                 decided_at: decision
                     .as_ref()
-                    .map(|decision| decision.created_at.to_rfc3339()),
+                    .map(|decision| crate::model::display_time(decision.created_at)),
                 reason,
                 reason_same_as_analysis: same,
                 revisit: decision
@@ -299,6 +299,8 @@ pub struct BriefService {
 
 #[derive(Debug, Serialize)]
 pub struct BriefRun {
+    /// 出さない。runは`short_id`で指せる（全コマンドが受け付ける）。
+    #[serde(skip)]
     pub id: String,
     /// The form printed by `run` and accepted everywhere a run is named.
     pub short_id: String,
@@ -423,8 +425,8 @@ pub fn build(
         run: BriefRun {
             short_id: crate::runner::short_id(&run.id).into(),
             id: run.id,
-            started_at: run.started_at.to_rfc3339(),
-            finished_at: run.finished_at.map(|value| value.to_rfc3339()),
+            started_at: crate::model::display_time(run.started_at),
+            finished_at: run.finished_at.map(crate::model::display_time),
             state: run.state.as_str().into(),
             score: run.benchmark.score,
             passed: run.benchmark.passed,

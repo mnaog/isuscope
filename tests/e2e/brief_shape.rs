@@ -265,9 +265,27 @@ parser = "slp-windows"
         top["digest"].as_str().unwrap().contains("id_generator"),
         "{top}"
     );
+    // briefは主要な列だけを、行を識別するdigestから順に出す。p99やmaxは`query`で見る。
+    assert!(top["p95_ms"].is_number(), "{top}");
     assert!(
-        top["p99_ms"].is_number() && top["max_ms"].is_number(),
+        top.get("p99_ms").is_none() && top.get("max_ms").is_none(),
         "{top}"
+    );
+    let raw: serde_json::Value =
+        serde_json::from_slice(&isuscope(&["brief", "latest"]).stdout).unwrap();
+    assert_eq!(
+        raw["database"]["columns"][0], "digest",
+        "{}",
+        raw["database"]
+    );
+    assert!(raw["run"].get("id").is_none(), "{}", raw["run"]);
+    assert!(
+        raw["run"]["started_at"]
+            .as_str()
+            .unwrap()
+            .ends_with("+09:00"),
+        "{}",
+        raw["run"]
     );
     assert!(
         !brief["database"]["rows"]
