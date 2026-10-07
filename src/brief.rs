@@ -253,7 +253,7 @@ pub struct BriefPressure {
 #[derive(Debug, Serialize)]
 pub struct BriefService {
     pub service: String,
-    pub cpu_cores_max: f64,
+    pub cpu_max_cores: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -623,10 +623,10 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                 .filter(|row| row.metric == "service.cpu_cores")
                 .map(|row| BriefService {
                     service: row.target.clone(),
-                    cpu_cores_max: query::round_to(row.peak, 3),
+                    cpu_max_cores: query::round_to(row.peak, 3),
                 })
                 .collect::<Vec<_>>();
-            services.sort_by(|a, b| b.cpu_cores_max.total_cmp(&a.cpu_cores_max));
+            services.sort_by(|a, b| b.cpu_max_cores.total_cmp(&a.cpu_max_cores));
             services.truncate(3);
             BriefHostNode {
                 node: node.into(),
@@ -668,9 +668,11 @@ fn is_idle(row: &CpuSummary) -> bool {
     row.process.starts_with("swapper") && IDLE_SYMBOLS.contains(&row.symbol.as_str())
 }
 
-/// どの値も分かっていて閾値を下回るnodeを1つにまとめる。実データで遊んでいたnodeはCPUのピークが
-/// 15%未満、ディスク7%未満、iowait 0.1%未満で、詰まっていたnodeとは桁が違う。値の欠けたnodeは
-/// 遊んでいたとは言えないので、まとめずにそのまま出す。1台だけならまとめても短くならない。
+/// どの値も閾値を下回るnodeを1つにまとめる。実データで遊んでいたnodeはCPUのピークが15%未満、
+/// ディスク7%未満、iowait 0.1%未満で、詰まっていたnodeとは桁が違う。CPU全体とコアのピークは必須で、
+/// 欠けたnodeは遊んでいたとは言えないので、まとめずにそのまま出す。iowait・PSI・diskは環境によって
+/// 取れないので、無ければ判定に使わない（collectorの失敗は`coverage_issues`に出る）。
+/// 1台だけならまとめても短くならない。
 fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<BriefQuietHosts>) {
     let quiet = |node: &BriefHostNode| {
         node.cpu_busy_max_percent.is_some_and(|value| value < 25.0)
