@@ -106,10 +106,10 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .unwrap();
     assert!(list.status.success());
     let list: serde_json::Value = parsed(&list.stdout).unwrap();
-    assert_eq!(list["schema_version"], 1);
-    assert_eq!(list["runs"].as_array().unwrap().len(), 1);
-    assert_eq!(list["runs"][0]["score"], 12345);
-    assert_eq!(list["runs"][0]["analysis_status"], "pending");
+    assert_eq!(list["schema_version"], 2);
+    assert_eq!(list["runs"]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(list["runs"]["rows"][0]["score"], 12345);
+    assert_eq!(list["runs"]["rows"][0]["analysis_status"], "pending");
 
     let brief = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["brief", "latest"])
@@ -118,9 +118,13 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .unwrap();
     assert!(brief.status.success());
     let brief: serde_json::Value = parsed(&brief.stdout).unwrap();
-    assert_eq!(brief["schema_version"], 1);
-    assert_eq!(brief["run"]["score"], 12345);
+    assert_eq!(brief["schema_version"], 2);
+    assert_eq!(brief["summary"]["score"], 12345);
     assert_eq!(brief["transitions"]["rows"][0]["count"], 7);
+    // briefは並行作業する別の人も読むので、分析待ちでも`analyze`を勧めない。
+    assert_eq!(brief["next"], serde_json::json!([]), "{}", brief["next"]);
+    // 切っていない欄には`more`を付けない。
+    assert!(brief["http"].get("more").is_none(), "{}", brief["http"]);
 
     // `report`, `diff` and `ui` were removed; brief, query and sql cover the same data.
     for removed in [
@@ -171,10 +175,10 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         .unwrap();
     assert!(series.status.success());
     let series: serde_json::Value = parsed(&series.stdout).unwrap();
-    assert_eq!(series["schema_version"], 1);
+    assert_eq!(series["schema_version"], 2);
     assert_eq!(series["mode"], "overview");
-    assert_eq!(series["window"]["name"], "whole");
-    assert_eq!(series["window"]["bucket_seconds"], 5);
+    assert_eq!(series["window"], "whole");
+    assert_eq!(series["range"]["bucket_seconds"], 5);
     assert_eq!(series["rows"][0]["from_seconds"], 0);
     assert!(series["rows"][0]["cpu_busy_avg_percent"].is_null());
 
@@ -217,7 +221,7 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
     assert!(filtered.status.success());
     let filtered: serde_json::Value = parsed(&filtered.stdout).unwrap();
     assert_eq!(filtered["mode"], "metrics");
-    assert_eq!(filtered["window"]["bucket_seconds"], 10);
+    assert_eq!(filtered["range"]["bucket_seconds"], 10);
     assert_eq!(filtered["rows"][0]["metric"], "cpu");
     assert_eq!(filtered["rows"][0]["value"], 12.5);
     // 単位と集計方法はmetricごとに1回だけ出し、行では繰り返さない。

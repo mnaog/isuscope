@@ -9,14 +9,19 @@ use crate::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// briefの`review.changes`に出す変更の数。
+const REVIEW_CHANGES: usize = 20;
+
 /// 長文の冒頭だけを出す文字数。全文は各欄の`full_text`の命令で読む。
 const EXCERPT_CHARS: usize = 240;
 
 #[derive(Debug, Serialize)]
 pub struct BriefOutput {
     pub schema_version: u32,
+    /// このrunの短縮ID。ほかの出力の`run`と同じ。
+    pub run: String,
+    pub summary: BriefRun,
     pub review: Option<BriefReview>,
-    pub run: BriefRun,
     pub coverage_issues: BriefSection<CoverageIssueGroup>,
     pub coverage_notes_hidden: usize,
     pub benchmark: BriefSection<MetricQueryRow>,
@@ -26,29 +31,30 @@ pub struct BriefOutput {
     /// Parser-kept benchmark output lines: why it failed and what the errors were.
     pub benchmark_messages: BriefBenchmarkMessages,
     pub http: BriefSection<HttpRouteSummary>,
-    /// DBの行を要約した区間（`load`など）。区間を持たない古いrunでは出さない。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub database_window: Option<String>,
+    /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
     pub database_rows_filtered_out: usize,
     /// idle taskが待機していた時間（`swapper`の`native_safe_halt`など）は除いて順位を付けます。
     /// `sample_percent`は除く前の全sampleに対する割合のままです。
     pub cpu: BriefSection<CpuSummary>,
-    /// `hosts`と`clients`を要約した区間。initializeの終わりが分かるrunは`load`、
-    /// 分からないrunは`whole`（initializeを含む）。
-    pub hosts_window: &'static str,
     /// 1 node 1行。詳細は`query --scope series --window load`で掘ります。
-    /// 遊んでいたnodeは`quiet_hosts`へまとめ、ここには出しません。
-    pub hosts: Vec<BriefHostNode>,
+    /// 遊んでいたnodeは`quiet_hosts`へまとめ、ここには出しません。`window`は要約した区間で、
+    /// initializeの終わりが分かるrunは`load`、分からないrunは`whole`（initializeを含む）。
+    pub hosts: BriefSection<BriefHostNode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quiet_hosts: Option<BriefQuietHosts>,
     /// ベンチ側の接続の使い方。access logに`$connection`と`$msec`があるとき、1 node 1行。
-    pub clients: Vec<BriefClientNode>,
+    /// `window`は`hosts`と同じ区間。
+    pub clients: BriefSection<BriefClientNode>,
     /// Per backend, when the access log carries `$upstream_addr` and the upstream times.
     pub upstreams: BriefSection<UpstreamSummary>,
-    pub transitions: BriefSection<Transition>,
+    pub transitions: BriefSection<BriefTransition>,
     pub artifact_issues: BriefSection<ProfileArtifact>,
     pub profiles_unavailable: usize,
+    /// 作業の流れで次に使えるコマンド。比較元があるときのHTTPとDBの比較だけで、推測の助言は入れない。
+    /// briefは並行して作業する別の人も読むので、書き込む`analyze`は出さない（runを走らせた本人へは
+    /// `run`の終了時に出る）。無ければ空。
+    pub next: Vec<String>,
     pub warnings: Vec<String>,
 }
 
@@ -94,6 +100,47 @@ pub struct BriefQuietHosts {
     pub disk_util_max_percent: Option<f64>,
 }
 
+/// 遷移1件と、その順序がどこまで確かか。順序の値は遷移helperが記録したrunだけに付く。
+#[derive(Debug, Serialize)]
+pub struct BriefTransition {
+    pub from_route: String,
+    pub to_route: String,
+    pub count: i64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    /// 前の要求が終わる前に次の要求が始まった回数（並行して出た要求で、遷移とは限らない）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overlap_count: Option<f64>,
+    /// 開始時刻が同じか、開始時刻を推定できない旧形式のlogで、順序が決まらなかった回数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguous_count: Option<f64>,
+}
+
+fn transitions(
+    transitions: Vec<Transition>,
+    order: &crate::report::TransitionOrder,
+) -> Vec<BriefTransition> {
+    transitions
+        .into_iter()
+        .map(|transition| {
+            let edge = order
+                .edges
+                .get(&(transition.from_route.clone(), transition.to_route.clone()))
+                .copied()
+                .unwrap_or_default();
+            BriefTransition {
+                from_route: transition.from_route,
+                to_route: transition.to_route,
+                count: transition.count,
+                p50_ms: transition.p50_ms,
+                p95_ms: transition.p95_ms,
+                overlap_count: edge.overlap_count,
+                ambiguous_count: edge.ambiguous_count,
+            }
+        })
+        .collect()
+}
+
 /// [`crate::changes::RunReview`]から判断に要る部分だけを残したもの。長文は冒頭だけにし、
 /// run・commitは短縮形にする。
 #[derive(Debug, Serialize)]
@@ -102,24 +149,29 @@ pub struct BriefReview {
     pub latest_analysis: Option<BriefAnalysis>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<BriefComparison>,
-    pub changes: Vec<BriefChange>,
-    pub changes_truncated: bool,
+    pub changes: BriefSection<BriefChange>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BriefAnalysis {
     pub verdict: crate::model::AnalysisVerdict,
+    /// 比較元runの短縮ID。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_short_id: Option<String>,
+    pub base: Option<String>,
     pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+/// 比較は`query --base`と同じ書き方。比較元は`_base`、今回は接尾辞なし、差は`_delta`と`_delta_percent`。
 pub struct BriefComparison {
-    pub base_short_id: String,
-    pub score: crate::diff::ScoreDiff,
+    /// 比較元runの短縮ID。
+    pub base: String,
+    pub score_base: Option<i64>,
+    pub score: Option<i64>,
+    pub score_delta: Option<i64>,
+    pub score_delta_percent: Option<f64>,
     pub conditions: Vec<crate::changes::ComparisonCondition>,
 }
 
@@ -158,7 +210,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
         let (body, cut) = excerpt(&analysis.body);
         BriefAnalysis {
             verdict: analysis.verdict,
-            base_short_id: analysis.base_run_id.as_deref().map(short),
+            base: analysis.base_run_id.as_deref().map(short),
             body,
             full_text: cut.then(|| {
                 format!(
@@ -169,8 +221,11 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
         }
     });
     let comparison = review.comparison.map(|comparison| BriefComparison {
-        base_short_id: short(&comparison.base_run_id),
-        score: comparison.score,
+        base: short(&comparison.base_run_id),
+        score_base: comparison.score.base,
+        score: comparison.score.candidate,
+        score_delta: comparison.score.delta,
+        score_delta_percent: comparison.score.delta_percent,
         conditions: comparison.conditions,
     });
     let changes = review
@@ -196,7 +251,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
                 status: decision.as_ref().map(|decision| decision.status.as_str()),
                 decided_at: decision
                     .as_ref()
-                    .map(|decision| decision.created_at.to_rfc3339()),
+                    .map(|decision| crate::model::display_time(decision.created_at)),
                 reason,
                 reason_same_as_analysis: same,
                 revisit: decision
@@ -217,8 +272,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
     BriefReview {
         latest_analysis,
         comparison,
-        changes,
-        changes_truncated: review.changes_truncated,
+        changes: section(changes, REVIEW_CHANGES),
     }
 }
 
@@ -253,13 +307,15 @@ pub struct BriefPressure {
 #[derive(Debug, Serialize)]
 pub struct BriefService {
     pub service: String,
-    pub cpu_cores_max: f64,
+    pub cpu_max_cores: f64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct BriefRun {
+    /// 出さない。runはトップレベルの`run`（短縮ID）で指す。
+    #[serde(skip)]
     pub id: String,
-    /// The form printed by `run` and accepted everywhere a run is named.
+    #[serde(skip)]
     pub short_id: String,
     pub started_at: String,
     pub finished_at: Option<String>,
@@ -268,6 +324,8 @@ pub struct BriefRun {
     pub passed: Option<bool>,
     pub hypothesis: String,
     pub analysis_status: String,
+    /// 先頭12桁。ほかの出力の短縮commitと同じ。
+    #[serde(serialize_with = "crate::model::serialize_short_commit")]
     pub commit_hash: Option<String>,
     pub dirty: bool,
     /// Organizer-only benchmark lines dropped before saving, per `operator_line_pattern`.
@@ -317,7 +375,27 @@ pub fn benchmark_messages(run: &RunManifest) -> BriefBenchmarkMessages {
 pub struct BriefSection<T> {
     pub total_count: usize,
     pub truncated: bool,
+    /// 行を要約した区間（`load`など）。区間で分けて要約した欄だけに付く。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+    /// 切ったときだけ付く、残りの行を見るコマンド。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub more: Option<String>,
     pub items: Vec<T>,
+}
+
+impl<T> BriefSection<T> {
+    fn window(mut self, window: Option<String>) -> Self {
+        self.window = window;
+        self
+    }
+
+    fn more(mut self, command: impl FnOnce() -> String) -> Self {
+        if self.truncated {
+            self.more = Some(command());
+        }
+        self
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -361,19 +439,33 @@ pub fn build(
     let clients = client_nodes(&diagnostics.client, window_seconds);
     let (hosts, quiet_hosts) = split_quiet_hosts(host_nodes(&diagnostics.host));
     let benchmark_messages = benchmark_messages(&run);
+    let mut warnings = benchmark.warnings;
+    if let Some(legacy) = diagnostics
+        .transition_order
+        .legacy_events
+        .filter(|count| *count > 0.0)
+    {
+        warnings.push(format!(
+            "{legacy} transition requests had no msec/reqtime in the access log; they are ordered by completion second and counted in ambiguous_count"
+        ));
+    }
     let profiles_unavailable = diagnostics
         .artifacts
         .iter()
         .filter(|item| item.status == "unavailable")
         .count();
+    let short = crate::runner::short_id(&run.id).to_owned();
+    let short = short.as_str();
+    let database_window_flag = window_flag(database_window.as_deref());
     BriefOutput {
-        schema_version: 1,
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
+        run: short.to_owned(),
         review: None,
-        run: BriefRun {
+        summary: BriefRun {
             short_id: crate::runner::short_id(&run.id).into(),
             id: run.id,
-            started_at: run.started_at.to_rfc3339(),
-            finished_at: run.finished_at.map(|value| value.to_rfc3339()),
+            started_at: crate::model::display_time(run.started_at),
+            finished_at: run.finished_at.map(crate::model::display_time),
             state: run.state.as_str().into(),
             score: run.benchmark.score,
             passed: run.benchmark.passed,
@@ -384,14 +476,20 @@ pub fn build(
             dirty: run.source.dirty,
             metric_count: run.metric_count,
         },
-        coverage_issues: section(coverage_issues, limit),
+        coverage_issues: section(coverage_issues, limit).more(|| collector_failures(short)),
         coverage_notes_hidden,
-        benchmark: section(by_metric_then_magnitude(benchmark.rows), limit),
-        score_inputs: section(score_inputs.rows, limit),
+        benchmark: section(by_metric_then_magnitude(benchmark.rows), limit)
+            .more(|| format!("isuscope query {short} --metric-prefix benchmark. --limit 20")),
+        score_inputs: section(score_inputs.rows, limit)
+            .more(|| format!("isuscope query {short} --metric-prefix score. --limit 20")),
         benchmark_messages,
-        http: section(http, limit),
-        database_window,
-        database: section(database, limit),
+        http: section(http, limit)
+            .more(|| format!("isuscope query {short} --view http --limit 20")),
+        database: section(database, limit)
+            .window(database_window)
+            .more(|| {
+                format!("isuscope query {short} --view database{database_window_flag} --limit 20")
+            }),
         database_rows_filtered_out,
         cpu: section(
             diagnostics
@@ -400,13 +498,22 @@ pub fn build(
                 .filter(|row| !is_idle(row))
                 .collect(),
             limit,
-        ),
-        hosts_window,
-        hosts,
+        )
+        .more(|| format!("isuscope query {short} --metric cpu.sample_percent --limit 20")),
+        hosts: section(hosts, usize::MAX).window(Some(hosts_window.to_owned())),
         quiet_hosts,
-        clients,
-        upstreams: section(diagnostics.upstreams, limit),
-        transitions: section(diagnostics.transitions, limit),
+        clients: section(clients, usize::MAX).window(Some(hosts_window.to_owned())),
+        upstreams: section(diagnostics.upstreams, limit)
+            .more(|| format!("isuscope query {short} --metric-prefix http.upstream_ --limit 20")),
+        transitions: section(
+            transitions(diagnostics.transitions, &diagnostics.transition_order),
+            limit,
+        )
+        .more(|| {
+            format!(
+                "isuscope sql \"SELECT from_route, to_route, count, p50_ms, p95_ms FROM transitions WHERE run_id LIKE '%{short}' ORDER BY count DESC\""
+            )
+        }),
         artifact_issues: section(
             diagnostics
                 .artifacts
@@ -414,9 +521,11 @@ pub fn build(
                 .filter(|item| item.status == "failed")
                 .collect(),
             limit,
-        ),
+        )
+        .more(|| collector_failures(short)),
         profiles_unavailable,
-        warnings: benchmark.warnings,
+        next: Vec::new(),
+        warnings,
     }
 }
 
@@ -623,10 +732,10 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                 .filter(|row| row.metric == "service.cpu_cores")
                 .map(|row| BriefService {
                     service: row.target.clone(),
-                    cpu_cores_max: query::round_to(row.peak, 3),
+                    cpu_max_cores: query::round_to(row.peak, 3),
                 })
                 .collect::<Vec<_>>();
-            services.sort_by(|a, b| b.cpu_cores_max.total_cmp(&a.cpu_cores_max));
+            services.sort_by(|a, b| b.cpu_max_cores.total_cmp(&a.cpu_max_cores));
             services.truncate(3);
             BriefHostNode {
                 node: node.into(),
@@ -668,9 +777,11 @@ fn is_idle(row: &CpuSummary) -> bool {
     row.process.starts_with("swapper") && IDLE_SYMBOLS.contains(&row.symbol.as_str())
 }
 
-/// どの値も分かっていて閾値を下回るnodeを1つにまとめる。実データで遊んでいたnodeはCPUのピークが
-/// 15%未満、ディスク7%未満、iowait 0.1%未満で、詰まっていたnodeとは桁が違う。値の欠けたnodeは
-/// 遊んでいたとは言えないので、まとめずにそのまま出す。1台だけならまとめても短くならない。
+/// どの値も閾値を下回るnodeを1つにまとめる。実データで遊んでいたnodeはCPUのピークが15%未満、
+/// ディスク7%未満、iowait 0.1%未満で、詰まっていたnodeとは桁が違う。CPU全体とコアのピークは必須で、
+/// 欠けたnodeは遊んでいたとは言えないので、まとめずにそのまま出す。iowait・PSI・diskは環境によって
+/// 取れないので、無ければ判定に使わない（collectorの失敗は`coverage_issues`に出る）。
+/// 1台だけならまとめても短くならない。
 fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<BriefQuietHosts>) {
     let quiet = |node: &BriefHostNode| {
         node.cpu_busy_max_percent.is_some_and(|value| value < 25.0)
@@ -707,12 +818,48 @@ fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<B
     (busy, Some(summary))
 }
 
+/// briefが要約したDBの区間を`query`でも選ぶ。区間を持たない古いrunでは付けない。
+fn window_flag(window: Option<&str>) -> String {
+    window
+        .map(|window| format!(" --window {window}"))
+        .unwrap_or_default()
+}
+
+/// 完了しなかったcollectorとそのerrorの全件。
+fn collector_failures(short: &str) -> String {
+    format!(
+        "isuscope sql \"SELECT name, node, phase, status, error FROM collector_runs WHERE run_id LIKE '%{short}' AND status != 'complete'\" --format tsv"
+    )
+}
+
+/// 比較元があれば、HTTPとDBの比較を次に使えるコマンドとして示す。読むだけのコマンドに限り、
+/// どの表を見るべきかのような推測はしない。
+pub fn next_steps(brief: &mut BriefOutput) {
+    let short = brief.run.clone();
+    if let Some(base) = brief
+        .review
+        .as_ref()
+        .and_then(|review| review.comparison.as_ref())
+        .map(|comparison| comparison.base.clone())
+    {
+        brief.next.push(format!(
+            "isuscope query {short} --base {base} --view http --limit 20"
+        ));
+        brief.next.push(format!(
+            "isuscope query {short} --base {base} --view database{} --limit 20",
+            window_flag(brief.database.window.as_deref())
+        ));
+    }
+}
+
 fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
     let total_count = items.len();
     items.truncate(limit);
     BriefSection {
         total_count,
         truncated: total_count > items.len(),
+        window: None,
+        more: None,
         items,
     }
 }
@@ -834,7 +981,6 @@ mod tests {
                     }],
                 }),
             }],
-            changes_truncated: false,
         }
     }
 
@@ -843,21 +989,21 @@ mod tests {
         let body = "減点が減った。".repeat(60);
         let brief = review(review_with(&body, &body));
         let analysis = brief.latest_analysis.unwrap();
-        assert_eq!(analysis.base_short_id.as_deref(), Some("224dc72b"));
+        assert_eq!(analysis.base.as_deref(), Some("224dc72b"));
         assert_eq!(analysis.body.chars().count(), EXCERPT_CHARS + 1);
         assert!(analysis.full_text.unwrap().starts_with("isuscope sql"));
-        let change = &brief.changes[0];
+        let change = &brief.changes.items[0];
         assert_eq!(change.status, Some("accepted"));
         assert!(change.reason.is_none() && change.reason_same_as_analysis);
         assert_eq!(change.evidence, ["b7c5d88e 288ecdfda281 dirty"]);
         // 分析と違う理由は、短ければそのまま出し、全文への案内も付けない。
         let brief = review(review_with("索引で走査行が減った", &body));
         assert_eq!(
-            brief.changes[0].reason.as_deref(),
+            brief.changes.items[0].reason.as_deref(),
             Some("索引で走査行が減った")
         );
-        assert!(!brief.changes[0].reason_same_as_analysis);
-        assert!(brief.changes[0].full_text.is_none());
+        assert!(!brief.changes.items[0].reason_same_as_analysis);
+        assert!(brief.changes.items[0].full_text.is_none());
     }
 
     /// AIのtool出力の上限（Codexでは約4500 tokens）を超えると、真ん中のsectionが削られる。
@@ -996,12 +1142,13 @@ mod tests {
             upstreams: Vec::new(),
             artifacts: Vec::new(),
             transitions: Vec::new(),
+            transition_order: Default::default(),
         };
         let mut brief = build(diagnostics, empty(), empty(), 5);
         let long = "受取履歴の旧単発SELECTは995回・合計373401.675ms。".repeat(20);
         brief.review = Some(review(review_with(&long, &long)));
         assert!(brief.cpu.items.iter().all(|row| row.process != "swapper"));
-        assert_eq!(brief.hosts.len(), 1);
+        assert_eq!(brief.hosts.items.len(), 1);
         let size = serde_json::to_vec(&brief).unwrap().len();
         assert!(size <= 12_000, "brief is {size} bytes");
     }
@@ -1111,5 +1258,78 @@ mod tests {
         assert_eq!(issues[0].nodes, ["app2", "app3"]);
         assert_eq!(issues[0].occurrences, 2);
         assert_eq!(info_count, 1);
+    }
+
+    #[test]
+    fn transitions_carry_how_certain_their_order_is() {
+        let metric = |name: &str, value: f64, edge: Option<(&str, &str)>| crate::model::Metric {
+            name: name.into(),
+            value,
+            unit: String::new(),
+            timestamp: None,
+            labels: edge
+                .map(|(from, to)| {
+                    BTreeMap::from([("from".into(), from.into()), ("to".into(), to.into())])
+                })
+                .unwrap_or_default(),
+        };
+        let transition = |from: &str, to: &str| Transition {
+            from_route: from.into(),
+            to_route: to.into(),
+            count: 10,
+            p50_ms: Some(5.0),
+            p95_ms: Some(9.0),
+        };
+        let diagnostics = crate::report::diagnose(
+            test_run(),
+            vec![
+                metric("transition.legacy_events", 3.0, None),
+                metric("transition.overlap_count", 2.0, Some(("GET /", "GET /a"))),
+                metric("transition.ambiguous_count", 0.0, Some(("GET /", "GET /a"))),
+            ],
+            vec![
+                transition("GET /", "GET /a"),
+                transition("GET /a", "GET /b"),
+            ],
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+        );
+        let options = || query::MetricQueryOptions {
+            scope: query::QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: None,
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        };
+        let empty = || query::metric_query("run".into(), Vec::new(), options());
+        let brief = build(diagnostics, empty(), empty(), 5);
+        let rows = &brief.transitions.items;
+        assert_eq!(rows[0].overlap_count, Some(2.0));
+        assert_eq!(rows[0].ambiguous_count, Some(0.0));
+        // 順序の記録が無い遷移には付けない。
+        assert_eq!(rows[1].overlap_count, None);
+        assert!(
+            brief
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("3 transition requests had no msec")),
+            "{:?}",
+            brief.warnings
+        );
+    }
+
+    #[test]
+    fn more_is_offered_only_for_a_truncated_section() {
+        let cut = section(vec![1, 2, 3], 2).more(|| "isuscope query x".into());
+        assert_eq!(cut.more.as_deref(), Some("isuscope query x"));
+        let whole = section(vec![1, 2], 2).more(|| unreachable!("not truncated"));
+        assert!(whole.more.is_none());
+        assert_eq!(window_flag(Some("load")), " --window load");
+        assert_eq!(window_flag(None), "");
     }
 }

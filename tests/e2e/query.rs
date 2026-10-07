@@ -95,7 +95,12 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
     assert_eq!(database_diff["view"], "database");
     assert_eq!(database_diff["total_count"], 1);
     assert_eq!(database_diff["rows"][0]["presence"], "both");
-    assert_eq!(database_diff["rows"][0]["total_ms_delta"], 0.0);
+    assert_eq!(database_diff["rows"][0]["total_ms_delta_percent"], 0.0);
+    // p95を出せない理由は両側で同じなので、比較でも1回だけ残る。
+    assert_eq!(
+        database_diff["rows"][0]["unavailable"]["p95_ms"],
+        "scalar quantiles cannot be merged across digests"
+    );
 
     let brief = Command::new(env!("CARGO_BIN_EXE_isuscope"))
         .args(["brief", "latest", "--limit", "1"])
@@ -104,8 +109,8 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
         .unwrap();
     assert!(brief.status.success());
     let brief: serde_json::Value = parsed(&brief.stdout).unwrap();
-    assert_eq!(brief["run"]["score"], 123);
-    assert_eq!(brief["run"]["passed"], true);
+    assert_eq!(brief["summary"]["score"], 123);
+    assert_eq!(brief["summary"]["passed"], true);
     assert_eq!(brief["benchmark"]["total_count"], 2);
     assert_eq!(brief["benchmark"]["truncated"], true);
     assert_eq!(brief["benchmark"]["rows"].as_array().unwrap().len(), 1);

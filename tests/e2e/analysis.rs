@@ -175,7 +175,7 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
     assert!(restored.status.success());
     let brief: serde_json::Value = parsed(&restored.stdout).unwrap();
     assert_eq!(
-        brief["run"]["hypothesis"],
+        brief["summary"]["hypothesis"],
         "removing one allocation raises score without errors"
     );
     // Every revision survives the rebuilt index, not just the latest one.

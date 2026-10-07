@@ -100,12 +100,14 @@ pub struct ChangeView {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    #[serde(serialize_with = "crate::model::serialize_display_time")]
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DecisionView {
     pub id: String,
+    #[serde(serialize_with = "crate::model::serialize_display_time")]
     pub created_at: DateTime<Utc>,
     pub status: DecisionStatus,
     pub reason: String,
@@ -140,6 +142,7 @@ impl From<Decision> for DecisionView {
 
 #[derive(Debug, Serialize)]
 pub struct ChangeHistoryView {
+    pub schema_version: u32,
     pub change: ChangeView,
     pub decisions: Vec<DecisionView>,
 }
@@ -150,8 +153,10 @@ pub struct ChangeSummaryView {
     pub id: String,
     pub description: String,
     pub target: Option<String>,
+    #[serde(serialize_with = "crate::model::serialize_display_time")]
     pub created_at: DateTime<Utc>,
     pub status: Option<DecisionStatus>,
+    #[serde(serialize_with = "crate::model::serialize_display_time_option")]
     pub decided_at: Option<DateTime<Utc>>,
     pub reason: Option<String>,
     pub revisit: Option<String>,
@@ -161,6 +166,7 @@ pub struct ChangeSummaryView {
 impl From<ChangeHistory> for ChangeHistoryView {
     fn from(history: ChangeHistory) -> Self {
         Self {
+            schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
             change: history.change.into(),
             decisions: history.decisions.into_iter().map(Into::into).collect(),
         }
@@ -196,7 +202,6 @@ pub struct RunReview {
     pub comparison: Option<ScoreComparison>,
     /// Current decisions for changes citing this run, not deployment state.
     pub changes: Vec<ChangeSummary>,
-    pub changes_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -474,14 +479,12 @@ impl Store {
                 })
             })
             .transpose()?;
-        let mut changes = self.list_changes(None, Some(&run.id), 21)?;
-        let changes_truncated = changes.len() > 20;
-        changes.truncate(20);
+        // 件数を出すので全件を読む（1 runが根拠になる変更は多くない）。
+        let changes = self.list_changes(None, Some(&run.id), 100_000)?;
         Ok(RunReview {
             latest_analysis,
             comparison,
             changes,
-            changes_truncated,
         })
     }
     pub fn create_change(
@@ -512,10 +515,10 @@ impl Store {
     pub fn change_history(&self, id: &str) -> Result<ChangeHistory> {
         validate_id(id)?;
         let dir = self.data_dir.join("changes").join(id);
-        let change: Change = serde_json::from_slice(
-            &fs::read(dir.join("change.json"))
-                .with_context(|| format!("change '{id}' was not found"))?,
-        )?;
+        if !dir.join("change.json").is_file() {
+            bail!("change `{id}` was not found; list changes with `isuscope change list`");
+        }
+        let change: Change = serde_json::from_slice(&fs::read(dir.join("change.json"))?)?;
         let mut decisions = Vec::new();
         let records = dir.join("decisions");
         if records.is_dir() {
@@ -559,9 +562,7 @@ impl Store {
         }
         let mut evidence = Vec::new();
         for requested in runs {
-            let run_id = self
-                .resolve_id(&requested)?
-                .with_context(|| format!("run '{requested}' was not found"))?;
+            let run_id = self.require_id(&requested, "run")?;
             if !self.final_dir(&run_id).is_dir() {
                 bail!("evidence run must be finalized");
             }

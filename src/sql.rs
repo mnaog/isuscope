@@ -6,7 +6,7 @@ use crate::config::LoadedConfig;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -19,10 +19,12 @@ pub enum SqlFormat {
 pub struct SqlOutput {
     pub schema_version: u32,
     pub columns: Vec<String>,
-    pub row_count: usize,
+    /// Rows the statement returned, including the ones `--limit` left out (like `query`).
+    pub total_count: usize,
     /// True when `--limit` cut the result; the query itself decides what is interesting.
     pub truncated: bool,
-    pub rows: Vec<Value>,
+    /// Values in `columns` order, exactly as stored: no rounding, and REAL stays a float.
+    pub rows: Vec<Vec<Value>>,
 }
 
 pub fn database_path(config: &LoadedConfig) -> std::path::PathBuf {
@@ -74,24 +76,24 @@ pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput
         );
     }
     let mut rows = Vec::new();
-    let mut truncated = false;
+    let mut total_count = 0;
     let mut cursor = statement.query([])?;
     while let Some(row) = cursor.next()? {
+        total_count += 1;
         if rows.len() >= limit {
-            truncated = true;
-            break;
+            continue;
         }
-        let mut object = Map::new();
-        for (index, column) in columns.iter().enumerate() {
-            object.insert(column.clone(), value_of(row.get_ref(index)?));
-        }
-        rows.push(Value::Object(object));
+        rows.push(
+            (0..columns.len())
+                .map(|index| row.get_ref(index).map(value_of))
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
     }
     Ok(SqlOutput {
-        schema_version: 1,
-        row_count: rows.len(),
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
+        truncated: total_count > rows.len(),
+        total_count,
         columns,
-        truncated,
         rows,
     })
 }
@@ -110,19 +112,23 @@ fn value_of(value: ValueRef<'_>) -> Value {
 pub fn write_tsv(output: &SqlOutput, mut writer: impl std::io::Write) -> Result<()> {
     writeln!(writer, "{}", output.columns.join("\t"))?;
     for row in &output.rows {
-        let cells = output
-            .columns
+        let cells = row
             .iter()
-            .map(|column| match row.get(column) {
-                Some(Value::Null) | None => String::new(),
-                Some(Value::String(text)) => text.replace(['\t', '\n'], " "),
-                Some(value) => value.to_string(),
+            .map(|value| match value {
+                Value::Null => String::new(),
+                Value::String(text) => text.replace(['\t', '\n'], " "),
+                value => value.to_string(),
             })
             .collect::<Vec<_>>();
         writeln!(writer, "{}", cells.join("\t"))?;
     }
     if output.truncated {
-        writeln!(writer, "# truncated at {} rows", output.row_count)?;
+        writeln!(
+            writer,
+            "# showing {} of {} rows",
+            output.rows.len(),
+            output.total_count
+        )?;
     }
     Ok(())
 }

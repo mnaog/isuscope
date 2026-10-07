@@ -86,6 +86,8 @@ mod log_rotation;
 mod node_disk;
 #[path = "e2e/operation_lock.rs"]
 mod operation_lock;
+#[path = "e2e/output_contract.rs"]
+mod output_contract;
 #[path = "e2e/parallel.rs"]
 mod parallel;
 #[path = "e2e/query.rs"]

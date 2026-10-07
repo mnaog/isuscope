@@ -8,7 +8,7 @@ isuscopeは、ISUCONのベンチマークと観測結果を1つのrunとして�
 
 開始直後の全体調査では、通常の観測に匿名viewer単位の行動遷移を加える`survey-run`を1回だけ使います。
 
-遷移はsession内のリクエスト開始順で集計します。nginxログに`msec`と`reqtime`があれば、完了時刻から処理時間を引いて開始時刻を推定します。`transition.ordering_version=2`、`transition.precise_events`、`transition.legacy_events`に加え、遷移のfrom/to別に`transition.overlap_count`（実行区間が重なる隣接要求）と`transition.ambiguous_count`（同一開始時刻・旧ログ）を記録します。旧ログは従来のtimeを使い、順序不確定として残します。これらは観測順であり、因果関係や公式シナリオを保証しません。通常runでsessionログを追加収集する必要はありません。
+遷移はsession内のリクエスト開始順で集計します。nginxログに`msec`と`reqtime`があれば、完了時刻から処理時間を引いて開始時刻を推定します。`transition.ordering_version=2`、`transition.precise_events`、`transition.legacy_events`に加え、遷移のfrom/to別に`transition.overlap_count`（実行区間が重なる隣接要求）と`transition.ambiguous_count`（同一開始時刻・旧ログ）を記録します。旧ログは従来のtimeを使い、順序不確定として残します。`brief`の`transitions`は各遷移にこの`overlap_count`と`ambiguous_count`を付け、旧ログの要求があれば`warnings`で伝えます。これらは観測順であり、因果関係や公式シナリオを保証しません。通常runでsessionログを追加収集する必要はありません。
 
 ```console
 isuscope doctor
@@ -26,7 +26,7 @@ isuscope query latest --base BASE_RUN --view database --group-by sql-shape
 isuscope analyze RUN_ID supported --analysis "p95とDB時間が低下し、スコアも改善した"
 ```
 
-run IDは実行結果か`isuscope list`で確認します。`analyze`は更新対象を曖昧にしないため、run ID、一意な短縮ID、または一意なtagを明示します。`run`・`list`・`brief`はrun IDの末尾8文字を`short_id`として表示します（UUIDv7の先頭は近い時刻のrunで重なるため）。仮説や分析の本文でrunに触れるときもこの形にそろえてください。判定は`supported`、`rejected`、`inconclusive`、`skipped`です。`skipped`の理由も`--analysis`に書きます。
+run IDは実行結果か`isuscope list`で確認します。`analyze`は更新対象を曖昧にしないため、run ID、一意な短縮ID、または一意なtagを明示します。どの出力もrunをrun IDの末尾8文字（短縮ID）で示します（UUIDv7の先頭は近い時刻のrunで重なるため）。仮説や分析の本文でrunに触れるときもこの形にそろえてください。判定は`supported`、`rejected`、`inconclusive`、`skipped`です。`skipped`の理由も`--analysis`に書きます。
 
 ### 仮説の判定と変更の採否
 
@@ -121,7 +121,19 @@ isuscope doctor
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 
-`list`、`brief`、`series`、`query`、`sql`、`change`は機械処理しやすいJSONを返します。同じ形の行が並ぶ表は、列名を`columns`に1回だけ置き、`rows`の各行を値の並びにします。キーは「対象_統計_単位」（例: `cpu_busy_max_percent`、`p95_ms`）で、統計は`avg`・`max`・`min`・`p95`・`total`、メモリはMiBです。`query --base`の各行は、行を識別する値（node、route、digest、metricとlabelsなど）、`presence`、値ごとの比較元（`calls_base`）と対象（`calls`）を並べ、主要な値（回数・合計・平均・p95、HTTPはエラー数も）には差（`calls_delta`、`calls_delta_percent`）も付けます。全行で同じ識別値は出力の`common`へ1回だけ出します。比較しない`query`でも、全行で同じnode・source・window・labelなどは`common`へ1回だけ出します。行を返す出力は約12KBを超えないよう末尾の行を減らし、そのときは`truncated`と`warnings`で伝えます（全行が要るときは`ISUSCOPE_OUTPUT_BYTES=0`）。`series`はmetricごとの単位と集計方法を`metrics`に1回だけ置き、`coverage`には完了しなかったcollectorだけを並べます。`--group-by sql-shape`の行では`digest`が文の形になり、元の文が2種類以上あるときだけ`digest_examples`に並べます。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice）で、全nodeの状況を最初の1画面で見切るためのものです。CPU・コア・iowait・PSI・diskがどれも低かったnodeが2台以上あれば、`quiet_hosts`へ名前と最大値だけをまとめます（負荷を振り分ける余地として読みます）。`cpu`はidle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。`review`は分析・変更の本文を冒頭だけにし、全文を読む命令を`full_text`に添えます。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取得できます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
+`list`、`brief`、`series`、`query`、`sql`、`change`は機械処理しやすいJSONを返します（`schema_version`は2。表を`columns`と`rows`で出す形になったときに上げました）。どの出力も同じ約束で書きます。
+
+- runを指す値は、そのrunなら`run`、比較元なら`base`で、値は短縮IDです。完全なIDは`list`の`id`だけに出します。
+- 表は`total_count`（切る前の件数）と`truncated`を必ず持ちます。briefの各欄、`list`の`runs`、`change`の`changes`・`decisions`も同じです。
+- 区間は`window`（`whole`・`initialize`・`load`）という名前で出します。`series`の実際の時刻とbucketは`range`です。
+- 比較は、比較元を`_base`、今回を接尾辞なし、差を`_delta`と`_delta_percent`で書きます。briefのスコアの比較も同じです。
+- `warnings`はどの出力にもあり、無ければ空です。briefの`next`も同じです。
+- 結果が空のときは、理由と次のコマンドを`warnings`に出します（時系列が無くrun集約だけある、絞り込みで消えた、名前が無い）。errorも、どのrunか・どうすればよいかを添えます。
+- 行を返すコマンド（`query`・`series`・`sql`）の`--limit`の既定値は100です。
+- commitは先頭12桁です。
+- 絞り込みの引数（`--metric`・`--metric-prefix`・`--source`・`--node`・`--label`・`--label-contains`）は`query`と`series`で同じ意味です。
+
+同じ形の行が並ぶ表（各出力の行、`brief`の各欄と`hosts`・`clients`、`list`の`runs`、`change`の`changes`・`decisions`など）は、列名を`columns`に1回だけ置き、`rows`の各行を値の並びにします。0件でも`columns`と`rows`の形は変わりません。キーは「対象_統計_単位」（例: `cpu_busy_max_percent`、`cpu_max_cores`、`p95_ms`）で、単位の無い値（件数・接続数・load）は「対象_統計」（例: `load1_max`、`connections_in_use_avg`）、時間あたりの値は`_per_second`で終えます。統計は`avg`・`max`・`min`・`p95`・`total`、メモリはMiBです。`query --base`の各行は、行を識別する値（node、route、digest、metricとlabelsなど）と`presence`に続けて、判断に使う列だけを並べます。主要な値（回数・合計・平均・p95、DBはlockも）は今回の値と差の割合（`calls`、`calls_delta_percent`）、HTTPのエラー数とDBの1回あたりの検査行数は比較元と今回（`errors_base`、`errors`）です。0からの増減や前後の値そのものが判断材料になるためです。`--all-columns`を付けると、すべての値の比較元・今回と、主要な値の差（`calls_delta`）も出します。全行で同じ識別値は出力の`common`へ1回だけ出します。比較しない`query`でも、全行で同じnode・source・window・labelなどは`common`へ1回だけ出します。行を返す出力（`query`、`series`、`sql`、`list`、`change list`）は約12KBを超えないよう末尾の行を減らし、そのときは`truncated`と、絞り方を添えた`warnings`で伝えます（全行が要るときは`ISUSCOPE_OUTPUT_BYTES=0`）。`brief`は`--limit`で各欄の件数を抑え、`change show`は判断の全履歴を出すので減らしません。`series`はmetricごとの単位と集計方法を`metrics`に1回だけ置き、`coverage`には完了しなかったcollectorだけを並べます。`--group-by sql-shape`の行では`digest`が文の形になり、元の文が2種類以上あるときだけ`digest_examples`に並べます。`brief`のhttpとdatabaseの表は判断に使う主要な列（回数・合計・平均・p95、HTTPはエラー数、DBはlockと1回あたりの検査行数）だけで、分位・最大・行数などの残りは`query`で見ます。時刻はどの出力もJSTのミリ秒まで（例: `2026-10-07T11:10:58.637+09:00`）で、`sql`だけは保存値（UTC）をそのまま返します。`brief`の`hosts`は**nodeごとに1行**（CPUの平均とピーク、最も詰まっていたコア、PSI、load、memory、disk、CPU上位のservice）で、全nodeの状況を最初の1画面で見切るためのものです。CPU・コア・iowait・PSI・diskがどれも低かったnodeが2台以上あれば、`quiet_hosts`へ名前と最大値だけをまとめます（負荷を振り分ける余地として読みます）。`cpu`はidle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。`review`は分析・変更の本文を冒頭だけにし、全文を読む命令を`full_text`に添えます。件数で切った欄には、残りを見るコマンドを`more`に添えます（切っていない欄には付きません）。`next`には、比較元があるrunでHTTPとDBの`query --base`を出します。読むだけのコマンドに限り、どの表を見るべきかのような推測は出しません。briefは並行して作業する別の人も読むので、`analyze`は出しません（runを走らせた本人へは`run`の終了時に出ます）。個々のmetricは`query --scope series --window load`や`series`へ進みます。まず`brief`で判断材料だけを確認し、上位件数から漏れた対象やrun集約metricは`query`で絞り込みます。両方で足りない問いは`sql`で直接引きます（`isuscope sql --schema`でtable定義、`isuscope sql "SELECT ..." --format tsv`で表形式。接続は読み取り専用で、書き込みは拒否されます）。runを丸ごと出す`report`と全件比較の`diff`は、SQL digestを含むJSONが1 MBを超えて読むのに向かないため廃止しました。同じ内容は`brief`・`query --base`・`sql`で取得できます。database viewはcollector sourceを保ったままSQL digestを集約し、`--group-by sql-shape`で可変長`IN`をまとめられます。詳しい引数は`isuscope COMMAND --help`で確認できます。
 
 どのmetricがあるかは`sql`で調べます。runごとの件数・単位・時系列の有無と、labelの種類がこれで分かります。
 
@@ -141,7 +153,7 @@ isuscope query latest --base BASE_RUN --view database --source mysql-log-delta -
 isuscope query latest --base BASE_RUN --view http --label-contains route=reservation
 ```
 
-`query --base`は同じselectorを両runへ適用し、全件をfull outer joinしてから`--limit`を適用します。metric viewの行は、metric名ごとに値の大きい順に並べてから切ります。base/candidate/delta/delta percentとadded/removed/bothを返すため、対象を絞った比較で上位項目の入れ替わりを失いません。SQL shapeは可変長`IN`と複数行`VALUES`をまとめ、長いdigest exampleは短縮します。SQLiteとstructured snapshotの値は変更せず、query/briefの表示値だけを単位に応じて丸めます。
+`query --base`は同じselectorを両runへ適用し、全件をfull outer joinしてから`--limit`を適用します。metric viewの行は、metric名ごとに値の大きい順に並べてから切ります。片側にしか無い行もadded/removedとして返すため、対象を絞った比較で上位項目の入れ替わりを失いません。SQL shapeは可変長`IN`と複数行`VALUES`をまとめ、長いdigest exampleは短縮します。SQLiteとstructured snapshotの値は変更しません。表示では`brief`の要約値を単位に応じて丸め、`sql`以外の出力は小数3桁（0.001未満は有効数字3桁）までにします。`sql`は保存値をそのまま返します。
 
 collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope init`はそれを実環境の値で`.isuscope/config.toml`へ書き出し、独自の生成処理を持つprojectは`isuscope init --print config --no-scaffold --data-dir ... --nginx-access-log ... --service-units "..."`で同じ内容を取り込み、`[lock]`・`[ssh]`・`[[nodes]]`を自分で追記します。collectorを増やすときにprojectごとの写しを直して回らずに済みます。
 
@@ -168,7 +180,7 @@ collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope ini
 
 `[benchmark] operator_line_pattern`に一致する行は、保存する前に捨てます。ISUCON12の`[ADMIN]`行のように、benchmarkerが運営向けにだけ出す情報はルール側であり、選手は見られません。捨てた行数だけを`run`の`operator`行と`brief`の`operator_lines_dropped`に残すので、log・metric・parser・briefのどこからも中身を読み戻せません。`doctor`が`sample_output`へparserを当てるときも同じ行を落とします。`[[nodes]]`に`rule_side = true`を付けたnode（benchmarker自身のmachineなど）では、collectorもdisk検査も動きません。
 
-parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例（categoryごとに最初の5件、最大20 category、各1000文字）で、runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure`、`brief`の`benchmark_messages`、`run`終了時の`failure`／`error`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
+parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例（categoryごとに最初の5件、最大20 category、各1000文字）で、runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure_reason`、`brief`の`benchmark_messages`、`run`終了時の`failure`／`error`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
 
 ### 最初のrunで確認すること
 

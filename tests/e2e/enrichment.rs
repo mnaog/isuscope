@@ -119,8 +119,11 @@ command = ["sh", "-c", "printf '%s\\n' '{{\"type\":\"metric\",\"name\":\"benchma
         .unwrap();
     assert!(listed.status.success());
     let listed: serde_json::Value = parsed(&listed.stdout).unwrap();
-    assert_eq!(listed["runs"][0]["note"], "initial parser");
-    assert_eq!(listed["runs"][0]["tags"], serde_json::json!(["candidate"]));
+    assert_eq!(listed["runs"]["rows"][0]["note"], "initial parser");
+    assert_eq!(
+        listed["runs"]["rows"][0]["tags"],
+        serde_json::json!(["candidate"])
+    );
 
     for suffix in ["", "-wal", "-shm"] {
         let path = config_dir.join(format!("isuscope.sqlite3{suffix}"));
@@ -265,7 +268,10 @@ fn analysis_written_while_enrich_runs_is_kept() {
     assert_eq!(manifest["analysis_status"], "complete");
     assert_eq!(manifest["enrichments"][0]["status"], "complete");
     let listed: serde_json::Value = parsed(&isuscope_in(project.path(), &["list"]).stdout).unwrap();
-    assert_eq!(listed["runs"][0]["analysis_status"], "complete", "{listed}");
+    assert_eq!(
+        listed["runs"]["rows"][0]["analysis_status"], "complete",
+        "{listed}"
+    );
 }
 
 /// enrichはrun.jsonを書いた時点で確定する。その後、SQLiteを確定する前に落ちたら（SQLiteは前の
@@ -289,13 +295,19 @@ fn enrich_interrupted_before_the_index_is_reindexed_and_settles_the_state() {
     let listed = |project: &std::path::Path| -> serde_json::Value {
         parsed(&isuscope_in(project, &["list"]).stdout).unwrap()
     };
-    assert_eq!(listed(project.path())["runs"][0]["state"], "complete");
+    assert_eq!(
+        listed(project.path())["runs"]["rows"][0]["state"],
+        "complete"
+    );
 
     // parserが失敗すればdegraded、直して入れ直せばcompleteに戻る。
     write_parser_config(&config_dir, "exit 3");
     let failed = isuscope_in(project.path(), &["enrich", "latest"]);
     assert!(!failed.status.success());
-    assert_eq!(listed(project.path())["runs"][0]["state"], "degraded");
+    assert_eq!(
+        listed(project.path())["runs"]["rows"][0]["state"],
+        "degraded"
+    );
     write_parser_config(&config_dir, &viewer_metric(20));
     let fixed = isuscope_in(project.path(), &["enrich", "latest"]);
     assert!(
@@ -303,7 +315,10 @@ fn enrich_interrupted_before_the_index_is_reindexed_and_settles_the_state() {
         "{}",
         String::from_utf8_lossy(&fixed.stderr)
     );
-    assert_eq!(listed(project.path())["runs"][0]["state"], "complete");
+    assert_eq!(
+        listed(project.path())["runs"]["rows"][0]["state"],
+        "complete"
+    );
 
     // run.jsonを書いた後、SQLiteを確定する前に落ちた状態を作る。
     let database = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();

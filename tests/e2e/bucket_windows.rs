@@ -66,21 +66,21 @@ emit client.connections_in_use 1 '"node":"app1"' "$(at 5)"
 
     let load = isuscope(&["series", "latest", "--window", "load"]);
     assert_eq!(requests(&load), 101.0, "{load}");
-    assert_eq!(load["window"]["edges"], "exact");
+    assert_eq!(load["range"]["edges"], "exact");
     let initialize = isuscope(&["series", "latest", "--window", "initialize"]);
     assert_eq!(requests(&initialize), 7.0, "{initialize}");
     // initializeの始まりはbucketの区切りでもnode上の境界でもない。
-    assert_eq!(initialize["window"]["edges"], "approximate");
+    assert_eq!(initialize["range"]["edges"], "approximate");
 
     // ベンチの始まりのbucketはwholeに入り、端はnode上の境界なので正確。
     let whole = isuscope(&["series", "latest", "--window", "whole"]);
     assert_eq!(requests(&whole), 111.0, "{whole}");
-    assert_eq!(whole["window"]["edges"], "exact");
+    assert_eq!(whole["range"]["edges"], "exact");
 
     let brief = isuscope(&["brief", "latest"]);
-    assert_eq!(brief["hosts_window"], "load");
+    assert_eq!(brief["hosts"]["window"], "load");
     assert_eq!(
-        brief["clients"][0]["connections_in_use_max"], 10.0,
+        brief["clients"]["rows"][0]["connections_in_use_max"], 10.0,
         "{}",
         brief["clients"]
     );

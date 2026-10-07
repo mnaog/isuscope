@@ -51,7 +51,7 @@ fn brief_shows_every_node_and_keeps_core_labels_apart() {
     let brief: serde_json::Value = parsed(&output.stdout).unwrap();
 
     // hostsは1 node 1行で、node数が既定の表示件数を超えても全nodeが出る。
-    let hosts = brief["hosts"].as_array().unwrap();
+    let hosts = brief["hosts"]["rows"].as_array().unwrap();
     assert_eq!(hosts.len(), 2, "{}", brief["hosts"]);
     let nodes = hosts
         .iter()
@@ -84,7 +84,7 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
     };
     isuscope(&["run", "--hypothesis", "base", "--tag", "bench:v1"]);
     let base: serde_json::Value = parsed(&isuscope(&["list", "--limit", "1"])).unwrap();
-    let base_id = base["runs"][0]["id"].as_str().unwrap().to_owned();
+    let base_id = base["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
     isuscope(&[
         "analyze",
         &base_id,
@@ -94,7 +94,10 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
     ]);
     isuscope(&["run", "--hypothesis", "candidate", "--tag", "bench:v2"]);
     let candidate: serde_json::Value = parsed(&isuscope(&["list", "--limit", "1"])).unwrap();
-    let candidate_id = candidate["runs"][0]["id"].as_str().unwrap().to_owned();
+    let candidate_id = candidate["runs"]["rows"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     isuscope(&[
         "analyze",
         &candidate_id,
@@ -106,7 +109,7 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
     ]);
 
     let brief: serde_json::Value = parsed(&isuscope(&["brief", &candidate_id])).unwrap();
-    let conditions = brief["review"]["comparison"]["conditions"]
+    let conditions = brief["review"]["comparison"]["conditions"]["rows"]
         .as_array()
         .unwrap();
     let state = |name: &str| {
@@ -189,14 +192,14 @@ printf '{"type":"metric","name":"client.request_gap","value":3,"unit":"ms","labe
         .unwrap();
     let brief: serde_json::Value = parsed(&output.stdout).unwrap();
 
-    assert_eq!(brief["hosts_window"], "load");
+    assert_eq!(brief["hosts"]["window"], "load");
     // initialize中の90%は混ざらない。
     assert_eq!(
-        brief["hosts"][0]["cpu_busy_avg_percent"], 10.0,
+        brief["hosts"]["rows"][0]["cpu_busy_avg_percent"], 10.0,
         "{}",
         brief["hosts"]
     );
-    assert_eq!(brief["hosts"][0]["cpu_busy_max_percent"], 10.0);
+    assert_eq!(brief["hosts"]["rows"][0]["cpu_busy_max_percent"], 10.0);
 
     let coverage = brief["coverage_issues"]["rows"].as_array().unwrap();
     assert!(
@@ -207,7 +210,7 @@ printf '{"type":"metric","name":"client.request_gap","value":3,"unit":"ms","labe
     );
 
     assert_eq!(
-        brief["clients"][0]["request_gap_ms"]["p95"], 3.0,
+        brief["clients"]["rows"][0]["request_gap_ms"]["p95"], 3.0,
         "{}",
         brief["clients"]
     );
@@ -257,17 +260,35 @@ parser = "slp-windows"
     );
 
     let brief: serde_json::Value = parsed(&isuscope(&["brief", "latest"]).stdout).unwrap();
-    assert_eq!(brief["database_window"], "load");
+    assert_eq!(brief["database"]["window"], "load");
     let top = &brief["database"]["rows"][0];
     // 全行で同じ区間は表の`common`に1回だけ出る。
-    assert_eq!(brief["database"]["common"]["window"], "load");
+    assert_eq!(brief["database"]["window"], "load");
     assert!(
         top["digest"].as_str().unwrap().contains("id_generator"),
         "{top}"
     );
+    // briefは主要な列だけを、行を識別するdigestから順に出す。p99やmaxは`query`で見る。
+    assert!(top["p95_ms"].is_number(), "{top}");
     assert!(
-        top["p99_ms"].is_number() && top["max_ms"].is_number(),
+        top.get("p99_ms").is_none() && top.get("max_ms").is_none(),
         "{top}"
+    );
+    let raw: serde_json::Value =
+        serde_json::from_slice(&isuscope(&["brief", "latest"]).stdout).unwrap();
+    assert_eq!(
+        raw["database"]["columns"][0], "digest",
+        "{}",
+        raw["database"]
+    );
+    assert!(raw["run"].get("id").is_none(), "{}", raw["run"]);
+    assert!(
+        raw["summary"]["started_at"]
+            .as_str()
+            .unwrap()
+            .ends_with("+09:00"),
+        "{}",
+        raw["run"]
     );
     assert!(
         !brief["database"]["rows"]

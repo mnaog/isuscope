@@ -46,9 +46,7 @@ pub async fn enrich_saved(config: &LoadedConfig, requested: &str) -> Result<Enri
         anyhow::bail!("no benchmark parsers are configured; add [[benchmark.parsers]] first");
     }
     let mut store = Store::open(&config.data_dir)?;
-    let id = store
-        .resolve_id(requested)?
-        .with_context(|| format!("run `{requested}` was not found"))?;
+    let id = store.require_id(requested, "run")?;
     // parserを動かしてから確定するまでrunを握る。握った後に読んだrun.jsonへ変更を加えるので、
     // その間にanalysisが加わって消えることも、enrichが重なってparserのlogを取り合うことも無い
     // （analyzeは握れるまで待つ）。

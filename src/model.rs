@@ -216,6 +216,61 @@ pub fn epoch_seconds(value: f64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros((value * 1_000_000.0).round() as i64)
 }
 
+/// 機械向け出力（`list`・`brief`・`series`・`query`・`sql`・`change list`/`show`）のJSONの版。
+/// 保存するfile（run.jsonや変更の記録）の版とは別に数える。2は表を`columns`と`rows`で出す形。
+pub const OUTPUT_SCHEMA_VERSION: u32 = 2;
+
+/// 出力に出す時刻。JSTのミリ秒まで（`2026-10-07T11:10:58.637+09:00`）。保存する時刻と`sql`が返す
+/// 値はUTCのまま。
+pub fn display_time(at: DateTime<Utc>) -> String {
+    let jst = chrono::FixedOffset::east_opt(9 * 3600).expect("+09:00 is a valid offset");
+    at.with_timezone(&jst)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+}
+
+/// 保存されたRFC 3339の時刻を[`display_time`]の形にする。読めない値はそのまま返す。
+pub fn display_stored_time(stored: &str) -> String {
+    DateTime::parse_from_rfc3339(stored)
+        .map(|at| display_time(at.with_timezone(&Utc)))
+        .unwrap_or_else(|_| stored.to_owned())
+}
+
+/// runを指す値は、どの出力でも`run`（そのrun）と`base`（比較元）の短縮ID。完全なIDは`list`の`id`だけ。
+pub fn serialize_short_run<S: serde::Serializer>(
+    id: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(crate::runner::short_id(id))
+}
+
+/// commitは、どの出力でも先頭12桁。
+pub fn serialize_short_commit<S: serde::Serializer>(
+    commit: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match commit {
+        Some(commit) => serializer.serialize_str(&commit[..commit.len().min(12)]),
+        None => serializer.serialize_none(),
+    }
+}
+
+pub fn serialize_display_time<S: serde::Serializer>(
+    at: &DateTime<Utc>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&display_time(*at))
+}
+
+pub fn serialize_display_time_option<S: serde::Serializer>(
+    at: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match at {
+        Some(at) => serialize_display_time(at, serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// 冒頭`chars`文字（超えたら`…`を付ける）と、切ったかどうか。AI向けの出力で長文を短くする。
 pub fn excerpt(text: &str, chars: usize) -> (String, bool) {
     match text.char_indices().nth(chars) {
@@ -443,6 +498,19 @@ mod tests {
 #[cfg(test)]
 mod bucket_tests {
     use super::*;
+
+    #[test]
+    fn display_time_is_jst_to_the_millisecond() {
+        let at = DateTime::parse_from_rfc3339("2026-10-07T02:10:58.637559727Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(display_time(at), "2026-10-07T11:10:58.637+09:00");
+        assert_eq!(
+            display_stored_time("2026-10-07T02:10:58.637559727+00:00"),
+            "2026-10-07T11:10:58.637+09:00"
+        );
+        assert_eq!(display_stored_time("not a time"), "not a time");
+    }
 
     #[test]
     fn buckets_start_at_the_load_start_and_are_cut_at_the_benchmark_start() {
