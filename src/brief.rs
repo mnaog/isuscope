@@ -49,8 +49,9 @@ pub struct BriefOutput {
     pub transitions: BriefSection<BriefTransition>,
     pub artifact_issues: BriefSection<ProfileArtifact>,
     pub profiles_unavailable: usize,
-    /// 作業の流れで次に使えるコマンド。分析がまだのrunの`analyze`と、比較元があるときの比較。
-    /// 推測の助言は入れず、runの状態だけで決める。
+    /// 作業の流れで次に使えるコマンド。比較元があるときのHTTPとDBの比較だけで、推測の助言は入れない。
+    /// briefは並行して作業する別の人も読むので、書き込む`analyze`は出さない（runを走らせた本人へは
+    /// `run`の終了時に出る）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub next: Vec<String>,
     pub warnings: Vec<String>,
@@ -812,15 +813,10 @@ fn collector_failures(short: &str) -> String {
     )
 }
 
-/// runの状態から、次に使えるコマンドを決める。分析がまだなら`analyze`、比較元があればHTTPとDBの比較。
+/// 比較元があれば、HTTPとDBの比較を次に使えるコマンドとして示す。読むだけのコマンドに限り、
 /// どの表を見るべきかのような推測はしない。
 pub fn next_steps(brief: &mut BriefOutput) {
     let short = brief.run.short_id.clone();
-    if brief.run.analysis_status == crate::model::AnalysisStatus::Pending.as_str() {
-        brief.next.push(format!(
-            "isuscope analyze {short} <supported|rejected|inconclusive|skipped> --analysis \"<結果と根拠>\""
-        ));
-    }
     if let Some(base) = brief
         .review
         .as_ref()
