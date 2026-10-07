@@ -119,9 +119,18 @@ enum Commands {
         /// node labelで絞り込みます。
         #[arg(long)]
         node: Option<String>,
+        /// このprefixで始まるmetricを返します（`query`と同じ）。指定時は汎用metric行になります。
+        #[arg(long)]
+        metric_prefix: Option<String>,
+        /// collectorかparserで絞り込みます（`query`と同じ）。
+        #[arg(long)]
+        source: Option<String>,
         /// `key=value`形式のlabel完全一致。複数回指定できます。
         #[arg(long = "label", value_parser = parse_label_filter)]
         labels: Vec<(String, String)>,
+        /// `key=value`形式で、labelの値が`value`を含むものに絞ります。複数回指定できます。
+        #[arg(long = "label-contains", value_parser = parse_label_filter)]
+        label_contains: Vec<(String, String)>,
         /// benchmark開始からの取得開始秒。
         #[arg(long, default_value_t = 0)]
         from: u64,
@@ -587,8 +596,11 @@ async fn real_main(cli: Cli) -> Result<bool> {
         Commands::Series {
             run,
             metrics,
+            metric_prefix,
+            source,
             node,
             labels,
+            label_contains,
             from,
             to,
             window,
@@ -600,8 +612,11 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 &run,
                 SeriesOptions {
                     metrics,
+                    metric_prefix,
+                    source,
                     node,
                     labels,
+                    label_contains,
                     from,
                     to,
                     window,
@@ -740,17 +755,22 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 } => write_stdout_json(&isuscope::changes::DecisionView::from(
                     store.decide_change(&id, status, reason, revisit, runs)?,
                 ))?,
-                ChangeCommand::List { status, limit } => write_capped_json(
-                    &serde_json::json!({
-                        "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
-                        "changes": store
-                            .list_changes(status, None, limit)?
-                            .into_iter()
-                            .map(isuscope::changes::ChangeSummaryView::from)
-                            .collect::<Vec<_>>(),
-                    }),
-                    &CHANGE_LIST_CAP,
-                )?,
+                ChangeCommand::List { status, limit } => {
+                    let mut changes = store
+                        .list_changes(status, None, 100_000)?
+                        .into_iter()
+                        .map(isuscope::changes::ChangeSummaryView::from)
+                        .collect::<Vec<_>>();
+                    let total_count = changes.len();
+                    changes.truncate(limit);
+                    write_capped_json(
+                        &serde_json::json!({
+                            "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
+                            "changes": Listed::new(changes, total_count),
+                        }),
+                        &CHANGE_LIST_CAP,
+                    )?
+                }
                 ChangeCommand::Show { id } => write_stdout_json(
                     &isuscope::changes::ChangeHistoryView::from(store.change_history(&id)?),
                 )?,
@@ -799,8 +819,11 @@ impl BucketRow {
 #[derive(Debug)]
 struct SeriesOptions {
     metrics: Vec<String>,
+    metric_prefix: Option<String>,
+    source: Option<String>,
     node: Option<String>,
     labels: Vec<(String, String)>,
+    label_contains: Vec<(String, String)>,
     from: u64,
     to: Option<u64>,
     window: SeriesWindowArg,
@@ -811,11 +834,15 @@ struct SeriesOptions {
 #[derive(serde::Serialize)]
 struct SeriesOutput {
     schema_version: u32,
-    run_id: String,
-    /// `from_seconds`の起点。区間がベンチ全体（`whole`）なら`window`と同じなので出さない。
+    #[serde(serialize_with = "isuscope::model::serialize_short_run")]
+    run: String,
+    /// 区間の名前（`whole`・`initialize`・`load`）。ほかの出力の`window`と同じ。
+    window: &'static str,
+    /// 区間の実際の時刻とbucket。
+    range: SeriesRange,
+    /// `from_seconds`の起点。区間がベンチ全体（`whole`）なら`range`と同じなので出さない。
     #[serde(skip_serializing_if = "Option::is_none")]
     benchmark: Option<SeriesInterval>,
-    window: SeriesWindow,
     /// 完了しなかったcollectorだけ。完了したものは並べない。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     coverage: Vec<SeriesCoverage>,
@@ -830,8 +857,7 @@ struct SeriesInterval {
 }
 
 #[derive(serde::Serialize)]
-struct SeriesWindow {
-    name: String,
+struct SeriesRange {
     started_at: String,
     finished_at: String,
     from_seconds: i64,
@@ -1222,7 +1248,7 @@ fn show_series(config: &LoadedConfig, requested: &str, options: SeriesOptions) -
         .into_iter()
         .filter(|metric| metric_matches(metric, &options, requested_start, requested_end))
         .collect::<Vec<_>>();
-    if !options.metrics.is_empty() {
+    if !options.metrics.is_empty() || options.metric_prefix.is_some() {
         let data = generic_series_data(start, requested_start, requested_end, &options, metrics);
         write_capped_json(
             &series_output(
@@ -1413,15 +1439,15 @@ fn series_output(
 ) -> SeriesOutput {
     SeriesOutput {
         schema_version: isuscope::model::OUTPUT_SCHEMA_VERSION,
-        run_id,
+        run: run_id,
+        window: options.window.as_str(),
         benchmark: ((window_start, window_end) != (benchmark_start, benchmark_end)).then(|| {
             SeriesInterval {
                 started_at: isuscope::model::display_time(benchmark_start),
                 finished_at: isuscope::model::display_time(benchmark_end),
             }
         }),
-        window: SeriesWindow {
-            name: options.window.as_str().into(),
+        range: SeriesRange {
             started_at: isuscope::model::display_time(window_start),
             finished_at: isuscope::model::display_time(window_end),
             from_seconds: (window_start - benchmark_start).num_seconds(),
@@ -1434,7 +1460,7 @@ fn series_output(
     }
 }
 
-/// 区間の端が5秒bucketで正確に切れているか（[`SeriesWindow::edges`]）。端がbucketの区切りか、
+/// 区間の端が5秒bucketで正確に切れているか（[`SeriesRange::edges`]）。端がbucketの区切りか、
 /// node上で行を振り分けた境界（ベンチの始まりと終わり）なら正確。bucketの区切りは保存された
 /// bucketから読む（負荷の始まりに揃える前のrunは、epochの5の倍数で区切っている）。
 /// 区間の始まりから数えたbucketの番号。差をマイクロ秒で取ってから割る（それぞれを整数秒へ
@@ -1520,6 +1546,19 @@ fn metric_matches(
     if !dependency && !options.metrics.is_empty() && !options.metrics.contains(&metric.name) {
         return false;
     }
+    if !dependency
+        && let Some(prefix) = &options.metric_prefix
+        && !metric.name.starts_with(prefix)
+    {
+        return false;
+    }
+    // `query`と同じく、sourceはcollectorかparserの名前。
+    if let Some(source) = &options.source
+        && metric.labels.get("collector") != Some(source)
+        && metric.labels.get("isuscope.parser") != Some(source)
+    {
+        return false;
+    }
     if let Some(node) = &options.node
         && metric.labels.get("node") != Some(node)
     {
@@ -1530,6 +1569,16 @@ fn metric_matches(
             .labels
             .iter()
             .any(|(key, value)| metric.labels.get(key) != Some(value))
+    {
+        return false;
+    }
+    if !dependency
+        && options.label_contains.iter().any(|(key, needle)| {
+            metric
+                .labels
+                .get(key)
+                .is_none_or(|value| !value.contains(needle))
+        })
     {
         return false;
     }
@@ -1561,11 +1610,11 @@ fn generic_series_data(
         scope: query::QueryScope::Series,
         window: None,
         metrics: options.metrics.clone(),
-        metric_prefix: None,
+        metric_prefix: options.metric_prefix.clone(),
         node: options.node.clone(),
-        source: None,
+        source: options.source.clone(),
         labels: options.labels.clone(),
-        label_contains: Vec::new(),
+        label_contains: options.label_contains.clone(),
         group_by: Vec::new(),
         limit: usize::MAX,
     };
@@ -1710,7 +1759,25 @@ fn observed_sum(value: f64, related_observed: bool) -> Option<f64> {
 #[derive(serde::Serialize)]
 struct RunListOutput {
     schema_version: u32,
-    runs: Vec<RunSummary>,
+    runs: Listed<RunSummary>,
+}
+
+/// `--limit`で切る一覧。briefの各欄やqueryと同じく、全件数と切ったかどうかを持つ。
+#[derive(serde::Serialize)]
+struct Listed<T> {
+    total_count: usize,
+    truncated: bool,
+    items: Vec<T>,
+}
+
+impl<T> Listed<T> {
+    fn new(items: Vec<T>, total_count: usize) -> Self {
+        Self {
+            truncated: total_count > items.len(),
+            total_count,
+            items,
+        }
+    }
 }
 
 fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
@@ -1718,7 +1785,7 @@ fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
     write_capped_json(
         &RunListOutput {
             schema_version: isuscope::model::OUTPUT_SCHEMA_VERSION,
-            runs: store.list(limit)?,
+            runs: Listed::new(store.list(limit)?, store.run_count()?),
         },
         &LIST_CAP,
     )?;
@@ -1753,7 +1820,15 @@ fn write_sql_json(output: &isuscope::sql::SqlOutput) -> Result<()> {
 }
 
 fn print_json(value: &serde_json::Value) -> Result<()> {
-    serde_json::to_writer(std::io::stdout().lock(), value)?;
+    // どの出力にも`warnings`を置く（無ければ空）。有無で形が変わらないように。
+    let mut value = value.clone();
+    if let Some(fields) = value.as_object_mut() {
+        let warnings = fields
+            .shift_remove("warnings")
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+        fields.insert("warnings".into(), warnings);
+    }
+    serde_json::to_writer(std::io::stdout().lock(), &value)?;
     println!();
     Ok(())
 }
@@ -1847,34 +1922,27 @@ struct RowCap {
     /// トップレベルの行の配列。表にした後の`{columns, rows}`でもよい。
     field: &'static str,
     hint: &'static str,
-    /// 減らした後の行数で書き換えるfield（`sql`の`row_count`）。
-    shown_count: Option<&'static str>,
 }
 
 const QUERY_CAP: RowCap = RowCap {
     field: "rows",
     hint: "narrow it with --node, --label, --label-contains or --limit (and --metric in the metric view)",
-    shown_count: None,
 };
 const SERIES_CAP: RowCap = RowCap {
     field: "rows",
     hint: "the last rows (later metrics and buckets) were dropped; narrow it with --metric, --node, --label or --from/--to",
-    shown_count: None,
 };
 const SQL_CAP: RowCap = RowCap {
     field: "rows",
     hint: "narrow it with WHERE or LIMIT",
-    shown_count: Some("row_count"),
 };
 const LIST_CAP: RowCap = RowCap {
     field: "runs",
     hint: "lower --limit",
-    shown_count: None,
 };
 const CHANGE_LIST_CAP: RowCap = RowCap {
     field: "changes",
     hint: "filter it with --status or lower --limit",
-    shown_count: None,
 };
 
 fn fit_rows(value: &mut serde_json::Value, cap: &RowCap) -> Result<()> {
@@ -1917,13 +1985,17 @@ fn fit_rows(value: &mut serde_json::Value, cap: &RowCap) -> Result<()> {
     if let Some(rows) = rows_of_mut(value, cap.field) {
         rows.truncate(kept);
     }
+    // `truncated`は減らした表に立てる（`list`の`runs`のように名前の付いた表ならその中）。
+    let table = match value.get_mut(cap.field) {
+        Some(table @ serde_json::Value::Object(_)) => table,
+        _ => &mut *value,
+    };
+    if let Some(table) = table.as_object_mut() {
+        table.insert("truncated".into(), serde_json::Value::Bool(true));
+    }
     let Some(fields) = value.as_object_mut() else {
         return Ok(());
     };
-    fields.insert("truncated".into(), serde_json::Value::Bool(true));
-    if let Some(count) = cap.shown_count {
-        fields.insert(count.into(), kept.into());
-    }
     match fields
         .entry("warnings")
         .or_insert_with(|| serde_json::Value::Array(Vec::new()))
@@ -1994,7 +2066,13 @@ fn tabulate(value: &mut serde_json::Value) {
                     output.insert("columns".into(), columns);
                     output.insert("rows".into(), rows);
                 } else {
-                    output.insert(name, serde_json::json!({"columns": columns, "rows": rows}));
+                    // 切らずに全件を出す表（hostのnode、変更の判断の履歴など）。ほかの表と同じく
+                    // 件数と`truncated`を持たせる。
+                    let total_count = rows.as_array().map_or(0, Vec::len);
+                    output.insert(
+                        name,
+                        serde_json::json!({"total_count": total_count, "truncated": false, "columns": columns, "rows": rows}),
+                    );
                 }
             }
             *fields = output;
@@ -2157,7 +2235,6 @@ const BRIEF_COLUMNS: &[(&str, &[&str])] = &[
             "node",
             "engine",
             "source",
-            "window",
             "digest",
             "digest_id",
             "calls",
@@ -2218,11 +2295,11 @@ mod series_tests {
         tabulate(&mut value);
         assert_eq!(
             value["hosts"],
-            serde_json::json!({"columns": [], "rows": []})
+            serde_json::json!({"total_count": 0, "truncated": false, "columns": [], "rows": []})
         );
         assert_eq!(
             value["clients"],
-            serde_json::json!({"columns": ["node", "connections_in_use_max"], "rows": [["app1", 4]]})
+            serde_json::json!({"total_count": 1, "truncated": false, "columns": ["node", "connections_in_use_max"], "rows": [["app1", 4]]})
         );
         assert_eq!(value["columns"], serde_json::json!([]));
         assert_eq!(value["rows"], serde_json::json!([]));
@@ -2282,7 +2359,7 @@ mod series_tests {
     }
 
     #[test]
-    fn caps_reach_nested_tables_and_correct_the_shown_count() {
+    fn caps_reach_nested_tables_and_mark_the_table_they_cut() {
         let rows = (0..400)
             .map(|index| serde_json::json!([format!("run-{index:040}"), index]))
             .collect::<Vec<_>>();
@@ -2291,16 +2368,14 @@ mod series_tests {
         fit_rows(&mut list, &LIST_CAP).unwrap();
         let kept = list["runs"]["rows"].as_array().unwrap().len();
         assert!(kept > 0 && kept < 400);
-        assert_eq!(list["truncated"], true);
         assert!(list["warnings"][0].as_str().unwrap().contains("--limit"));
-        // `sql`の`row_count`は返した行数に合わせる。
+        // 名前の付いた表では、減らした表の中に`truncated`を立てる。
+        assert_eq!(list["runs"]["truncated"], true);
         let mut sql =
-            serde_json::json!({"columns": ["id", "score"], "row_count": 400, "rows": rows});
+            serde_json::json!({"columns": ["id", "score"], "total_count": 400, "rows": rows});
         fit_rows(&mut sql, &SQL_CAP).unwrap();
-        assert_eq!(
-            sql["row_count"].as_u64().unwrap() as usize,
-            sql["rows"].as_array().unwrap().len()
-        );
+        assert_eq!(sql["total_count"], 400);
+        assert_eq!(sql["truncated"], true);
         assert!(sql["warnings"][0].as_str().unwrap().contains("WHERE"));
     }
 
@@ -2392,8 +2467,11 @@ mod series_tests {
         for labels in [vec![], vec![("symbol".into(), "A".into())]] {
             let options = SeriesOptions {
                 metrics: vec!["cpu.sample_percent".into()],
+                metric_prefix: None,
+                source: None,
                 node: None,
                 labels,
+                label_contains: Vec::new(),
                 from: 0,
                 to: None,
                 window: SeriesWindowArg::Load,
@@ -2446,8 +2524,11 @@ mod series_tests {
             start + chrono::Duration::seconds(60),
             &SeriesOptions {
                 metrics: vec!["db.query.rows_examined".into()],
+                metric_prefix: None,
+                source: None,
                 node: None,
                 labels: Vec::new(),
+                label_contains: Vec::new(),
                 from: 0,
                 to: None,
                 window: SeriesWindowArg::Whole,

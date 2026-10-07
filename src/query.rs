@@ -30,6 +30,7 @@ pub struct MetricQueryOptions {
 #[derive(Debug, Serialize)]
 pub struct MetricQueryOutput {
     pub schema_version: u32,
+    #[serde(rename = "run", serialize_with = "crate::model::serialize_short_run")]
     pub run_id: String,
     pub view: &'static str,
     pub scope: QueryScope,
@@ -200,9 +201,11 @@ impl<T> QueryDiffOutput<T> {
 #[derive(Debug, Serialize)]
 pub struct QueryDiffOutput<T> {
     pub schema_version: u32,
-    pub view: &'static str,
-    pub base_run_id: String,
+    #[serde(rename = "run", serialize_with = "crate::model::serialize_short_run")]
     pub candidate_run_id: String,
+    #[serde(rename = "base", serialize_with = "crate::model::serialize_short_run")]
+    pub base_run_id: String,
+    pub view: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -599,6 +602,7 @@ pub struct DatabaseQueryOptions {
 #[derive(Debug, Serialize)]
 pub struct DatabaseQueryOutput {
     pub schema_version: u32,
+    #[serde(rename = "run", serialize_with = "crate::model::serialize_short_run")]
     pub run_id: String,
     pub view: &'static str,
     pub grouping: &'static str,
@@ -860,6 +864,7 @@ pub struct HttpQueryOptions {
 #[derive(Debug, Serialize)]
 pub struct HttpQueryOutput {
     pub schema_version: u32,
+    #[serde(rename = "run", serialize_with = "crate::model::serialize_short_run")]
     pub run_id: String,
     pub view: &'static str,
     pub total_count: usize,

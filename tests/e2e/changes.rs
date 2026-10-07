@@ -41,7 +41,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     fs::create_dir(p.join(".isuscope")).unwrap();
     config(p, 100);
     ok(p, &["run", "--hypothesis", "baseline"]);
-    let base = json(p, &["list"])["runs"][0]["id"]
+    let base = json(p, &["list"])["runs"]["rows"][0]["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -64,7 +64,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
             "remove long queries and improve score",
         ],
     );
-    let candidate = json(p, &["list"])["runs"][0]["id"]
+    let candidate = json(p, &["list"])["runs"]["rows"][0]["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -167,7 +167,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         ],
     );
     assert_eq!(
-        json(p, &["change", "list", "--status", "provisional"])["changes"]
+        json(p, &["change", "list", "--status", "provisional"])["changes"]["rows"]
             .as_array()
             .unwrap()
             .len(),
@@ -202,14 +202,11 @@ fn decisions_are_independent_recoverable_and_concurrent() {
             short(&base)
         )
     );
-    assert_eq!(
-        brief["review"]["latest_analysis"]["base_short_id"],
-        short(&base)
-    );
-    assert_eq!(brief["review"]["comparison"]["score"]["delta"], -10);
-    assert_eq!(brief["review"]["changes"][0]["status"], "accepted");
+    assert_eq!(brief["review"]["latest_analysis"]["base"], short(&base));
+    assert_eq!(brief["review"]["comparison"]["score_delta"], -10);
+    assert_eq!(brief["review"]["changes"]["rows"][0]["status"], "accepted");
     assert!(
-        json(p, &["change", "list", "--status", "provisional"])["changes"]
+        json(p, &["change", "list", "--status", "provisional"])["changes"]["rows"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -218,10 +215,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     // Analysis, not adoption, controls the next benchmark.
     ok(p, &["run", "--hypothesis", "follow-up without a decision"]);
     let brief = json(p, &["brief", &candidate]);
-    assert_eq!(
-        brief["review"]["comparison"]["score"]["delta_percent"],
-        -10.0
-    );
+    assert_eq!(brief["review"]["comparison"]["score_delta_percent"], -10.0);
 
     let mut children = Vec::new();
     for reason in ["parallel one", "parallel two"] {
@@ -241,16 +235,16 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         assert!(child.wait().unwrap().success());
     }
     let history = json(p, &["change", "show", "items"]);
-    assert_eq!(history["decisions"].as_array().unwrap().len(), 5);
+    assert_eq!(history["decisions"]["rows"].as_array().unwrap().len(), 5);
     assert_eq!(
-        history["decisions"][0]["evidence"]
+        history["decisions"]["rows"][0]["evidence"]
             .as_array()
             .unwrap()
             .len(),
         2
     );
     // The saved record keeps each evidence run's source; the output names it in one line.
-    let decision_id = history["decisions"][0]["id"].as_str().unwrap();
+    let decision_id = history["decisions"]["rows"][0]["id"].as_str().unwrap();
     let record: Value = parsed(
         &fs::read(p.join(format!(
             ".isuscope/changes/items/decisions/{decision_id}.json"
@@ -260,7 +254,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     .unwrap();
     assert!(record["evidence"][0]["source"]["state_sha256"].is_string());
     assert!(
-        history["decisions"][0]["evidence"][0]
+        history["decisions"]["rows"][0]["evidence"][0]
             .as_str()
             .unwrap()
             .starts_with(&candidate[candidate.len() - 8..])
@@ -280,10 +274,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     }
     assert_eq!(json(p, &["change", "show", "items"]), history);
     let restored = json(p, &["brief", &candidate]);
-    assert_eq!(
-        restored["review"]["latest_analysis"]["base_short_id"],
-        short(&base)
-    );
+    assert_eq!(restored["review"]["latest_analysis"]["base"], short(&base));
     let db = Connection::open(p.join(".isuscope/isuscope.sqlite3")).unwrap();
     assert_eq!(
         db.query_row("SELECT count(*) FROM change_decisions", [], |r| r
@@ -317,7 +308,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     .unwrap();
     drop(db);
     assert_eq!(
-        json(p, &["list"])["runs"]
+        json(p, &["list"])["runs"]["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -346,7 +337,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
         ],
     );
     assert_eq!(
-        json(p, &["brief", &candidate])["review"]["changes"]
+        json(p, &["brief", &candidate])["review"]["changes"]["rows"]
             .as_array()
             .unwrap()
             .len(),
@@ -361,7 +352,7 @@ fn analyze_records_a_change_decision_with_the_analysis() {
     fs::create_dir(p.join(".isuscope")).unwrap();
     config(p, 100);
     ok(p, &["run", "--hypothesis", "baseline"]);
-    let base = json(p, &["list"])["runs"][0]["short_id"]
+    let base = json(p, &["list"])["runs"]["rows"][0]["run"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -379,7 +370,7 @@ fn analyze_records_a_change_decision_with_the_analysis() {
             "shorter keepalive frees idle connections",
         ],
     );
-    let candidate = json(p, &["list"])["runs"][0]["short_id"]
+    let candidate = json(p, &["list"])["runs"]["rows"][0]["run"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -401,7 +392,10 @@ fn analyze_records_a_change_decision_with_the_analysis() {
     );
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--revisit"));
-    assert_eq!(json(p, &["list"])["runs"][0]["analysis_status"], "pending");
+    assert_eq!(
+        json(p, &["list"])["runs"]["rows"][0]["analysis_status"],
+        "pending"
+    );
 
     let recorded = ok(
         p,
@@ -425,7 +419,7 @@ fn analyze_records_a_change_decision_with_the_analysis() {
         history["change"]["description"],
         "shorter keepalive frees idle connections"
     );
-    let decision = &history["decisions"][0];
+    let decision = &history["decisions"]["rows"][0];
     assert_eq!(decision["status"], "accepted");
     assert_eq!(decision["reason"], "idle connections fell and score rose");
     let evidence = decision["evidence"]
@@ -457,7 +451,7 @@ fn analyze_records_a_change_decision_with_the_analysis() {
     assert!(!duplicate.status.success());
     assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
     assert_eq!(
-        json(p, &["change", "show", "keepalive"])["decisions"]
+        json(p, &["change", "show", "keepalive"])["decisions"]["rows"]
             .as_array()
             .unwrap()
             .len(),

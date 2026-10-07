@@ -396,8 +396,8 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"host.cpu_
     drop(db);
 
     let list: serde_json::Value = parsed(&isuscope(&["list"])).unwrap();
-    assert_eq!(list["runs"][0]["state"], "complete", "{list}");
-    assert_eq!(list["runs"][0]["score"], 1234, "{list}");
+    assert_eq!(list["runs"]["rows"][0]["state"], "complete", "{list}");
+    assert_eq!(list["runs"]["rows"][0]["score"], 1234, "{list}");
     let db = Connection::open(config_dir.join("isuscope.sqlite3")).unwrap();
     assert_eq!(metric_count(&db), saved);
     // 入れ直した後は確定済みとして扱い、開き直しても重ねて入れない。

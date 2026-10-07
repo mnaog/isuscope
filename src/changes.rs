@@ -202,7 +202,6 @@ pub struct RunReview {
     pub comparison: Option<ScoreComparison>,
     /// Current decisions for changes citing this run, not deployment state.
     pub changes: Vec<ChangeSummary>,
-    pub changes_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -480,14 +479,12 @@ impl Store {
                 })
             })
             .transpose()?;
-        let mut changes = self.list_changes(None, Some(&run.id), 21)?;
-        let changes_truncated = changes.len() > 20;
-        changes.truncate(20);
+        // 件数を出すので全件を読む（1 runが根拠になる変更は多くない）。
+        let changes = self.list_changes(None, Some(&run.id), 100_000)?;
         Ok(RunReview {
             latest_analysis,
             comparison,
             changes,
-            changes_truncated,
         })
     }
     pub fn create_change(

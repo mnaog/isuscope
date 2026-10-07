@@ -19,7 +19,8 @@ pub enum SqlFormat {
 pub struct SqlOutput {
     pub schema_version: u32,
     pub columns: Vec<String>,
-    pub row_count: usize,
+    /// Rows the statement returned, including the ones `--limit` left out (like `query`).
+    pub total_count: usize,
     /// True when `--limit` cut the result; the query itself decides what is interesting.
     pub truncated: bool,
     /// Values in `columns` order, exactly as stored: no rounding, and REAL stays a float.
@@ -75,12 +76,12 @@ pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput
         );
     }
     let mut rows = Vec::new();
-    let mut truncated = false;
+    let mut total_count = 0;
     let mut cursor = statement.query([])?;
     while let Some(row) = cursor.next()? {
+        total_count += 1;
         if rows.len() >= limit {
-            truncated = true;
-            break;
+            continue;
         }
         rows.push(
             (0..columns.len())
@@ -90,9 +91,9 @@ pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput
     }
     Ok(SqlOutput {
         schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
-        row_count: rows.len(),
+        truncated: total_count > rows.len(),
+        total_count,
         columns,
-        truncated,
         rows,
     })
 }
@@ -122,7 +123,12 @@ pub fn write_tsv(output: &SqlOutput, mut writer: impl std::io::Write) -> Result<
         writeln!(writer, "{}", cells.join("\t"))?;
     }
     if output.truncated {
-        writeln!(writer, "# truncated at {} rows", output.row_count)?;
+        writeln!(
+            writer,
+            "# showing {} of {} rows",
+            output.rows.len(),
+            output.total_count
+        )?;
     }
     Ok(())
 }

@@ -235,6 +235,25 @@ pub fn display_stored_time(stored: &str) -> String {
         .unwrap_or_else(|_| stored.to_owned())
 }
 
+/// runを指す値は、どの出力でも`run`（そのrun）と`base`（比較元）の短縮ID。完全なIDは`list`の`id`だけ。
+pub fn serialize_short_run<S: serde::Serializer>(
+    id: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(crate::runner::short_id(id))
+}
+
+/// commitは、どの出力でも先頭12桁。
+pub fn serialize_short_commit<S: serde::Serializer>(
+    commit: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match commit {
+        Some(commit) => serializer.serialize_str(&commit[..commit.len().min(12)]),
+        None => serializer.serialize_none(),
+    }
+}
+
 pub fn serialize_display_time<S: serde::Serializer>(
     at: &DateTime<Utc>,
     serializer: S,

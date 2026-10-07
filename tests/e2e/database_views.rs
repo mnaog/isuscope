@@ -49,7 +49,7 @@ command = ["sh", "-c", "sed -E \"s/\\\"timestamp\\\":[0-9]+/\\\"timestamp\\\":$(
         parsed(&output.stdout).unwrap_or_default()
     };
     isuscope(&["run", "--hypothesis", "base"]);
-    let first = isuscope(&["list"])["runs"][0]["id"]
+    let first = isuscope(&["list"])["runs"]["rows"][0]["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -62,8 +62,8 @@ command = ["sh", "-c", "sed -E \"s/\\\"timestamp\\\":[0-9]+/\\\"timestamp\\\":$(
     ]);
     isuscope(&["run", "--hypothesis", "candidate"]);
     let runs = isuscope(&["list"]);
-    let candidate = runs["runs"][0]["id"].as_str().unwrap().to_owned();
-    let base = runs["runs"][1]["id"].as_str().unwrap().to_owned();
+    let candidate = runs["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
+    let base = runs["runs"]["rows"][1]["id"].as_str().unwrap().to_owned();
 
     let expected_calls = fs::read_to_string(&fixture)
         .unwrap()

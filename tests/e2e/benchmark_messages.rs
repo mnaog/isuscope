@@ -58,18 +58,15 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
     );
 
     let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
-    let summary = &list["runs"][0];
+    let summary = &list["runs"]["rows"][0];
     let id = summary["id"].as_str().unwrap();
-    assert_eq!(summary["short_id"], &id[id.len() - 8..]);
+    assert_eq!(summary["run"], &id[id.len() - 8..]);
     assert_eq!(
         summary["failure_reason"],
         "validation: GET /user/0/home expected(403) != actual(401)"
     );
 
-    let brief = isuscope(
-        project.path(),
-        &["brief", summary["short_id"].as_str().unwrap()],
-    );
+    let brief = isuscope(project.path(), &["brief", summary["run"].as_str().unwrap()]);
     assert!(
         brief.status.success(),
         "{}",
@@ -89,7 +86,7 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
         .unwrap();
     assert_eq!(timeouts["samples"].as_array().unwrap().len(), 5);
     assert_eq!(messages["omitted_count"], 2);
-    assert_eq!(brief["run"]["short_id"], summary["short_id"]);
+    assert_eq!(brief["run"], summary["run"]);
 
     let manifest: Value =
         parsed(&fs::read(config_dir.join("runs").join(id).join("run.json")).unwrap()).unwrap();
@@ -125,14 +122,14 @@ command = ["sh", "-c", "printf 'broken \\377\\376 line\\n'; printf '%s\\n' '{\"t
         String::from_utf8_lossy(&run.stderr)
     );
     let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
-    assert_eq!(list["runs"][0]["score"], 7);
+    assert_eq!(list["runs"]["rows"][0]["score"], 7);
     let query = isuscope(
         project.path(),
         &["query", "latest", "--metric", "benchmark.after_broken"],
     );
     let query: Value = parsed(&query.stdout).unwrap();
     assert_eq!(query["total_count"], 1, "{query}");
-    let id = list["runs"][0]["short_id"].as_str().unwrap().to_owned();
+    let id = list["runs"]["rows"][0]["run"].as_str().unwrap().to_owned();
     isuscope(
         project.path(),
         &["analyze", &id, "skipped", "--analysis", "fixture"],
@@ -152,7 +149,7 @@ command = ["sh", "-c", "printf 'broken \\377\\376 line\\n'; printf '%s\\n' '{\"t
     );
     let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
     assert!(
-        list["runs"][0]["failure_reason"]
+        list["runs"]["rows"][0]["failure_reason"]
             .as_str()
             .unwrap()
             .starts_with("benchmark command exited with"),
@@ -208,7 +205,7 @@ command = ["true"]
     );
 
     let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
-    let id = list["runs"][0]["id"].as_str().unwrap().to_owned();
+    let id = list["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
     let saved = Command::new("zstd")
         .args(["-dc", "--"])
         .arg(

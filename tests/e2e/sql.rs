@@ -42,7 +42,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
         &["sql", "SELECT score, state FROM runs ORDER BY started_at"],
     );
     let rows: Value = parsed(&rows.stdout).unwrap();
-    assert_eq!(rows["row_count"], 1);
+    assert_eq!(rows["total_count"], 1);
     assert_eq!(rows["rows"][0]["score"], 42);
     assert_eq!(rows["rows"][0]["state"], "complete");
     assert_eq!(rows["truncated"], false);
@@ -83,7 +83,7 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"metric\",\"name\":\"benchmark
     );
     let limited = String::from_utf8_lossy(&limited.stdout);
     assert!(limited.starts_with("name\n"), "{limited}");
-    assert!(limited.contains("# truncated at 1 rows"), "{limited}");
+    assert!(limited.contains("# showing 1 of "), "{limited}");
 
     // A write is refused by the read-only connection, and the run survives.
     let write = isuscope(project.path(), &["sql", "DELETE FROM runs"]);

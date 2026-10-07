@@ -109,8 +109,8 @@ command = ["sh", "-c", "printf '%s\\n' '{\"type\":\"metric\",\"name\":\"benchmar
         .unwrap();
     assert!(brief.status.success());
     let brief: serde_json::Value = parsed(&brief.stdout).unwrap();
-    assert_eq!(brief["run"]["score"], 123);
-    assert_eq!(brief["run"]["passed"], true);
+    assert_eq!(brief["summary"]["score"], 123);
+    assert_eq!(brief["summary"]["passed"], true);
     assert_eq!(brief["benchmark"]["total_count"], 2);
     assert_eq!(brief["benchmark"]["truncated"], true);
     assert_eq!(brief["benchmark"]["rows"].as_array().unwrap().len(), 1);

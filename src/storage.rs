@@ -35,13 +35,15 @@ struct StructuredSnapshot {
 
 #[derive(Debug, Serialize)]
 pub struct RunSummary {
-    pub id: String,
-    /// The form printed by `run` and accepted everywhere a run is named.
+    /// The form printed by `run` and accepted everywhere a run is named, as in every other output.
+    #[serde(rename = "run")]
     pub short_id: String,
+    /// 完全なID。出力の中でこれを出すのは`list`だけ。
+    pub id: String,
     /// JSTのミリ秒まで（[`crate::model::display_time`]）。
     pub started_at: String,
-    /// 先頭12桁（ほかの出力の短縮commitと同じ）。完全な値は`brief`の`run`にある。
-    #[serde(serialize_with = "short_commit")]
+    /// 先頭12桁（ほかの出力の短縮commitと同じ）。
+    #[serde(serialize_with = "crate::model::serialize_short_commit")]
     pub commit_hash: Option<String>,
     pub dirty: bool,
     pub mode: String,
@@ -57,16 +59,6 @@ pub struct RunSummary {
     /// First parser failure message of a run that did not pass.
     #[serde(rename = "failure_reason")]
     pub failure: Option<String>,
-}
-
-fn short_commit<S: serde::Serializer>(
-    commit: &Option<String>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    match commit {
-        Some(commit) => serializer.serialize_str(&commit[..commit.len().min(12)]),
-        None => serializer.serialize_none(),
-    }
 }
 
 #[derive(Debug, Default)]
@@ -363,6 +355,13 @@ impl Store {
             );
         }
         Ok(final_dir)
+    }
+
+    pub fn run_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))?;
+        Ok(count as usize)
     }
 
     /// Newest runs first.
