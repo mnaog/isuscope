@@ -1282,8 +1282,8 @@ command -v sudo >/dev/null 2>&1 || exit 75
 snapshot=/tmp/isuscope-{run_id}.mysql-io.before
 sudo -n mysql -N -B --force -e "
 SHOW GLOBAL STATUS LIKE 'Uptime';
-SELECT 'F', FILE_NAME, SUM_TIMER_READ, SUM_TIMER_WRITE, SUM_NUMBER_OF_BYTES_READ, SUM_NUMBER_OF_BYTES_WRITE FROM performance_schema.file_summary_by_instance WHERE COUNT_STAR > 0;
-SELECT 'T', CONCAT(OBJECT_SCHEMA, '.', OBJECT_NAME), SUM_TIMER_FETCH, SUM_TIMER_INSERT + SUM_TIMER_UPDATE + SUM_TIMER_DELETE, COUNT_FETCH, COUNT_INSERT + COUNT_UPDATE + COUNT_DELETE FROM performance_schema.table_io_waits_summary_by_table WHERE COUNT_STAR > 0 AND OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys');
+SELECT 'F', FILE_NAME, SUM_TIMER_READ, SUM_TIMER_WRITE, SUM_NUMBER_OF_BYTES_READ, SUM_NUMBER_OF_BYTES_WRITE, SUM_TIMER_MISC FROM performance_schema.file_summary_by_instance WHERE COUNT_STAR > 0;
+SELECT 'T', CONCAT(OBJECT_SCHEMA, '.', OBJECT_NAME), SUM_TIMER_FETCH, SUM_TIMER_INSERT + SUM_TIMER_UPDATE + SUM_TIMER_DELETE, COUNT_FETCH, COUNT_INSERT + COUNT_UPDATE + COUNT_DELETE, 0 FROM performance_schema.table_io_waits_summary_by_table WHERE COUNT_STAR > 0 AND OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys');
 " > "$snapshot" 2>/dev/null || true
 grep -q '^Uptime' "$snapshot" || { rm -f "$snapshot"; exit 75; }
 grep -q '^F' "$snapshot" || { rm -f "$snapshot"; echo "performance_schema has no file I/O rows; is performance_schema enabled?" >&2; exit 75; }
@@ -1307,8 +1307,8 @@ trap 'rm -f "$before" "$after"' EXIT
 test -r "$before" || exit 75
 sudo -n mysql -N -B --force -e "
 SHOW GLOBAL STATUS LIKE 'Uptime';
-SELECT 'F', FILE_NAME, SUM_TIMER_READ, SUM_TIMER_WRITE, SUM_NUMBER_OF_BYTES_READ, SUM_NUMBER_OF_BYTES_WRITE FROM performance_schema.file_summary_by_instance WHERE COUNT_STAR > 0;
-SELECT 'T', CONCAT(OBJECT_SCHEMA, '.', OBJECT_NAME), SUM_TIMER_FETCH, SUM_TIMER_INSERT + SUM_TIMER_UPDATE + SUM_TIMER_DELETE, COUNT_FETCH, COUNT_INSERT + COUNT_UPDATE + COUNT_DELETE FROM performance_schema.table_io_waits_summary_by_table WHERE COUNT_STAR > 0 AND OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys');
+SELECT 'F', FILE_NAME, SUM_TIMER_READ, SUM_TIMER_WRITE, SUM_NUMBER_OF_BYTES_READ, SUM_NUMBER_OF_BYTES_WRITE, SUM_TIMER_MISC FROM performance_schema.file_summary_by_instance WHERE COUNT_STAR > 0;
+SELECT 'T', CONCAT(OBJECT_SCHEMA, '.', OBJECT_NAME), SUM_TIMER_FETCH, SUM_TIMER_INSERT + SUM_TIMER_UPDATE + SUM_TIMER_DELETE, COUNT_FETCH, COUNT_INSERT + COUNT_UPDATE + COUNT_DELETE, 0 FROM performance_schema.table_io_waits_summary_by_table WHERE COUNT_STAR > 0 AND OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys');
 SHOW GLOBAL VARIABLES WHERE Variable_name IN ('datadir', 'innodb_buffer_pool_size');
 SET SESSION information_schema_stats_expiry = 0;
 SELECT 'S', CONCAT(TABLE_SCHEMA, '.', TABLE_NAME), IFNULL(DATA_LENGTH, 0) + IFNULL(INDEX_LENGTH, 0) FROM information_schema.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_SCHEMA NOT IN ('mysql', 'performance_schema', 'sys', 'information_schema');
@@ -1323,13 +1323,13 @@ LC_ALL=C awk -F '\t' '
   function grew(now, then) { return now >= then ? now - then : now }
   FNR == 1 { side++ }
   side == 1 && $1 == "Uptime" { uptime_before = $2; next }
-  side == 1 && ($1 == "F" || $1 == "T") { for (i = 3; i <= 6; i++) old[$1, $2, i] = $i; next }
+  side == 1 && ($1 == "F" || $1 == "T") { for (i = 3; i <= 7; i++) old[$1, $2, i] = $i; next }
   side == 2 && $1 == "Uptime" { uptime_after = $2; next }
   side == 2 && $1 == "datadir" { datadir = $2; next }
   side == 2 && $1 == "innodb_buffer_pool_size" { buffer_pool = $2; next }
   side == 2 && $1 == "S" { tables += $3; size[$2] = $3; next }
   side == 2 && ($1 == "F" || $1 == "T") {
-    for (i = 3; i <= 6; i++) delta[$1, $2, i] = grew($i + 0, old[$1, $2, i] + 0)
+    for (i = 3; i <= 7; i++) delta[$1, $2, i] = grew($i + 0, old[$1, $2, i] + 0)
     seen[$1, $2] = 1
     next
   }
@@ -1341,7 +1341,7 @@ LC_ALL=C awk -F '\t' '
     for (pair in seen) {
       split(pair, part, SUBSEP)
       kind = part[1]; name = part[2]
-      if (delta[kind, name, 3] + delta[kind, name, 4] + delta[kind, name, 5] + delta[kind, name, 6] == 0) continue
+      if (delta[kind, name, 3] + delta[kind, name, 4] + delta[kind, name, 5] + delta[kind, name, 6] + delta[kind, name, 7] == 0) continue
       if (kind == "F") {
         if (datadir != "" && index(name, datadir) == 1) name = substr(name, length(datadir) + 1)
         # InnoDB自身のfileは番号ごとに分かれるので、種類ごとに1行へまとめる。
@@ -1349,7 +1349,7 @@ LC_ALL=C awk -F '\t' '
         else if (name ~ /\.b?dblwr$/) name = "#innodb_dblwr"
         else if (name ~ /(^|\/)undo_[0-9]+(\.ibu)?$/) name = "#innodb_undo"
         else if (name ~ /^#innodb_temp\//) name = "#innodb_temp"
-        for (i = 3; i <= 6; i++) file[name, i] += delta[kind, part[2], i]
+        for (i = 3; i <= 7; i++) file[name, i] += delta[kind, part[2], i]
         files[name] = 1
       } else {
         metric("db.table.read_time", delta[kind, name, 3] / 1e9, "ms", "table", name)
@@ -1363,6 +1363,8 @@ LC_ALL=C awk -F '\t' '
       metric("db.file.write_wait", file[name, 4] / 1e9, "ms", "file", name)
       metric("db.file.read_bytes", file[name, 5], "bytes", "file", name)
       metric("db.file.write_bytes", file[name, 6], "bytes", "file", name)
+      # 読み書き以外の操作（fsync・open・close・statなど）の待ちの合計。fsyncだけの時間ではない。
+      metric("db.file.misc_wait", file[name, 7] / 1e9, "ms", "file", name)
     }
     for (name in size) metric("db.table.size", size[name], "bytes", "table", name)
     if (buffer_pool != "") printf "{\"type\":\"metric\",\"name\":\"db.memory.buffer_pool\",\"value\":%.0f,\"unit\":\"bytes\",\"labels\":{\"engine\":\"mysql\"}}\n", buffer_pool

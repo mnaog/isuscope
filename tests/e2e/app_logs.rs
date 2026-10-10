@@ -78,7 +78,7 @@ fn mysql_io_collector_reports_the_waits_between_the_two_snapshots() {
         &before,
         "Uptime\t100\n\
          F\t/var/lib/mysql/isucon/user_presents.ibd\t1000000000000\t0\t1048576\t0\n\
-         F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t5000000000\t0\t4096\n\
+         F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t5000000000\t0\t4096\t1000000000\n\
          T\tisucon.user_presents\t2000000000\t0\t10\t0\n",
     )
     .unwrap();
@@ -86,8 +86,8 @@ fn mysql_io_collector_reports_the_waits_between_the_two_snapshots() {
         format!(
             "Uptime\t{uptime}\n\
              F\t/var/lib/mysql/isucon/user_presents.ibd\t52100000000000\t0\t475004928\t0\n\
-             F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t9000000000\t0\t8192\n\
-             F\t/var/lib/mysql/#innodb_redo/#ib_redo2\t0\t2000000000\t0\t4096\n\
+             F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t9000000000\t0\t8192\t8000000000\n\
+             F\t/var/lib/mysql/#innodb_redo/#ib_redo2\t0\t2000000000\t0\t4096\t3000000000\n\
              F\t/var/lib/mysql/isucon/users.ibd\t3000000000\t0\t16384\t0\n\
              F\t/var/lib/mysql/#ib_16384_0.dblwr\t0\t0\t0\t0\n\
              T\tisucon.user_presents\t5000000000\t1000000000\t30\t4\n\
@@ -130,6 +130,15 @@ fn mysql_io_collector_reports_the_waits_between_the_two_snapshots() {
     assert_eq!(
         value(&metrics, "db.file.write_wait", ("file", "#innodb_redo")),
         Some(6.0)
+    );
+    // fsyncなど読み書き以外の待ちも同じようにまとめる（7ms + 新しいfileの3ms）。古い形の行は0から数える。
+    assert_eq!(
+        value(&metrics, "db.file.misc_wait", ("file", "#innodb_redo")),
+        Some(10.0)
+    );
+    assert_eq!(
+        value(&metrics, "db.file.misc_wait", ("file", "isucon/users.ibd")),
+        Some(0.0)
     );
     assert!(
         !metrics.iter().any(|metric| metric["labels"]["file"]

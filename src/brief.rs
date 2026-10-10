@@ -36,7 +36,7 @@ pub struct BriefOutput {
     /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
     pub database_rows_filtered_out: usize,
-    /// MySQLがfileの読み書きで待った時間の長い順。ベンチの前後の差なのでinitializeも含む。
+    /// MySQLがfileの読み書きとそれ以外の操作（fsyncなど）で待った時間の長い順。ベンチの前後の差なのでinitializeも含む。
     pub database_io: BriefSection<BriefDatabaseFile>,
     /// buffer poolの大きさと、tableのdataとindexの合計（ベンチ後）。
     pub database_memory: BriefSection<BriefDatabaseMemory>,
@@ -451,6 +451,8 @@ pub struct BriefDatabaseFile {
     pub file: String,
     pub read_wait_ms: f64,
     pub write_wait_ms: f64,
+    /// 読み書き以外の操作（fsync・open・close・statなど）で待った時間。fsyncだけの時間ではない。
+    pub misc_wait_ms: f64,
     pub read_mib: f64,
     pub write_mib: f64,
 }
@@ -515,12 +517,14 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
                     file,
                     read_wait_ms: 0.0,
                     write_wait_ms: 0.0,
+                    misc_wait_ms: 0.0,
                     read_mib: 0.0,
                     write_mib: 0.0,
                 });
             match field {
                 "read_wait" => row.read_wait_ms += metric.value,
                 "write_wait" => row.write_wait_ms += metric.value,
+                "misc_wait" => row.misc_wait_ms += metric.value,
                 "read_bytes" => row.read_mib += metric.value / MIB,
                 "write_bytes" => row.write_mib += metric.value / MIB,
                 _ => {}
@@ -540,16 +544,15 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
             }
         }
     }
+    let waited = |row: &BriefDatabaseFile| row.read_wait_ms + row.write_wait_ms + row.misc_wait_ms;
     let mut files = files
         .into_values()
-        .filter(|row| row.read_wait_ms + row.write_wait_ms > 0.0)
+        .filter(|row| waited(row) > 0.0)
         .collect::<Vec<_>>();
-    files.sort_by(|a, b| {
-        (b.read_wait_ms + b.write_wait_ms).total_cmp(&(a.read_wait_ms + a.write_wait_ms))
-    });
+    files.sort_by(|a, b| waited(b).total_cmp(&waited(a)));
     brief.database_io = section(files, limit).more(|| {
         format!(
-            "isuscope query {short} --metric db.file.read_wait --metric db.file.write_wait --group-by file --limit 20"
+            "isuscope query {short} --metric db.file.read_wait --metric db.file.write_wait --metric db.file.misc_wait --group-by file --limit 20"
         )
     });
     brief.database_memory = section(memory.into_values().collect(), usize::MAX);
@@ -1551,6 +1554,8 @@ mod tests {
                 metric("log.lines", 37_500.0, &[("source", "isu")]),
                 metric("log.lines", 41.0, &[("source", "nginx-error")]),
                 file("isucon/users.ibd", "read_wait", 2.0),
+                // redo logはcommitごとのfsyncで待つ。読み書きの待ちが無くてもMISCだけで出す。
+                file("#innodb_redo", "misc_wait", 9_000.0),
                 file("isucon/user_presents.ibd", "read_wait", 51_100.0),
                 file(
                     "isucon/user_presents.ibd",
@@ -1574,9 +1579,13 @@ mod tests {
         assert_eq!(brief.warnings.len(), 1, "{:?}", brief.warnings);
         assert!(brief.warnings[0].contains("isu on app1 wrote 37500 lines"));
         let files = &brief.database_io.items;
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert_eq!(files[0].file, "isucon/user_presents.ibd");
         assert_eq!(files[0].read_mib, 452.0);
+        assert_eq!(
+            (files[1].file.as_str(), files[1].misc_wait_ms),
+            ("#innodb_redo", 9_000.0)
+        );
         let memory = &brief.database_memory.items[0];
         assert_eq!(
             (memory.buffer_pool_mib, memory.tables_mib),
