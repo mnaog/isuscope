@@ -331,7 +331,16 @@ pub struct BriefPressure {
 #[derive(Debug, Serialize)]
 pub struct BriefService {
     pub service: String,
-    pub cpu_max_cores: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_max_cores: Option<f64>,
+    /// processのRSSの合計のピーク（`process-sampler`）。cgroupの`memory.current`とは別の値。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_max_mib: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_max: Option<f64>,
+    /// ベンチの間にMainPIDが変わった回数。クラッシュやOOM killによる再起動の手がかり。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarts: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -468,7 +477,8 @@ pub struct BriefDatabaseMemory {
 const JOURNAL_RATE_LIMIT_BURST: f64 = 10_000.0;
 
 /// `app-log-delta`と`mysql-io-delta`のmetric（`log.`・`db.file.`・`db.memory.`）から、
-/// `logs`・`database_io`・`database_memory`の欄を作る。
+/// `logs`・`database_io`・`database_memory`の欄を作る。`network-allowance-delta`の`net.`は
+/// 上限を超えたcounterだけを`warnings`へ出す。
 pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
     const MIB: f64 = 1024.0 * 1024.0;
     let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
@@ -490,6 +500,13 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
             )),
             // journaldは1 unitあたり既定で30秒に10000行までしか残さない。捨てたことを知らせる
             // `Suppressed`の行は区間が明けて次の行が来たときに出るので、runの終わりには数えられない。
+            // ENAが上限を超えて捨てた・遅らせたpacket。0でなければ、そのnodeはCPU以外の上限に当たっている。
+            "net.allowance_exceeded" if metric.value > 0.0 => brief.warnings.push(format!(
+                "network: {} on {node} {} increased by {} during the run (including initialize); the instance network allowance dropped or delayed packets",
+                label(metric, "counter"),
+                label(metric, "device"),
+                metric.value
+            )),
             "log.lines" if metric.value >= JOURNAL_RATE_LIMIT_BURST && source != "nginx-error" => {
                 brief.warnings.push(format!(
                     "logs: {source} on {node} wrote {} lines; journald keeps about {JOURNAL_RATE_LIMIT_BURST} lines per 30s per unit by default, so its error counts may be low",
@@ -890,15 +907,50 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         .into(),
                     max_percent: query::round_to(row.peak, 2),
                 });
-            let mut services = rows
-                .iter()
-                .filter(|row| row.metric == "service.cpu_cores")
-                .map(|row| BriefService {
-                    service: row.target.clone(),
-                    cpu_max_cores: query::round_to(row.peak, 3),
-                })
-                .collect::<Vec<_>>();
-            services.sort_by(|a, b| b.cpu_max_cores.total_cmp(&a.cpu_max_cores));
+            let mut services = BTreeMap::<String, BriefService>::new();
+            for row in &rows {
+                if !matches!(
+                    row.metric.as_str(),
+                    "service.cpu_cores"
+                        | "service.process_rss_bytes"
+                        | "service.process_threads"
+                        | "service.process_restarts"
+                ) {
+                    continue;
+                }
+                let service = services
+                    .entry(row.target.clone())
+                    .or_insert_with(|| BriefService {
+                        service: row.target.clone(),
+                        cpu_max_cores: None,
+                        rss_max_mib: None,
+                        threads_max: None,
+                        restarts: None,
+                    });
+                match row.metric.as_str() {
+                    "service.cpu_cores" => {
+                        service.cpu_max_cores = Some(query::round_to(row.peak, 3))
+                    }
+                    "service.process_rss_bytes" => {
+                        service.rss_max_mib = Some(query::round_to(row.peak / 1_048_576.0, 1))
+                    }
+                    "service.process_threads" => service.threads_max = Some(row.peak),
+                    _ => service.restarts = row.value.map(|count| count as usize),
+                }
+            }
+            let mut services = services.into_values().collect::<Vec<_>>();
+            services.sort_by(|a, b| {
+                let key = |service: &BriefService| {
+                    (
+                        service.cpu_max_cores.unwrap_or(0.0),
+                        service.rss_max_mib.unwrap_or(0.0),
+                    )
+                };
+                key(b)
+                    .0
+                    .total_cmp(&key(a).0)
+                    .then(key(b).1.total_cmp(&key(a).1))
+            });
             services.truncate(3);
             BriefHostNode {
                 node: node.into(),
@@ -1352,6 +1404,56 @@ mod tests {
     }
 
     #[test]
+    fn services_show_process_memory_threads_and_restarts_without_cgroup_cpu() {
+        // cgroup v1ではservice-samplerが動かず、process-samplerの値だけが来る。
+        let row = |metric: &str, target: &str, value: f64, peak: f64| HostSummary {
+            node: "app3".into(),
+            metric: metric.into(),
+            target: target.into(),
+            source: "process-sampler".into(),
+            labels: BTreeMap::new(),
+            unit: String::new(),
+            aggregation: crate::metric_semantics::MetricAggregation::Average,
+            value: Some(value),
+            peak,
+            peak_at: None,
+            samples: 60,
+        };
+        let nodes = host_nodes(&[
+            row("host.cpu_busy_percent", "host", 50.0, 90.0),
+            row(
+                "service.process_rss_bytes",
+                "core.service",
+                600.0 * 1_048_576.0,
+                1254.0 * 1_048_576.0,
+            ),
+            row("service.process_threads", "core.service", 99.0, 228.0),
+            row("service.process_restarts", "core.service", 1.0, 1.0),
+            row(
+                "service.process_rss_bytes",
+                "nginx.service",
+                20.0 * 1_048_576.0,
+                30.0 * 1_048_576.0,
+            ),
+            row("service.memory_bytes", "core.service", 1.0, 1.0),
+        ]);
+        let services = &nodes[0].top_services;
+        assert_eq!(services.len(), 2);
+        let core = &services[0];
+        assert_eq!(core.service, "core.service");
+        assert_eq!(
+            (
+                core.cpu_max_cores,
+                core.rss_max_mib,
+                core.threads_max,
+                core.restarts
+            ),
+            (None, Some(1254.0), Some(228.0), Some(1))
+        );
+        assert_eq!(services[1].restarts, None);
+    }
+
+    #[test]
     fn new_connections_per_second_divide_the_window_total_by_its_length() {
         // 60秒の負荷で、5秒bucketごとに10接続（合計120）なら毎秒2。1 bucketの5秒で割ると24になる。
         let row = HostSummary {
@@ -1553,6 +1655,16 @@ mod tests {
                 ),
                 metric("log.lines", 37_500.0, &[("source", "isu")]),
                 metric("log.lines", 41.0, &[("source", "nginx-error")]),
+                metric(
+                    "net.allowance_exceeded",
+                    1234.0,
+                    &[("device", "ens5"), ("counter", "bw_out_allowance_exceeded")],
+                ),
+                metric(
+                    "net.allowance_exceeded",
+                    0.0,
+                    &[("device", "ens5"), ("counter", "pps_allowance_exceeded")],
+                ),
                 file("isucon/users.ibd", "read_wait", 2.0),
                 // redo logはcommitごとのfsyncで待つ。読み書きの待ちが無くてもMISCだけで出す。
                 file("#innodb_redo", "misc_wait", 9_000.0),
@@ -1576,8 +1688,13 @@ mod tests {
         );
         assert_eq!(logs[1].count, 3);
         // 1万行を超えたunitだけ、journaldが捨てた可能性を知らせる。
-        assert_eq!(brief.warnings.len(), 1, "{:?}", brief.warnings);
-        assert!(brief.warnings[0].contains("isu on app1 wrote 37500 lines"));
+        assert_eq!(brief.warnings.len(), 2, "{:?}", brief.warnings);
+        let warned = |text: &str| brief.warnings.iter().any(|warning| warning.contains(text));
+        assert!(warned("isu on app1 wrote 37500 lines"));
+        // 上限に当たったcounterだけを出す。
+        assert!(warned(
+            "bw_out_allowance_exceeded on app1 ens5 increased by 1234"
+        ));
         let files = &brief.database_io.items;
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].file, "isucon/user_presents.ibd");

@@ -12,10 +12,12 @@ perf、alp、slp、sysstatは「必要になってから有効化する追加機
 |---|---|---|---|
 | sysstat | during | CPU内訳、disk IOPS・帯域・queue・latency・utilのベンチ区間sample | `sar`がない |
 | service-sampler | during | 指定systemd unitのCPU、memory、disk I/O、PID数 | unit未指定、cgroup v2でない、unitが停止中 |
+| process-sampler | during | 指定systemd unitの全process（cgroup v2・v1、見つからなければMainPID）のRSS合計・thread数・process数を/procから1秒ごと。MainPIDが変わったら再起動として数える。RSSはcgroupの`memory.current`（page cacheを含む）とは別の値 | unit未指定、`systemctl`か`/proc`がない |
 | perf | before/after | detachしたsystem-wide sampleとhot symbol。perf.dataは`perf-series`の1回の`perf script`で読み、ベンチの区間`[始まり, 終わり)`のsampleだけから、区間全体と5秒ごとのsymbol別の割合を作る（perfはafter phaseまで止まらないので、ベンチの後のsampleは捨てる） | `perf`がない、権限不足、kernelが非対応 |
 | alp | after | access logの差分をnode上で集計する。route別のrequest数・status・合計・平均・min/max・p50/p95/p99・error・bytes（差分全体、alp）、route別の5秒ごとのrequest数・error・p50/p95/p99（ベンチ区間、5秒ごとのfileをalp）、ベンチ側の接続の使い方とupstream別の試行数・失敗して次へ回された試行・connect/header/response時間（試行単位、ベンチ区間、awk）。生のlogは運ばない | access logがない（alpが無い、行はあるのにmethod/uriを1件も読めない場合は`failed`） |
 | slp | after | slow logの差分をnode上でinitializeと負荷区間に分け、文ごとの回数・合計・最大・p95・p99・lock・rowsと、DB全体の5秒ごとの回数・時間 | MySQL slow logがない、MySQLが退役済み（slpが無いのは`failed`。Ansibleのobservability roleが入れる） |
 | app-log | before/after | `service_units`のjournal、nginxのerror log（access logと同じdirectoryの`error.log`）、kernelのwarning以上を、beforeで記録した位置（journalはcursor、error logは大きさ）より後だけnode上で読む。行の数字を含む語を`<N>`にした型ごとに数え、多い順に10型と1行の実例だけを持ち帰る。appのunitはerror・timeout・失敗などの語を含む行だけを数える。journaldは1 unitあたり既定で30秒に10,000行までしか残さず、捨てた通知は区間が明けて次の行が来たときに出るので、捨てた行数は数えない（briefは1万行以上読んだunitに、件数が少ない可能性を警告する） | journalもerror logも読めない |
+| network-allowance | before/after | EC2のENAが上限を超えて捨てた・遅らせたpacketの数（`ethtool -S`の`bw_in`・`bw_out`・`pps`・`conntrack`・`linklocal`の`*_allowance_exceeded`）の前後の差と、後の`conntrack_allowance_available`。initializeを含む。briefは増えたcounterを`warnings`に出す | `ethtool`がない、どのdeviceもallowance counterを持たない（ENA以外） |
 | mysql-io | before/after | Performance Schemaのfile別（`file_summary_by_instance`）とtable別（`table_io_waits_summary_by_table`）の累積値を前後に1回ずつ読んだ差。あわせてbuffer poolの大きさとtableのdata・indexの大きさ。ベンチ中は何もしない | MySQLがない、Performance Schemaが無効、間でmysqldが再起動した |
 | PostgreSQL | after | `pg_stat_statements`のquery別差分 | PostgreSQLがない、extensionが無効 |
 
@@ -54,6 +56,8 @@ unavailable_exit_codes = [75]
 | perf-series | `cpu.process_percent`（5秒bucketと取得全体） | `node`, `process` |
 | sysstat | `host.cpu_busy_percent`, `host.cpu_{user,system,iowait,steal,idle}_percent`, `host.disk_{iops,read_bytes_per_second,write_bytes_per_second,queue_depth,await,util_percent}` | `node`; diskは`device` |
 | service-sampler | `service.cpu_cores`, `service.memory_bytes`, `service.io_{read,write}_bytes_per_second`, `service.pids` | `node`, `service` |
+| process-sampler | `service.process_rss_bytes`, `service.process_threads`, `service.processes`, `service.process_restarts`（MainPIDが変わった秒に1） | `node`, `service` |
+| network-allowance | `net.allowance_exceeded`（packets、前後の差）、`net.conntrack_allowance_available` | `node`, `device`; 前者は`counter`（`bw_out_allowance_exceeded`など） |
 
 `isuscope init`が生成するconfigにはhost-sampler、sysstat、service-sampler、perf、alp、slp、optionalなFlame Graph/off-CPU collectorが含まれます。role指定を省略して設定済みの全nodeを対象とし、`run`と`survey-run`の両方で実行します。service-samplerは`[observability].service_units`に列挙した少数のunitだけを対象にし、cgroupの累積counterをparserでrateへ変換します。sysstat、service-sampler、alp、slp、perf scriptのnative出力はcollectorの`parser` adapterが上記の共通metricへ変換します。perfは`perf record -g`でcall graphを採取し、`stackcollapse-perf.pl`と`flamegraph.pl`があればSVGを生成して完全なSVG documentか検証します。`offcputime-bpfcc`と権限があればbeforeでSSHからdetachし、afterでprocess groupへSIGINTを送り、終了と非空出力を確認してからfolded off-CPU stackを回収します。各非空行はstack/count形式か検証します。ツールやkernel capabilityがない場合とsampleが0件の場合は終了コード75の`unavailable`であり、runをdegradedにしません。各ツールの生出力も圧縮保存され、直近runのSVG/folded stackは`latest/logs`へ直接展開されます。
 

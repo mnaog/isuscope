@@ -699,7 +699,7 @@ fn collector_section(name: &str) -> Option<&'static str> {
         "alp" | "nginx-series" | "user-transition" => Some("http"),
         "slp" | "mysql-log-delta" | "pg-stat-statements" => Some("database"),
         "perf-report" | "perf-series" => Some("cpu"),
-        "host-sampler" | "sysstat" | "service-sampler" => Some("host"),
+        "host-sampler" | "sysstat" | "service-sampler" | "process-sampler" => Some("host"),
         "perf-flamegraph" | "offcpu" => Some("profiles"),
         _ => None,
     }
@@ -724,6 +724,7 @@ fn expected_collector_metrics(collector: &str) -> &'static [&'static str] {
         "host-sampler" => &["host.cpu_percent", "host.memory_used_bytes"],
         "sysstat" => &["host.cpu_percent"],
         "service-sampler" => &["service.cpu_cores", "service.memory_bytes"],
+        "process-sampler" => &["service.process_rss_bytes", "service.process_threads"],
         _ => &[],
     }
 }

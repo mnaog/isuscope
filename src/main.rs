@@ -1780,10 +1780,11 @@ fn preferred_cpu(row: &BucketRow) -> &[f64] {
 }
 
 fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<SeriesCoverage> {
-    const SERIES_COLLECTORS: [&str; 9] = [
+    const SERIES_COLLECTORS: [&str; 10] = [
         "host-sampler",
         "sysstat",
         "service-sampler",
+        "process-sampler",
         "nginx-log-delta",
         "alp",
         "nginx-series",
@@ -2301,7 +2302,7 @@ fn build_brief(
     );
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
     let mut extra = Vec::new();
-    for prefix in ["log.", "db.file.", "db.memory."] {
+    for prefix in ["log.", "db.file.", "db.memory.", "net."] {
         extra.extend(store.query_metrics(&brief.summary.id, &[], Some(prefix), Some(false))?);
     }
     brief::attach_logs_and_database_io(&mut brief, &extra, limit);

@@ -235,6 +235,57 @@ parser = "service-cgroup"
 unavailable_exit_codes = [75]
 
 [[collectors]]
+# 指定したunitのprocessが実際に使っているmemory（RSS）とthread数を/procから1秒ごとに読みます。
+# cgroupの`memory.current`はpage cacheなども含み、processのRSSとは別の値です。cgroup v1でも動き、
+# unitの再起動（MainPIDの変化）も数えます。thread poolの膨張やallocatorの保持によるOOMの前兆を見るためのもの。
+name = "process-sampler"
+phase = "during"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -eu
+units='{service_units}'
+test -n "$units" || exit 75
+test -r /proc/self/status || exit 75
+command -v systemctl >/dev/null 2>&1 || exit 75
+trap 'exit 0' HUP INT TERM
+emit() { printf '{"type":"metric","name":"%s","value":%s,"unit":"%s","labels":{"service":"%s"},"timestamp":"%s"}\n' "$1" "$2" "$3" "$4" "$ts"; }
+# unitの全process。cgroup v2、v1のsystemd階層、hybridの順に探し、無ければMainPIDだけを見る。
+unit_pids() {
+  cgroup=$(systemctl show "$1" --property=ControlGroup --value 2>/dev/null || true)
+  if [ -n "$cgroup" ] && [ "$cgroup" != / ]; then
+    for root in /sys/fs/cgroup /sys/fs/cgroup/systemd /sys/fs/cgroup/unified; do
+      if [ -r "$root$cgroup/cgroup.procs" ]; then cat "$root$cgroup/cgroup.procs"; return; fi
+    done
+  fi
+  [ "$2" -gt 0 ] && echo "$2"
+}
+previous=
+while :; do
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  current=
+  for unit in $units; do
+    main=$(systemctl show "$unit" --property=MainPID --value 2>/dev/null || echo 0)
+    case "$main" in ''|*[!0-9]*) main=0 ;; esac
+    current="$current $unit=$main"
+    # 前の秒と別のMainPIDなら、unitが再起動した。
+    case " $previous " in
+      *" $unit="*) before=${previous#*" $unit="}; before=${before%% *}
+        if [ "$before" -gt 0 ] && [ "$main" -gt 0 ] && [ "$before" != "$main" ]; then emit service.process_restarts 1 restarts "$unit"; fi ;;
+    esac
+    set -- $(for pid in $(unit_pids "$unit" "$main"); do cat "/proc/$pid/status" 2>/dev/null || true; done |
+      awk '$1 == "VmRSS:" { rss += $2 } $1 == "Threads:" { threads += $2; processes++ } END { print rss * 1024, threads + 0, processes + 0 }')
+    emit service.processes "$3" processes "$unit"
+    [ "$3" -gt 0 ] || continue
+    emit service.process_rss_bytes "$1" bytes "$unit"
+    emit service.process_threads "$2" threads "$unit"
+  done
+  previous=$current
+  sleep 1
+done
+''']
+unavailable_exit_codes = [75]
+
+[[collectors]]
 # CPU割当の上限で止められた時間。CPU使用率が低いのに遅い場合の原因になる。
 name = "service-throttle"
 phase = "during"
@@ -1266,6 +1317,66 @@ fi
 ''']
 parser = "slp-windows"
 timeout_seconds = 120
+unavailable_exit_codes = [75]
+
+[[collectors]]
+# EC2（ENA）がinstanceの上限を超えたために捨てたり遅らせたりしたpacketの数。`ethtool -S`の
+# `*_allowance_exceeded`をベンチの前と後に読み、差を取ります。CPUに余裕があるのに遅いとき、
+# 帯域（bw_in/bw_out）・PPS・接続追跡（conntrack）のどの上限に当たったかを分けます。ENA以外のNICは
+# このcounterを持たないのでunavailable。
+name = "network-allowance-mark"
+phase = "before"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -eu
+command -v ethtool >/dev/null 2>&1 || exit 75
+snapshot=/tmp/isuscope-{run_id}.net-allowance.before
+: > "$snapshot"
+for path in /sys/class/net/*; do
+  device=${path##*/}
+  [ "$device" = lo ] && continue
+  { ethtool -S "$device" 2>/dev/null || sudo -n ethtool -S "$device" 2>/dev/null || true; } |
+    awk -v device="$device" '$1 ~ /_allowance_(exceeded|available):$/ { sub(/:$/, "", $1); print device, $1, $2 }' >> "$snapshot"
+done
+test -s "$snapshot" || { rm -f "$snapshot"; exit 75; }
+''']
+timeout_seconds = 15
+unavailable_exit_codes = [75]
+
+[[collectors]]
+# 前後の差をdevice・counterごとの`net.allowance_exceeded`にします。0も出すので、無かったことと
+# 測れなかったことを分けられます。`conntrack_allowance_available`は差ではなく後の値（残りの追跡枠）。
+# initializeも含みます。
+name = "network-allowance-delta"
+phase = "after"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -eu
+before=/tmp/isuscope-{run_id}.net-allowance.before
+after=/tmp/isuscope-{run_id}.net-allowance.after
+trap 'rm -f "$before" "$after"' EXIT
+test -r "$before" || exit 75
+: > "$after"
+for device in $(awk '{ print $1 }' "$before" | sort -u); do
+  { ethtool -S "$device" 2>/dev/null || sudo -n ethtool -S "$device" 2>/dev/null || true; } |
+    awk -v device="$device" '$1 ~ /_allowance_(exceeded|available):$/ { sub(/:$/, "", $1); print device, $1, $2 }' >> "$after"
+done
+test -s "$after" || exit 75
+awk '
+  function metric(name, value, unit, device, counter) {
+    printf "{\"type\":\"metric\",\"name\":\"%s\",\"value\":%.0f,\"unit\":\"%s\",\"labels\":{\"device\":\"%s\"%s}}\n", name, value, unit, device, counter == "" ? "" : ",\"counter\":\"" counter "\""
+  }
+  FNR == 1 { side++ }
+  side == 1 { old[$1, $2] = $3; next }
+  $2 ~ /_exceeded$/ {
+    # driverの再読み込みなどで数え直されていれば、今の値をそのまま使う。
+    metric("net.allowance_exceeded", $3 >= old[$1, $2] ? $3 - old[$1, $2] : $3, "packets", $1, $2)
+    next
+  }
+  $2 == "conntrack_allowance_available" { metric("net.conntrack_allowance_available", $3, "connections", $1, "") }
+' "$before" "$after"
+''']
+timeout_seconds = 15
 unavailable_exit_codes = [75]
 
 [[collectors]]
