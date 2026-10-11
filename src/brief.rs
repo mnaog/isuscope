@@ -30,6 +30,8 @@ pub struct BriefOutput {
     pub score_inputs: BriefSection<MetricQueryRow>,
     /// Parser-kept benchmark output lines: why it failed and what the errors were.
     pub benchmark_messages: BriefBenchmarkMessages,
+    /// 当たった、または近づいた接続・fdの上限を、設定の名前と証拠で示す。何も無ければ空。
+    pub limits: BriefSection<BriefLimit>,
     /// ベンチの間にアプリ（`service_units`）・nginxのerror log・kernelが出したエラーの型。多い順。
     pub logs: BriefSection<BriefLogPattern>,
     pub http: BriefSection<HttpRouteSummary>,
@@ -71,6 +73,7 @@ impl BriefOutput {
         self.coverage_issues.cut(rows);
         self.benchmark.cut(rows);
         self.score_inputs.cut(rows);
+        self.limits.cut(rows);
         self.logs.cut(rows);
         self.http.cut(rows);
         self.database.cut(rows);
@@ -444,6 +447,178 @@ impl<T> BriefSection<T> {
     }
 }
 
+/// 当たった（または80%以上まで使った）上限。`setting`は上げる設定の名前、`evidence`はそう判断した観測。
+#[derive(Debug, Serialize)]
+pub struct BriefLimit {
+    pub node: String,
+    pub setting: String,
+    pub evidence: String,
+}
+
+/// error logの文言と、それが示す上限。小文字で照合する。
+const LIMIT_SIGNATURES: &[(&[&str], &str)] = &[
+    (
+        &["too many open files", "emfile"],
+        "file descriptors (LimitNOFILE of the unit, nginx worker_rlimit_nofile)",
+    ),
+    (
+        &["worker_connections are not enough"],
+        "nginx worker_connections",
+    ),
+    (&["too many connections"], "MySQL max_connections"),
+    (
+        &["possible syn flooding"],
+        "listen backlog (nginx listen backlog=, net.core.somaxconn)",
+    ),
+    (
+        &["cannot assign requested address"],
+        "ephemeral ports (net.ipv4.ip_local_port_range, net.ipv4.tcp_tw_reuse)",
+    ),
+    (
+        &[
+            "upstream prematurely closed",
+            "connection reset by peer) while reading response header from upstream",
+        ],
+        "upstream connections (keepalive to the app, or the app closed them)",
+    ),
+    (
+        &[
+            "no live upstreams",
+            "connection refused) while connecting to upstream",
+        ],
+        "upstream availability (the app was down or refused connections)",
+    ),
+];
+/// nginxの`keepalive_requests`の既定値（1.19.10から1000、それより前は100）。
+const NGINX_KEEPALIVE_REQUESTS_DEFAULTS: [f64; 2] = [1000.0, 100.0];
+
+/// `limit.`（ベンチ前の上限値）と、logの型・listen overflow・接続数から`limits`欄を作る。
+/// 当たった証拠のあるものと、上限の80%以上まで使ったものだけを出す。
+pub fn attach_limits(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let mut found = BTreeMap::<(String, String), String>::new();
+    let mut values = BTreeMap::<(String, String), f64>::new();
+    let mut peaks = BTreeMap::<(String, String), f64>::new();
+    let mut overflows = BTreeMap::<String, f64>::new();
+    let mut nofile = BTreeMap::<String, Vec<String>>::new();
+    let mut log_hits = BTreeMap::<(String, &str), (u64, String)>::new();
+    for metric in metrics {
+        let node = label(metric, "node");
+        match metric.name.as_str() {
+            "limit.service_nofile" => nofile.entry(node).or_default().push(format!(
+                "{} {}",
+                label(metric, "service"),
+                metric.value
+            )),
+            name if name.starts_with("limit.") => {
+                values.insert((node, name.to_owned()), metric.value);
+            }
+            "host.tcp_listen_overflows" => *overflows.entry(node).or_default() += metric.value,
+            "host.tcp_established"
+            | "mysql.threads_connected"
+            | "client.connection_requests_max" => {
+                let peak = peaks.entry((node, metric.name.clone())).or_insert(0.0);
+                *peak = peak.max(metric.value);
+            }
+            "log.error_lines" => {
+                let text = format!("{} {}", label(metric, "pattern"), label(metric, "example"))
+                    .to_lowercase();
+                if let Some((_, setting)) = LIMIT_SIGNATURES
+                    .iter()
+                    .find(|(needles, _)| needles.iter().any(|needle| text.contains(needle)))
+                {
+                    let entry = log_hits
+                        .entry((node, setting))
+                        .or_insert((0, label(metric, "example")));
+                    entry.0 += metric.value as u64;
+                }
+            }
+            _ => {}
+        }
+    }
+    let value = |node: &str, name: &str| values.get(&(node.to_owned(), name.to_owned())).copied();
+    for (node, count) in &overflows {
+        if *count > 0.0 {
+            let somaxconn = value(node, "limit.somaxconn")
+                .map(|v| format!(" (somaxconn {v})"))
+                .unwrap_or_default();
+            found.insert(
+                (
+                    node.clone(),
+                    "listen backlog (nginx listen backlog=, net.core.somaxconn)".into(),
+                ),
+                format!("{count} TCP listen overflows during the run{somaxconn}"),
+            );
+        }
+    }
+    for ((node, setting), (count, example)) in log_hits {
+        let mut evidence = format!(
+            "{count} log lines: {}",
+            crate::model::excerpt(&example, 120).0
+        );
+        if setting.starts_with("file descriptors")
+            && let Some(limits) = nofile.get(&node)
+        {
+            evidence.push_str(&format!(" (LimitNOFILE: {})", limits.join(", ")));
+        }
+        found.entry((node, setting.to_owned())).or_insert(evidence);
+    }
+    for ((node, name), peak) in &peaks {
+        match name.as_str() {
+            "client.connection_requests_max" => {
+                let configured = value(node, "limit.nginx_keepalive_requests");
+                let hit = match configured {
+                    Some(limit) => *peak >= limit,
+                    None => NGINX_KEEPALIVE_REQUESTS_DEFAULTS.contains(peak),
+                };
+                if hit {
+                    found.insert(
+                        (node.clone(), "nginx keepalive_requests".into()),
+                        format!(
+                            "a client connection served {peak} requests, the keepalive_requests limit{}; nginx then closes it, and a request sent at that moment fails",
+                            configured.map(|_| String::new()).unwrap_or_else(|| " (nginx default)".into())
+                        ),
+                    );
+                }
+            }
+            "mysql.threads_connected" => {
+                if let Some(max) = value(node, "limit.mysql_max_connections")
+                    && *peak >= max * 0.8
+                {
+                    found.insert(
+                        (node.clone(), "MySQL max_connections".into()),
+                        format!("{peak} of {max} connections in use at the peak"),
+                    );
+                }
+            }
+            "host.tcp_established" => {
+                if let (Some(connections), Some(workers)) = (
+                    value(node, "limit.nginx_worker_connections"),
+                    value(node, "limit.nginx_workers"),
+                ) && *peak >= connections * workers * 0.8
+                {
+                    found.insert(
+                        (node.clone(), "nginx worker_connections".into()),
+                        format!(
+                            "{peak} established TCP connections at the peak against {connections} × {workers} worker connections (client and upstream connections both count)"
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let rows = found
+        .into_iter()
+        .map(|((node, setting), evidence)| BriefLimit {
+            node,
+            setting,
+            evidence,
+        })
+        .collect::<Vec<_>>();
+    brief.limits = section(rows, limit);
+}
+
 /// logの1つの型（数字を含む語を`<N>`へ置き換えた行）。briefには型の最初の1行だけを出す。
 /// 型そのものはほぼ同じ文の繰り返しになるので、`query --metric log.error_lines`で見る。
 #[derive(Debug, Serialize)]
@@ -660,6 +835,7 @@ pub fn build(
         score_inputs: section(score_inputs.rows, limit)
             .more(|| format!("isuscope query {short} --metric-prefix score. --limit 20")),
         benchmark_messages,
+        limits: section(Vec::new(), limit),
         logs: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
@@ -1644,6 +1820,108 @@ mod tests {
         assert_eq!(whole.more.as_deref(), Some("isuscope query y"));
         assert_eq!(window_flag(Some("load")), " --window load");
         assert_eq!(window_flag(None), "");
+    }
+
+    #[test]
+    fn limits_name_the_setting_behind_each_observed_limit() {
+        // practice-14のSSE化で順に当たった上限と、80%まで使った接続数。
+        let diagnostics = crate::report::diagnose(
+            test_run(),
+            Vec::new(),
+            Vec::new(),
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+        );
+        let options = || query::MetricQueryOptions {
+            scope: query::QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: None,
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        };
+        let empty = || query::metric_query("run".into(), Vec::new(), options());
+        let metric = |node: &str, name: &str, value: f64, labels: &[(&str, &str)]| Metric {
+            name: name.into(),
+            value,
+            unit: String::new(),
+            timestamp: None,
+            labels: labels
+                .iter()
+                .chain(&[("node", node)])
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        };
+        let mut brief = build(diagnostics, empty(), empty(), 10);
+        attach_limits(
+            &mut brief,
+            &[
+                metric(
+                    "app3",
+                    "log.error_lines",
+                    37.0,
+                    &[
+                        ("source", "isuride-rust.service"),
+                        ("example", "accept error: Too many open files (os error 24)"),
+                    ],
+                ),
+                metric(
+                    "app3",
+                    "limit.service_nofile",
+                    1024.0,
+                    &[("service", "isuride-rust.service")],
+                ),
+                metric("app1", "host.tcp_listen_overflows", 300.0, &[]),
+                metric("app1", "host.tcp_listen_overflows", 211.0, &[]),
+                metric("app1", "limit.somaxconn", 4096.0, &[]),
+                metric("app1", "client.connection_requests_max", 1000.0, &[]),
+                metric("app1", "limit.nginx_worker_connections", 4096.0, &[]),
+                metric("app1", "limit.nginx_workers", 2.0, &[]),
+                metric("app1", "host.tcp_established", 7000.0, &[]),
+                metric("app2", "mysql.threads_connected", 140.0, &[]),
+                metric("app2", "limit.mysql_max_connections", 151.0, &[]),
+                // Below 80% and an ordinary error: nothing to report.
+                metric("app2", "host.tcp_established", 100.0, &[]),
+                metric("app2", "limit.nginx_worker_connections", 4096.0, &[]),
+                metric("app2", "limit.nginx_workers", 2.0, &[]),
+                metric(
+                    "app2",
+                    "log.error_lines",
+                    5.0,
+                    &[("example", "invalid ride id")],
+                ),
+                metric("app2", "client.connection_requests_max", 640.0, &[]),
+            ],
+            10,
+        );
+        let rows = brief
+            .limits
+            .items
+            .iter()
+            .map(|row| {
+                (
+                    row.node.as_str(),
+                    row.setting.as_str(),
+                    row.evidence.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let find = |node: &str, setting: &str| {
+            rows.iter()
+                .find(|(n, s, _)| *n == node && s.starts_with(setting))
+                .map(|(_, _, evidence)| *evidence)
+                .unwrap_or_else(|| panic!("no {setting} on {node}: {rows:?}"))
+        };
+        assert!(find("app3", "file descriptors").contains("isuride-rust.service 1024"));
+        assert!(find("app1", "listen backlog").starts_with("511 TCP listen overflows"));
+        assert!(find("app1", "nginx keepalive_requests").contains("1000"));
+        assert!(find("app1", "nginx worker_connections").contains("7000"));
+        assert!(find("app2", "MySQL max_connections").contains("140 of 151"));
+        assert_eq!(rows.len(), 5, "{rows:?}");
     }
 
     #[test]

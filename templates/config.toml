@@ -71,6 +71,48 @@ command = ["sh", "-c", "test -x /usr/local/lib/isuscope/fingerprint.sh || exit 7
 timeout_seconds = 15
 unavailable_exit_codes = [75]
 
+# ベンチの前の上限値。briefの`limits`が、当たった証拠（logの型やlisten overflow）と並べて、
+# どの設定を上げればよいかを名前で出すのに使います。読むだけで、何も変えません。
+# practice-14では、fd 1024・listen backlog 511・worker_connections 4096・keepalive_requests 1000に
+# 順に当たり、そのたびにどの上限かを手で探しました。
+[[collectors]]
+name = "limits"
+phase = "before"
+transport = "ssh"
+command = ["sh", "-c", '''
+set -u
+emit() { printf '{"type":"metric","name":"%s","value":%s,"unit":"%s","labels":{%s}}\n' "$1" "$2" "$3" "${4:-}"; }
+number() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+value=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || true)
+number "$value" && emit limit.somaxconn "$value" connections
+if command -v nginx >/dev/null 2>&1; then
+  config=$(sudo -n nginx -T 2>/dev/null || true)
+  # httpやeventsでの最初の指定。keepalive_requestsはupstreamの中の指定（upstream側の再利用回数）を除く。
+  directive() {
+    printf '%s\n' "$config" | awk -v name="$1" '
+      /^[[:space:]]*upstream[[:space:]]/ { upstream = 1 }
+      upstream && /}/ { upstream = 0; next }
+      !upstream && $1 == name { value = $2; sub(/;.*$/, "", value); print value; exit }'
+  }
+  value=$(directive worker_connections); number "$value" && emit limit.nginx_worker_connections "$value" connections
+  value=$(directive worker_rlimit_nofile); number "$value" && emit limit.nginx_worker_rlimit_nofile "$value" files
+  value=$(directive keepalive_requests); number "$value" && emit limit.nginx_keepalive_requests "$value" requests
+  value=$(pgrep -c -f 'nginx: worker process' 2>/dev/null || true)
+  number "$value" && test "$value" -gt 0 && emit limit.nginx_workers "$value" processes
+fi
+for unit in {service_units}; do
+  value=$(systemctl show -p LimitNOFILESoft --value "$unit" 2>/dev/null || true)
+  number "$value" || value=$(systemctl show -p LimitNOFILE --value "$unit" 2>/dev/null || true)
+  number "$value" && emit limit.service_nofile "$value" files "\"service\":\"$unit\""
+done
+if command -v mysql >/dev/null 2>&1; then
+  value=$(sudo -n mysql -N -B -e "SHOW GLOBAL VARIABLES LIKE 'max_connections'" 2>/dev/null | awk '{print $2}' || true)
+  number "$value" && emit limit.mysql_max_connections "$value" connections
+fi
+exit 0
+''']
+timeout_seconds = 15
+
 # /procだけを使うため、remoteへの追加package導入なしで1秒ごとの基本host時系列を取ります。
 [[collectors]]
 name = "host-sampler"

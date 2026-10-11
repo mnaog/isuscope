@@ -120,3 +120,78 @@ fn digest_collector_splits_cumulative_snapshots_into_initialize_and_load() {
     // The node's temporary files are removed.
     assert!(!std::path::Path::new(&format!("{}.digest", prefix.display())).exists());
 }
+
+/// The template `limits` collector reads the limits before the benchmark: nginx's own (not the
+/// upstream's keepalive_requests), each service unit's open-file limit and MySQL's connections.
+#[cfg(unix)]
+#[test]
+fn limits_collector_reads_the_limits_without_changing_anything() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rendered = isuscope::init::render_config(&isuscope::init::ConfigOptions::default());
+    let config: toml::Value = toml::from_str(&rendered).unwrap();
+    let template = config["collectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|collector| collector["name"].as_str() == Some("limits"))
+        .unwrap()["command"][2]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    for (name, body) in [
+        ("sudo", "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n"),
+        (
+            "nginx",
+            "#!/bin/sh\nprintf 'events {\\n    worker_connections 4096;\\n}\\nhttp {\\nupstream app {\\n  keepalive_requests 100000;\\n}\\n    keepalive_requests 10000;\\n}\\n'\n",
+        ),
+        ("pgrep", "#!/bin/sh\necho 2\n"),
+        (
+            "systemctl",
+            "#!/bin/sh\n[ \"$3\" = LimitNOFILESoft ] && echo 1024 || echo 524288\n",
+        ),
+        ("mysql", "#!/bin/sh\nprintf 'max_connections\\t151\\n'\n"),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = Command::new("sh")
+        .args(["-c", &template.replace("{service_units}", "app.service")])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metrics = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|value| {
+            (
+                value["name"].as_str().unwrap().to_owned(),
+                value["value"].as_f64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (name, value) in [
+        ("limit.nginx_worker_connections", 4096.0),
+        ("limit.nginx_keepalive_requests", 10000.0),
+        ("limit.nginx_workers", 2.0),
+        ("limit.service_nofile", 1024.0),
+        ("limit.mysql_max_connections", 151.0),
+    ] {
+        assert!(
+            metrics.iter().any(|(n, v)| n == name && *v == value),
+            "{name} {value} missing: {metrics:?}"
+        );
+    }
+}

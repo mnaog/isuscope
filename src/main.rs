@@ -2343,6 +2343,24 @@ fn build_brief(
         extra.extend(store.query_metrics(&brief.summary.id, &[], Some(prefix), Some(false))?);
     }
     brief::attach_logs_and_database_io(&mut brief, &extra, limit);
+    // 上限：ベンチ前の値（limit.）、logの型、listen overflow、接続数のピーク。
+    let mut limits = extra
+        .into_iter()
+        .filter(|metric| metric.name == "log.error_lines")
+        .collect::<Vec<_>>();
+    limits.extend(store.query_metrics(&brief.summary.id, &[], Some("limit."), Some(false))?);
+    limits.extend(store.query_metrics(
+        &brief.summary.id,
+        &[
+            "host.tcp_listen_overflows".into(),
+            "host.tcp_established".into(),
+            "mysql.threads_connected".into(),
+            "client.connection_requests_max".into(),
+        ],
+        None,
+        None,
+    )?);
+    brief::attach_limits(&mut brief, &limits, limit);
     brief.review = Some(brief::review(review));
     brief::next_steps(&mut brief);
     Ok(brief)
