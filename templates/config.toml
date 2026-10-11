@@ -38,6 +38,16 @@ stream_output = false
 # 判断に使わないための設定です。当日のbenchmarkerの出力を見て決めます。
 # operator_line_pattern = "^\\[ADMIN\\]"
 
+# ベンチの前に毎回実行するcommand（collectorより前）。前のベンチが途中で切ったrequestの
+# transactionがinitializeを止めないよう、アプリを再起動してhealth checkを待つ、など。
+# 失敗するとベンチを始めずにFAILとして記録します。
+# prepare_command = [".isuscope/prepare.sh"]
+# prepare_timeout_seconds = 120
+
+# adapterが判定を保留した（pending）runを、保存済みの出力から確定するcommand（`isuscope rescore`）。
+# `{benchmark_stdout}`を読み、`isuscope.result`を1行出します。
+# rescore_command = [".isuscope/benchmark.sh", "--extract", "{benchmark_stdout}"]
+
 # 問題固有の件数などがbenchmark stdoutに現れる場合に有効化します。
 # parserはベンチ終了後に実行され、保存済みrunへ`isuscope enrich`で再適用できます。
 # [[benchmark.parsers]]

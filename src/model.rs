@@ -30,6 +30,9 @@ pub enum RunState {
     Degraded,
     Failed,
     Aborted,
+    /// The benchmark ran but the adapter could not judge its output yet (no verified sample);
+    /// `isuscope rescore` sets the result.
+    Pending,
 }
 
 impl RunState {
@@ -40,6 +43,7 @@ impl RunState {
             Self::Degraded => "degraded",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
+            Self::Pending => "pending",
         }
     }
 }
@@ -148,6 +152,9 @@ pub struct BenchmarkResult {
     pub exit_code: Option<i32>,
     pub score: Option<i64>,
     pub passed: Option<bool>,
+    /// The adapter ran the benchmark but left the score and verdict to `isuscope rescore`.
+    #[serde(default)]
+    pub pending: bool,
     #[serde(default)]
     pub interrupted: bool,
     pub messages: Vec<String>,
@@ -403,6 +410,7 @@ impl RunManifest {
             .any(|enrichment| enrichment.status == "failed");
         self.state = match self.benchmark.passed {
             _ if self.benchmark.interrupted => RunState::Aborted,
+            None if self.benchmark.pending => RunState::Pending,
             Some(true) if collector_degraded || enrichment_degraded => RunState::Degraded,
             Some(true) => RunState::Complete,
             _ => RunState::Failed,
@@ -423,7 +431,7 @@ impl RunManifest {
     /// Why a run did not pass: the parsers' failure lines, or isuscope's own error when the
     /// benchmark produced none (for example the command exited before printing anything).
     pub fn failure_reasons(&self) -> Vec<String> {
-        if self.benchmark.passed == Some(true) {
+        if self.benchmark.passed == Some(true) || self.benchmark.pending {
             return Vec::new();
         }
         let parsed = self

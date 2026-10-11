@@ -17,6 +17,15 @@ isuscope brief latest
 isuscope analyze RUN_ID supported --analysis "初期状態を記録できた"
 ```
 
+初回は、ベンチ出力の形が分からずadapterがscoreと合否を読み取れないことがあります。そのときadapterは判定を保留（`{"type":"isuscope.result","pending":true}`）でき、runは`pending`で残ります。全collectorの計測はそのまま使えます。保存された出力（`logs/benchmark-stdout.zst`）でadapterの読み取りを確かめてから、`isuscope rescore`で同じ出力を読み直して確定します。確定するまで次のベンチは始まりません。
+
+```console
+isuscope survey-run --hypothesis "初期状態の負荷構造を記録する"   # result PENDING
+isuscope rescore latest                                            # result PASS / score
+```
+
+`[benchmark] prepare_command`は、毎回のベンチの前（collectorより前）に実行されます。前のベンチが途中で切ったrequestのtransactionがinitializeを止めないよう、アプリを再起動してhealth checkを待つ、などに使います。失敗するとベンチを始めずにFAILとして記録し、出力は`benchmark-prepare`のlogに残ります。
+
 環境を受け入れた後は、仮説付きの`run`を改善ごとに繰り返します。
 
 ```console
@@ -120,6 +129,7 @@ isuscope doctor
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
+| `rescore` | adapterが判定を保留した（pending）runを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定する |
 
 `list`、`brief`、`series`、`query`、`sql`、`change`は機械処理しやすいJSONを返します（`schema_version`は2。表を`columns`と`rows`で出す形になったときに上げました）。どの出力も同じ約束で書きます。
 

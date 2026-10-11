@@ -166,6 +166,18 @@ pub struct BenchmarkConfig {
     pub parsers: Vec<BenchmarkParserConfig>,
     /// Saved real benchmark stdout; `doctor` runs every parser against it.
     pub sample_output: Option<PathBuf>,
+    /// Runs before any collector and the benchmark, for example to restart the application so
+    /// that transactions left open by an earlier, interrupted benchmark cannot block initialize.
+    /// A failure records the run as not started.
+    #[serde(default)]
+    pub prepare_command: Vec<String>,
+    #[serde(default = "default_prepare_timeout")]
+    pub prepare_timeout_seconds: u64,
+    /// Reads the saved stdout of a run whose result the adapter left pending, once the adapter
+    /// can judge it (`isuscope rescore`). Takes the same placeholders as parsers, such as
+    /// `{benchmark_stdout}`, and prints one `isuscope.result`.
+    #[serde(default)]
+    pub rescore_command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -331,6 +343,9 @@ fn default_unavailable_exit_codes() -> Vec<i32> {
 }
 fn default_parser_timeout() -> u64 {
     30
+}
+fn default_prepare_timeout() -> u64 {
+    120
 }
 fn default_parser_output_bytes() -> u64 {
     16 * 1024 * 1024

@@ -15,6 +15,10 @@ set -euo pipefail
 #      起動・認証・poll・parseなどアダプター自体の失敗時だけnon-zeroで終了する。
 #      passはベンチ自身の判定（ISUCON12なら`[PASSED]: true`）から作る。終了コードからは作らない。
 #      passが無いrunはPASSと推測せず、判定不明（UNKNOWN）として記録する。
+#   4. 実際の出力でscoreと合否の読み取りを確かめる前（初回）は、判定せずに保留してよい。
+#      {"type":"isuscope.result","pending":true,"messages":["no verified sample yet"]}
+#      runはpendingで残り、次のベンチは止まる。この出力で読み取りを確かめてから、
+#      `isuscope rescore <run>`が`[benchmark] rescore_command`で同じ出力を読み直して確定する。
 #
 # 任意のinitialize境界:
 #   printf '%s\n' '{"type":"isuscope.event","name":"initialize-started"}'

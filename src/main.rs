@@ -8,6 +8,7 @@ use isuscope::{
     model::{AnalysisVerdict, RunManifest, RunMode},
     query::{self, DatabaseQueryOptions, HttpQueryOptions, MetricQueryOptions, QueryScope},
     report::{self, RunDiagnostics},
+    result_commands,
     runner::{self, RunAnnotations},
     shutdown::Shutdown,
     storage::{RunSummary, Store},
@@ -200,6 +201,11 @@ enum Commands {
     },
     /// 保存済みbenchmark logへ現在のparserを適用します。
     Enrich {
+        /// run ID、一意な短縮ID、または一意なtagを指定します。
+        run: String,
+    },
+    /// adapterが判定を保留したrunを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定します。
+    Rescore {
         /// run ID、一意な短縮ID、または一意なtagを指定します。
         run: String,
     },
@@ -676,6 +682,37 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 }
             );
             Ok(!outcome.failed)
+        }
+        Commands::Rescore { run } => {
+            let outcome = result_commands::rescore(&config, &run).await?;
+            let manifest = &outcome.manifest;
+            println!("run       {}", runner::short_id(&manifest.id));
+            println!(
+                "result    {}",
+                if manifest.benchmark.passed == Some(true) {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
+            );
+            println!(
+                "score     {}",
+                manifest
+                    .benchmark
+                    .score
+                    .map(|score| score.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            println!("state     {}", manifest.state.as_str());
+            println!("analysis  {}", manifest.analysis_status.as_str());
+            if manifest.analysis_status == isuscope::model::AnalysisStatus::Pending {
+                println!();
+                println!(
+                    "next      isuscope analyze {} <supported|rejected|inconclusive> --analysis <text>",
+                    runner::short_id(&manifest.id)
+                );
+            }
+            Ok(true)
         }
         Commands::Doctor => {
             let report = doctor::run(&config).await?;
