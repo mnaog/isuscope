@@ -102,3 +102,5 @@ mod score_inputs;
 mod slow_log;
 #[path = "e2e/sql.rs"]
 mod sql;
+#[path = "e2e/statement_digest.rs"]
+mod statement_digest;

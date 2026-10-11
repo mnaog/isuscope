@@ -1067,12 +1067,133 @@ done
 ''']
 unavailable_exit_codes = [75]
 
+# performance_schemaのstatement digestで、SQLの回数・時間・lock・検査行数をinitializeと負荷の区間に分けます。
+# slow log（long_query_time=0）は全文を書くのでベンチ中のDBの負荷になり、ベンチの後のslpの集計も
+# 1回で数十秒かかります（practice-14の序盤では後処理37.7秒のうち27秒）。ここでは、ベンチの前にdigest表を
+# 空にし、ベンチの間は1秒ごとに累積値をnodeの一時fileへ写し、ベンチの後に区間ごとの差を出します。
+# 出力はslpと同じ形なので、briefとqueryのdatabase viewはそのまま使えます（両方あればこちらを使います）。
+# p95・p99・最大は、ベンチ全体（initializeを含む）の分布です。
+[[collectors]]
+name = "mysql-digest-start"
+phase = "before"
+transport = "ssh"
+roles = ["db", "mysql"]
+preflight = ["sh", "-c", "sudo -n mysql -N -B -e \"SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME='statements_digest'\" 2>/dev/null | grep -qx YES || { echo 'performance_schema statement digests are unavailable (MariaDB or performance_schema=OFF); turn the slow log on instead'; exit 75; }; echo statement digests enabled"]
+command = ["sh", "-c", '''
+set -eu
+command -v mysql >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 || exit 75
+enabled=$(sudo -n mysql -N -B -e "SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME='statements_digest'" 2>/dev/null) || exit 75
+test "$enabled" = YES || exit 75
+rm -f /tmp/isuscope-{run_id}.digest
+# 表を空にすると、分位（QUANTILE_95など）もこのrunだけの分布になる（histogram表も一緒に空になる）。
+sudo -n mysql -e 'TRUNCATE TABLE performance_schema.events_statements_summary_by_digest'
+echo statement digests reset
+''']
+unavailable_exit_codes = [75]
+timeout_seconds = 15
+
+[[collectors]]
+name = "mysql-digest-sampler"
+phase = "during"
+transport = "ssh"
+roles = ["db", "mysql"]
+command = ["sh", "-c", '''
+set -eu
+command -v mysql >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 || exit 75
+out=/tmp/isuscope-{run_id}.digest
+trap 'exit 0' HUP INT TERM
+# 累積値だけを写す（digestの数だけの行）。区間への振り分けはベンチの後に行う。
+while :; do
+  now=$(date +%s.%N)
+  rows=$(sudo -n mysql -N -B -e 'SELECT DIGEST, COUNT_STAR, SUM_TIMER_WAIT, SUM_LOCK_TIME, SUM_ROWS_SENT, SUM_ROWS_EXAMINED FROM performance_schema.events_statements_summary_by_digest WHERE DIGEST IS NOT NULL' 2>/dev/null) || exit 75
+  printf 'T\t%s\n%s\n' "$now" "$rows" >> "$out"
+  sleep 1
+done
+''']
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "mysql-digest"
+phase = "after"
+transport = "ssh"
+roles = ["db", "mysql"]
+command = ["sh", "-c", '''
+set -eu
+snapshots=/tmp/isuscope-{run_id}.digest
+final=/tmp/isuscope-{run_id}.digest.final
+trap 'rm -f "$snapshots" "$final"' EXIT
+test -r "$snapshots" || exit 75
+command -v mysql >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 || exit 75
+# 文の形・最大・分位はベンチの後の累積から取る。分位の列はMySQL 8.0から。
+sudo -n mysql -N -B -e 'SELECT DIGEST, MAX_TIMER_WAIT, QUANTILE_95, QUANTILE_99, DIGEST_TEXT FROM performance_schema.events_statements_summary_by_digest WHERE DIGEST IS NOT NULL' > "$final" 2>/dev/null ||
+  sudo -n mysql -N -B -e "SELECT DIGEST, MAX_TIMER_WAIT, '', '', DIGEST_TEXT FROM performance_schema.events_statements_summary_by_digest WHERE DIGEST IS NOT NULL" > "$final"
+# 区間は[ベンチの始まり, 終わり)。終わりより後の写し（ベンチの後の定期処理など）は使わない。
+# 負荷の始まり以前で最後の写しまでをinitialize、そこから終わりまでをloadにする。始まりが分からなければwhole。
+# 5秒bucketの数と時間も出す（slpと同じく負荷の始まりから区切る）。時間はpicosecondなので1e12で割る。
+awk -F '\t' -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='{benchmark_finished_at}' '
+  BEGIN { origin = (load_start != "") ? load_start + 0 : ((begin != "") ? begin + 0 : 0) }
+  function bucket_end(t,   offset, index5) {
+    offset = (t - origin) / 5; index5 = int(offset); if (index5 > offset) index5--
+    return origin + (index5 + 1) * 5
+  }
+  function bucket_of(t,   start) {
+    start = bucket_end(t) - 5
+    if (begin != "" && t >= begin + 0 && start < begin + 0) start = begin + 0
+    return sprintf("%.6f", start)
+  }
+  function seconds(value) { return (value == "" || value == "NULL") ? "" : sprintf("%.9f", value / 1e12) }
+  function emit(window, digest, count, wait, lock, sent, examined,   query) {
+    if (count <= 0) return
+    query = (digest in text) ? text[digest] : "digest " digest
+    printf "%s\t%.0f\t%s\t%.9f\t%s\t%s\t%s\t%.9f\t%.0f\t%.0f\n", window, count, query, wait / 1e12,
+      seconds(maxw[digest]), seconds(p95[digest]), seconds(p99[digest]), lock / 1e12, sent, examined
+  }
+  FNR == NR { maxw[$1] = $2; p95[$1] = $3; p99[$1] = $4; text[$1] = $5; next }
+  $1 == "T" { at = $2 + 0; late = (end != "" && at > end + 0); if (!late) snapshots++; next }
+  late { next }
+  {
+    digest = $1
+    delta = $2 - calls[digest]
+    if (delta > 0) {
+      bucket = bucket_of(at)
+      bucket_calls[bucket] += delta
+      bucket_wait[bucket] += $3 - wait[digest]
+      bucket_lock[bucket] += $4 - lock[digest]
+    }
+    calls[digest] = $2; wait[digest] = $3; lock[digest] = $4; sent[digest] = $5; examined[digest] = $6
+    if (load_start != "" && at <= load_start + 0) {
+      init_calls[digest] = $2; init_wait[digest] = $3; init_lock[digest] = $4
+      init_sent[digest] = $5; init_examined[digest] = $6
+    }
+  }
+  END {
+    for (digest in calls) {
+      if (load_start == "") {
+        emit("whole", digest, calls[digest], wait[digest], lock[digest], sent[digest], examined[digest])
+        continue
+      }
+      emit("initialize", digest, init_calls[digest], init_wait[digest], init_lock[digest], init_sent[digest], init_examined[digest])
+      emit("load", digest, calls[digest] - init_calls[digest], wait[digest] - init_wait[digest],
+        lock[digest] - init_lock[digest], sent[digest] - init_sent[digest], examined[digest] - init_examined[digest])
+    }
+    for (bucket in bucket_calls) {
+      printf "{\"type\":\"metric\",\"name\":\"db.calls\",\"value\":%.0f,\"unit\":\"queries\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%s}\n", bucket_calls[bucket], bucket
+      printf "{\"type\":\"metric\",\"name\":\"db.duration\",\"value\":%.3f,\"unit\":\"ms\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%s}\n", bucket_wait[bucket] / 1e9, bucket
+      printf "{\"type\":\"metric\",\"name\":\"db.lock_duration\",\"value\":%.3f,\"unit\":\"ms\",\"labels\":{\"engine\":\"mysql\"},\"timestamp\":%s}\n", bucket_lock[bucket] / 1e9, bucket
+    }
+    printf "{\"type\":\"metric\",\"name\":\"db.digest_snapshots\",\"value\":%d,\"unit\":\"snapshots\",\"labels\":{\"engine\":\"mysql\"}}\n", snapshots
+  }' "$final" "$snapshots"
+''']
+parser = "slp-windows"
+unavailable_exit_codes = [75]
+timeout_seconds = 60
+
 [[collectors]]
 name = "mysql-log-mark"
 phase = "before"
 transport = "ssh"
 roles = ["db", "mysql"]
-preflight = ["sh", "-c", "command -v sha256sum >/dev/null || { echo sha256sum missing; exit 1; }; sudo -n test -r @@MYSQL_SLOW_LOG@@ && echo readable via sudo @@MYSQL_SLOW_LOG@@"]
+preflight = ["sh", "-c", "command -v sha256sum >/dev/null || { echo sha256sum missing; exit 1; }; sudo -n test -e @@MYSQL_SLOW_LOG@@ || { echo 'slow log is off (statement digests are used)'; exit 75; }; sudo -n test -r @@MYSQL_SLOW_LOG@@ && echo readable via sudo @@MYSQL_SLOW_LOG@@"]
 command = ["sh", "-c", '''
 set -eu
 log=@@MYSQL_SLOW_LOG@@
@@ -1217,7 +1338,7 @@ name = "slp"
 phase = "after"
 transport = "ssh"
 roles = ["db", "mysql"]
-preflight = ["sh", "-c", "command -v slp >/dev/null 2>&1 || { echo 'slp is not installed; install it with the Ansible observability role'; exit 1; }; echo slp available"]
+preflight = ["sh", "-c", "sudo -n test -e @@MYSQL_SLOW_LOG@@ || { echo 'slow log is off (statement digests are used)'; exit 75; }; command -v slp >/dev/null 2>&1 || { echo 'slp is not installed; install it with the Ansible observability role'; exit 1; }; echo slp available"]
 command = ["sh", "-c", '''
 set -eu
 input=/tmp/isuscope-{run_id}.mysql.log

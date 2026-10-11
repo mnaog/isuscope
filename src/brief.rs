@@ -787,6 +787,16 @@ fn preferred_database(
     run: &crate::model::RunManifest,
 ) -> (Vec<DatabaseSummary>, usize, Option<String>) {
     let total_count = database.len();
+    // performance_schemaのdigestから集計した行があれば、slow log（slp）の行は使わない。同じ文を
+    // 2つのsourceで数えて並べないため。
+    let database = if database.iter().any(|item| item.source == "mysql-digest") {
+        database
+            .into_iter()
+            .filter(|item| item.source == "mysql-digest")
+            .collect()
+    } else {
+        database
+    };
     // slp collectorが区間に分けて集計したrun。行が1つも無くても、slpが成功していれば区間は決まる。
     let windowed = database.iter().any(|item| item.window.is_some())
         || (database.is_empty() && crate::report::supports_database_windows(run, &[]));
@@ -1401,6 +1411,39 @@ mod tests {
         // slpが成功して1行も無いrunも、負荷区間は0件として出す。
         let (rows, _, window) = preferred_database(Vec::new(), &run);
         assert_eq!((rows.len(), window.as_deref()), (0, Some("load")));
+    }
+
+    #[test]
+    fn database_prefers_statement_digests_over_the_slow_log() {
+        // slow logとperformance_schemaの両方で数えたrunでは、同じ文を2行並べない。
+        let row = |source: &str| DatabaseSummary {
+            node: "db1".into(),
+            engine: "mysql".into(),
+            digest: "SELECT * FROM t WHERE id = ?".into(),
+            source: source.into(),
+            window: Some("load".into()),
+            calls: 100.0,
+            ..Default::default()
+        };
+        let run: crate::model::RunManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 6, "id": "r", "mode": "run", "state": "complete",
+            "started_at": "2026-09-19T00:00:00Z", "finished_at": null,
+            "source": {"repository": ".", "git_available": false, "commit_hash": null,
+                "branch": null, "dirty": false, "state_sha256": "", "untracked": [], "error": null},
+            "benchmark": {"mode": "command", "command": [], "exit_code": 0, "score": 1,
+                "passed": true, "messages": [], "initialize_started_at": "2026-09-19T00:00:01Z",
+                "initialize_finished_at": "2026-09-19T00:00:10Z", "error": null},
+            "collectors": [], "logs": [], "metric_count": 0, "transition_count": 0
+        }))
+        .unwrap();
+        let (rows, omitted, window) =
+            preferred_database(vec![row("slp"), row("mysql-digest")], &run);
+        assert_eq!(window.as_deref(), Some("load"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "mysql-digest");
+        assert_eq!(omitted, 1);
+        let (rows, _, _) = preferred_database(vec![row("slp")], &run);
+        assert_eq!(rows[0].source, "slp");
     }
 
     #[test]
