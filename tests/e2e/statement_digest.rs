@@ -365,3 +365,68 @@ fn slow_log_preflights_follow_whether_statement_digests_carry_the_sql() {
         "an existing slow log is used"
     );
 }
+
+/// The digest sampler writes to a file, not stdout, so a lost ssh session never stops it
+/// (practice-14-forth: twenty leftover samplers per node used about 40% of the CPU). It stops
+/// once the after collector or the cleanup has removed the snapshots it wrote.
+#[cfg(unix)]
+#[test]
+fn digest_sampler_stops_when_its_snapshots_are_removed() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let rendered = isuscope::init::render_config(&isuscope::init::ConfigOptions::default());
+    let config: toml::Value = toml::from_str(&rendered).unwrap();
+    let script = config["collectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|collector| collector["name"].as_str() == Some("mysql-digest-sampler"))
+        .unwrap()["command"][2]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    for (name, body) in [
+        ("sudo", "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n"),
+        ("mysql", "#!/bin/sh\nprintf 'd1\\t1\\t1\\t0\\t0\\t0\\n'\n"),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let prefix = directory.path().join("isuscope-t");
+    let snapshots = std::path::PathBuf::from(format!("{}.digest", prefix.display()));
+    let mut sampler = Command::new("sh")
+        .args([
+            "-c",
+            &script.replace("/tmp/isuscope-{run_id}", prefix.to_str().unwrap()),
+        ])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !snapshots.exists() {
+        assert!(Instant::now() < deadline, "the sampler wrote no snapshot");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fs::remove_file(&snapshots).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = sampler.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = sampler.kill();
+            panic!("the sampler kept running after its snapshots were removed");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success());
+    assert!(!snapshots.exists(), "the sampler recreated its snapshots");
+}

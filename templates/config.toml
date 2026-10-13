@@ -1238,13 +1238,20 @@ command -v mysql >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1 || exit 75
 out=/tmp/isuscope-{run_id}.digest
 trap 'exit 0' HUP INT TERM
 # 累積値だけを写す（digestの数だけの行）。区間への振り分けはベンチの後に行う。
+# stdoutへ書かないので、sshが切れてもSIGPIPEで止まらない（非ttyのsshではHUPも来ない）。
+# 書いた写しが消えたら（after collectorか中断時のcleanupが消した）runは終わっているので止まる
+# （practice-14-forthで、止まらないsamplerが1nodeに20本残り、CPUの約4割を使った）。
+# 読む間に消えた写しを書き足して作り直さないよう、書く直前に確かめる。
+written=
 while :; do
   now=$(date +%s.%N)
   rows=$(sudo -n mysql -N -B -e 'SELECT DIGEST, COUNT_STAR, SUM_TIMER_WAIT, SUM_LOCK_TIME, SUM_ROWS_SENT, SUM_ROWS_EXAMINED FROM performance_schema.events_statements_summary_by_digest WHERE DIGEST IS NOT NULL' 2>/dev/null) || exit 75
   # prepared statementは接続ごとの行なので、SQL文ごとに足す。接続が閉じると行ごと消えるので、
   # 文の本文もここで写しておく（ベンチの後には残っていないことがある）。
   prepared=$(sudo -n mysql -N -B -e "SELECT CONCAT('ps:', MD5(SQL_TEXT)), SUM(COUNT_EXECUTE), SUM(SUM_TIMER_EXECUTE), SUM(SUM_LOCK_TIME), SUM(SUM_ROWS_SENT), SUM(SUM_ROWS_EXAMINED), ANY_VALUE(SQL_TEXT) FROM performance_schema.prepared_statements_instances GROUP BY 1" 2>/dev/null) || prepared=
+  if [ -n "$written" ] && [ ! -e "$out" ]; then exit 0; fi
   printf 'T\t%s\n%s\n%s\n' "$now" "$rows" "$prepared" >> "$out"
+  written=1
   sleep 1
 done
 ''']
