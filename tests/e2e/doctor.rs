@@ -272,3 +272,50 @@ initialize_finish_marker = "初期化処理が成功しました！"
     );
     assert!(output.contains("✓ benchmark initialize_finish_marker appears in the sample"));
 }
+
+/// practice-12-sixth: the windows came from the access log ([initialize] in routes.toml), and
+/// doctor still warned on every check that the default output markers were not in the sample.
+#[test]
+fn doctor_does_not_ask_for_output_markers_when_routes_name_the_initialize_request() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        project.path().join("sample.log"),
+        "[SCORE] 64\n[PASSED]: true\n",
+    )
+    .unwrap();
+    let config = r#"
+[benchmark]
+mode = "external"
+sample_output = "sample.log"
+"#;
+    fs::write(config_dir.join("config.toml"), config).unwrap();
+    let doctor = |project: &std::path::Path| {
+        let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .arg("doctor")
+            .current_dir(project)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let without = doctor(project.path());
+    assert!(
+        without.contains("! benchmark initialize_start_marker")
+            && without.contains("[initialize] method and path"),
+        "{without}"
+    );
+    fs::write(
+        config_dir.join("routes.toml"),
+        "[initialize]\nmethod = \"POST\"\npath = \"/initialize\"\n",
+    )
+    .unwrap();
+    let with = doctor(project.path());
+    assert!(
+        with.contains(
+            "✓ initialize/load windows come from the access log ([initialize] POST /initialize"
+        ),
+        "{with}"
+    );
+    assert!(!with.contains("initialize_start_marker"), "{with}");
+}

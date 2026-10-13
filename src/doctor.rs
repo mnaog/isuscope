@@ -544,7 +544,7 @@ fn check_initialize_markers(config: &LoadedConfig, report: &mut DoctorReport) {
         return;
     };
     let text = String::from_utf8_lossy(&bytes);
-    for (key, marker) in [
+    let markers = [
         (
             "initialize_start_marker",
             &benchmark.initialize_start_marker,
@@ -553,12 +553,34 @@ fn check_initialize_markers(config: &LoadedConfig, report: &mut DoctorReport) {
             "initialize_finish_marker",
             &benchmark.initialize_finish_marker,
         ),
-    ] {
+    ];
+    if markers
+        .iter()
+        .all(|(_, marker)| text.contains(marker.as_str()))
+    {
+        for (key, marker) in markers {
+            report.pass(format!("benchmark {key} appears in the sample: {marker}"));
+        }
+        return;
+    }
+    // Without the markers, the window split comes from the access log when routes.toml names the
+    // initialize request (the `boundary` collector); the markers are then not needed at all.
+    let routes = config.project_root.join(".isuscope/routes.toml");
+    if let Ok(Some(route)) =
+        crate::transition::initialize_route(routes.is_file().then_some(routes.as_path()))
+    {
+        report.pass(format!(
+            "initialize/load windows come from the access log ([initialize] {} {} in routes.toml); the output markers are not needed",
+            route.method, route.path
+        ));
+        return;
+    }
+    for (key, marker) in markers {
         if text.contains(marker.as_str()) {
             report.pass(format!("benchmark {key} appears in the sample: {marker}"));
         } else {
             report.warn(format!(
-                "benchmark {key} `{marker}` is not in {}; set [benchmark] {key} to this contest's text or initialize/load windows will be missing",
+                "benchmark {key} `{marker}` is not in {}; set [benchmark] {key} to this contest's text, or name the initialize request in routes.toml ([initialize] method and path), or initialize/load windows will be missing",
                 sample.display()
             ));
         }
