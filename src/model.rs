@@ -329,7 +329,7 @@ pub struct LogRef {
     pub node: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CollectorResult {
     pub name: String,
     pub node: Option<String>,
@@ -338,6 +338,12 @@ pub struct CollectorResult {
     pub exit_code: Option<i32>,
     pub error: Option<String>,
     pub log_ids: Vec<String>,
+    /// 起動した時刻。起動できなかったcollectorには無い。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// 起動からlogの取り込み・解析を終えるまで。during collectorはベンチの間も含む。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +389,19 @@ pub struct EnrichmentResult {
     /// Messages dropped by the per-kind and per-category sample limits.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub omitted_message_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// runの各段階にかかった時間。並行に動く段階（benchmark parsersとafter collectorなど）は
+/// 区間が重なる。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageTiming {
+    pub name: String,
+    pub started_at: DateTime<Utc>,
+    pub duration_ms: u64,
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -475,6 +494,8 @@ pub struct RunManifest {
     /// 無ければ`structured.json.zst`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<StageTiming>,
 }
 
 #[cfg(test)]

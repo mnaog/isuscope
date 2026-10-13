@@ -297,8 +297,9 @@ impl Store {
             )?;
         }
         for metric in metrics {
-            transaction.execute(
+            transaction.prepare_cached(
                 "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?.execute(
                 params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
             )?;
         }
@@ -798,8 +799,9 @@ impl Store {
                 )?;
             }
             for metric in &output.metrics {
-                transaction.execute(
+                transaction.prepare_cached(
                     "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?.execute(
                     params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
                 )?;
             }
@@ -1049,8 +1051,9 @@ impl Store {
             )?;
         }
         for metric in metrics {
-            transaction.execute(
+            transaction.prepare_cached(
                 "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?.execute(
                 params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
             )?;
         }
@@ -1584,6 +1587,7 @@ mod tests {
             fingerprint_count: 0,
             transition_count: 0,
             structured_snapshot: None,
+            stages: Vec::new(),
         };
         store.begin(&manifest).unwrap();
         drop(store);

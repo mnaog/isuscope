@@ -274,6 +274,11 @@ pub struct CollectorConfig {
     pub roles: Vec<String>,
     #[serde(default)]
     pub modes: Vec<RunMode>,
+    /// Collectors on the same node and phase with the same `sequence` run one at a time in
+    /// configured order; different sequences run in parallel. Collectors without one share a
+    /// single sequence per node.
+    #[serde(default)]
+    pub sequence: Option<String>,
     pub command: Vec<String>,
     /// Optional adapter for a standard tool's native stdout.
     pub parser: Option<CollectorParser>,

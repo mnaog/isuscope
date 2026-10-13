@@ -16,7 +16,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::process::{Child, Command};
 use tokio::{
@@ -42,7 +43,16 @@ pub struct RunningCollector {
     stderr_path: PathBuf,
     stdout_capture: JoinHandle<Result<bool>>,
     stderr_capture: JoinHandle<Result<bool>>,
+    started_at: chrono::DateTime<Utc>,
+    started: Instant,
 }
+
+/// A node and a collector `sequence` (or none).
+type QueueKey = (String, Option<String>);
+
+/// 1 nodeへ同時に走らせるcollectorの上限。sshdは認証前の接続が`MaxStartups`の既定（10）を
+/// 超えると新しい接続を落とし始めるので、それより少なく抑える。
+const MAX_CONCURRENT_PER_NODE: usize = 8;
 
 pub async fn cleanup_abandoned(config: &LoadedConfig, run_ids: &[String]) {
     for run_id in run_ids {
@@ -106,10 +116,11 @@ pub fn selected(
     })
 }
 
-/// Runs a phase with one queue per node, and the queues in parallel. Collectors on the same
-/// node keep their configured order, because they hand work to each other there (perf-stop
-/// before perf-report, a log mark before its delta). Local collectors run last and in order,
-/// since they read what the node collectors just brought back.
+/// Runs a phase with one queue per node and `sequence`, and the queues in parallel. Collectors
+/// in the same queue keep their configured order, because they hand work to each other there
+/// (perf-stop before perf-series, a log mark before its delta). Collectors without a `sequence`
+/// share one queue per node. Local collectors run last and in order, since they read what the
+/// node collectors just brought back.
 pub async fn run_phase(
     config: &LoadedConfig,
     mode: RunMode,
@@ -119,7 +130,7 @@ pub async fn run_phase(
     shutdown: Option<Shutdown>,
 ) -> Vec<CollectorOutput> {
     let mut outputs = Vec::new();
-    let mut queues: Vec<(String, Vec<(usize, ExecutionSpec)>)> = Vec::new();
+    let mut queues: Vec<(QueueKey, Vec<(usize, ExecutionSpec)>)> = Vec::new();
     let mut local: Vec<(usize, ExecutionSpec)> = Vec::new();
     let mut order = 0;
     for collector in selected(config, mode, phase) {
@@ -133,10 +144,10 @@ pub async fn run_phase(
                     match &spec.node {
                         None => local.push((order, spec)),
                         Some(node) => {
-                            let name = node.name.clone();
-                            match queues.iter_mut().find(|(queue, _)| *queue == name) {
+                            let key = (node.name.clone(), collector.sequence.clone());
+                            match queues.iter_mut().find(|(queue, _)| *queue == key) {
                                 Some((_, queue)) => queue.push((order, spec)),
-                                None => queues.push((name, vec![(order, spec)])),
+                                None => queues.push((key, vec![(order, spec)])),
                             }
                         }
                     }
@@ -146,13 +157,19 @@ pub async fn run_phase(
         }
     }
 
+    let mut limits = BTreeMap::<String, Arc<tokio::sync::Semaphore>>::new();
     let mut running = tokio::task::JoinSet::new();
-    for (_, queue) in queues {
+    for ((node, _), queue) in queues {
         let run_dir = run_dir.to_path_buf();
         let shutdown = shutdown.clone();
+        let limit = limits
+            .entry(node)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PER_NODE)))
+            .clone();
         running.spawn(async move {
             let mut results = Vec::with_capacity(queue.len());
             for (order, spec) in queue {
+                let _permit = limit.acquire().await;
                 results.push((order, run_once(spec, &run_dir, shutdown.clone()).await));
             }
             results
@@ -203,29 +220,36 @@ pub async fn start_during(
     (running, failed_outputs)
 }
 
+/// Stops every during collector at once. One at a time, the SIGTERM grace period and the log
+/// compression and parsing add up over every collector on every node. Outputs keep the order
+/// the collectors were started in.
 pub async fn stop_during(running: Vec<RunningCollector>, run_dir: &Path) -> Vec<CollectorOutput> {
-    let mut outputs = Vec::new();
-    for mut collector in running {
-        let already_finished = collector.child.try_wait().ok().flatten();
-        let (status, intentionally_stopped) = match already_finished {
-            Some(status) => (Some(status), false),
-            None => (
-                process::terminate_group(&mut collector.child).await.ok(),
-                true,
-            ),
-        };
-        outputs.push(
-            finalize(
+    let mut stopping = tokio::task::JoinSet::new();
+    for (order, mut collector) in running.into_iter().enumerate() {
+        let run_dir = run_dir.to_path_buf();
+        stopping.spawn(async move {
+            let already_finished = collector.child.try_wait().ok().flatten();
+            let (status, intentionally_stopped) = match already_finished {
+                Some(status) => (Some(status), false),
+                None => (
+                    process::terminate_group(&mut collector.child).await.ok(),
+                    true,
+                ),
+            };
+            let output = finalize(
                 collector,
                 status.and_then(|value| value.code()),
                 None,
                 intentionally_stopped,
-                run_dir,
+                &run_dir,
             )
-            .await,
-        );
+            .await;
+            (order, output)
+        });
     }
-    outputs
+    let mut outputs = stopping.join_all().await;
+    outputs.sort_by_key(|(order, _)| *order);
+    outputs.into_iter().map(|(_, output)| output).collect()
 }
 
 async fn run_once(
@@ -319,6 +343,8 @@ fn spawn(spec: ExecutionSpec, run_dir: &Path) -> Result<RunningCollector> {
         stderr_path,
         stdout_capture,
         stderr_capture,
+        started_at: Utc::now(),
+        started: Instant::now(),
     })
 }
 
@@ -336,13 +362,10 @@ async fn finalize(
         stderr_path,
         stdout_capture,
         stderr_capture,
+        started_at,
+        started,
         ..
     } = running;
-    let mut logs = Vec::new();
-    let stdout_id = format!("{}-stdout", spec.id_prefix);
-    let stderr_id = format!("{}-stderr", spec.id_prefix);
-    let stdout_destination = run_dir.join("logs").join(format!("{stdout_id}.zst"));
-    let stderr_destination = run_dir.join("logs").join(format!("{stderr_id}.zst"));
     let mut compression_errors = Vec::new();
     // 子が終わっても、pipeを握った孫が残ると取り込みが終わらない。締切で打ち切り、その
     // process groupを落として、logが途中までであることをcollectorの結果に残す。
@@ -365,6 +388,52 @@ async fn finalize(
             )),
         }
     }
+    // 圧縮と解析はCPUを使い切るので、取り込みtaskを動かすworkerを塞がないよう別threadで行う。
+    // 並行に止めた他のcollectorの取り込みが、締切を過ぎたと誤って判定されないようにするため。
+    let collector = spec.collector.clone();
+    let node = spec.node.as_ref().map(|node| node.name.clone());
+    let run_dir = run_dir.to_path_buf();
+    let finished = tokio::task::spawn_blocking(move || {
+        let mut output = finish_output(
+            spec,
+            stdout_path,
+            stderr_path,
+            compression_errors,
+            exit_code,
+            error,
+            intentionally_stopped,
+            &run_dir,
+        );
+        output.result.started_at = Some(started_at);
+        output.result.duration_ms = Some(started.elapsed().as_millis() as u64);
+        output
+    })
+    .await;
+    finished.unwrap_or_else(|error| {
+        failed(
+            &collector,
+            node,
+            format!("collector output processing failed: {error}"),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_output(
+    spec: ExecutionSpec,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    mut compression_errors: Vec<String>,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    intentionally_stopped: bool,
+    run_dir: &Path,
+) -> CollectorOutput {
+    let mut logs = Vec::new();
+    let stdout_id = format!("{}-stdout", spec.id_prefix);
+    let stderr_id = format!("{}-stderr", spec.id_prefix);
+    let stdout_destination = run_dir.join("logs").join(format!("{stdout_id}.zst"));
+    let stderr_destination = run_dir.join("logs").join(format!("{stderr_id}.zst"));
     if let Err(value) = compress_log(&stdout_path, &stdout_destination) {
         compression_errors.push(value.to_string());
     } else {
@@ -453,6 +522,7 @@ async fn finalize(
             exit_code: exit_code.filter(|_| !(intentionally_stopped && success)),
             error,
             log_ids: logs.iter().map(|log| log.id.clone()).collect(),
+            ..Default::default()
         },
         logs,
         metrics,
@@ -2229,6 +2299,7 @@ fn failed(collector: &CollectorConfig, node: Option<String>, error: String) -> C
             exit_code: None,
             error: Some(error),
             log_ids: Vec::new(),
+            ..Default::default()
         },
         logs: Vec::new(),
         metrics: Vec::new(),

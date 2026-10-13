@@ -6,7 +6,7 @@ use crate::{
     git_snapshot,
     model::{
         AnalysisStatus, BenchmarkMessageKind, BenchmarkResult, RunManifest, RunMode, RunState,
-        SourceSnapshot, ToolingSnapshot,
+        SourceSnapshot, StageTiming, ToolingSnapshot,
     },
     shutdown::Shutdown,
     storage::Store,
@@ -139,6 +139,7 @@ pub async fn execute(
         fingerprint_count: 0,
         transition_count: 0,
         structured_snapshot: None,
+        stages: Vec::new(),
     };
     store.begin(&manifest)?;
 
@@ -146,15 +147,20 @@ pub async fn execute(
     let mut metrics = Vec::new();
     let mut fingerprints = Vec::new();
     let mut transitions = Vec::new();
+    let mut after_outputs = None;
 
     println!("→ collectors: before");
-    let before = collector::run_phase(
-        &config,
-        mode,
-        CollectorPhase::Before,
-        &id,
-        &staging,
-        Some(shutdown.clone()),
+    let before = timed(
+        "collectors_before",
+        &mut manifest.stages,
+        collector::run_phase(
+            &config,
+            mode,
+            CollectorPhase::Before,
+            &id,
+            &staging,
+            Some(shutdown.clone()),
+        ),
     )
     .await;
     let required_failed = before.iter().any(|output| {
@@ -197,8 +203,12 @@ pub async fn execute(
         };
     } else {
         println!("→ collectors: during");
-        let (running, startup_failures) =
-            collector::start_during(&config, mode, &id, &staging).await;
+        let (running, startup_failures) = timed(
+            "collectors_during_start",
+            &mut manifest.stages,
+            collector::start_during(&config, mode, &id, &staging),
+        )
+        .await;
         absorb(
             startup_failures,
             &mut manifest,
@@ -208,13 +218,45 @@ pub async fn execute(
         );
 
         println!("→ benchmark");
-        let execution = benchmark::execute(&config, &staging, shutdown.clone(), true, mode).await;
+        let execution = timed(
+            "benchmark",
+            &mut manifest.stages,
+            benchmark::execute(&config, &staging, shutdown.clone(), true, mode),
+        )
+        .await;
         manifest.benchmark = execution.result;
         manifest.logs.extend(execution.logs);
         store.checkpoint(&manifest)?;
         metrics.extend(execution.metrics);
 
-        let during = collector::stop_during(running, &staging).await;
+        // benchmark parserはベンチの出力だけを読むので、during collectorの停止とafter collectorを
+        // 待たずに並行して動かす。表示と保存の順は、並行にする前と同じにする。
+        let mut parser_stages = Vec::new();
+        let mut collector_stages = Vec::new();
+        let (enriched, (during, after)) = tokio::join!(
+            timed(
+                "benchmark_parsers",
+                &mut parser_stages,
+                enrichment::run_all(&config, &id, &staging, &id),
+            ),
+            async {
+                let during = timed(
+                    "collectors_during_stop",
+                    &mut collector_stages,
+                    collector::stop_during(running, &staging),
+                )
+                .await;
+                let after = timed(
+                    "collectors_after",
+                    &mut collector_stages,
+                    collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None),
+                )
+                .await;
+                (during, after)
+            },
+        );
+        manifest.stages.extend(collector_stages);
+        manifest.stages.extend(parser_stages);
         absorb(
             during,
             &mut manifest,
@@ -224,13 +266,22 @@ pub async fn execute(
         );
 
         println!("→ benchmark parsers");
-        let enriched = enrichment::run_all(&config, &id, &staging, &id).await;
         absorb_enrichments(enriched, &mut manifest, &mut metrics);
+        after_outputs = Some(after);
     }
 
     println!("→ collectors: after");
-    let after =
-        collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None).await;
+    let after = match after_outputs {
+        Some(after) => after,
+        None => {
+            timed(
+                "collectors_after",
+                &mut manifest.stages,
+                collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None),
+            )
+            .await
+        }
+    };
     absorb(
         after,
         &mut manifest,
@@ -283,6 +334,9 @@ pub async fn execute(
             .unwrap_or_else(|| "-".into())
     );
     println!("state     {}", manifest.state.as_str());
+    if !manifest.stages.is_empty() {
+        println!("timing    {}", describe_stages(&manifest.stages));
+    }
     for reason in manifest.failure_reasons().iter().take(3) {
         println!("failure   {reason}");
     }
@@ -315,6 +369,31 @@ pub async fn execute(
         state: manifest.state,
         score: manifest.benchmark.score,
     })
+}
+
+/// Runs one stage of the run and records when it started and how long it took.
+async fn timed<T>(
+    name: &str,
+    stages: &mut Vec<StageTiming>,
+    stage: impl std::future::Future<Output = T>,
+) -> T {
+    let started_at = Utc::now();
+    let started = std::time::Instant::now();
+    let value = stage.await;
+    stages.push(StageTiming {
+        name: name.into(),
+        started_at,
+        duration_ms: started.elapsed().as_millis() as u64,
+    });
+    value
+}
+
+fn describe_stages(stages: &[StageTiming]) -> String {
+    stages
+        .iter()
+        .map(|stage| format!("{} {:.1}s", stage.name, stage.duration_ms as f64 / 1_000.0))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn absorb_enrichments(
