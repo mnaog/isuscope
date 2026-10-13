@@ -102,7 +102,7 @@ isuscope init
 └── SETUP.md            # 導入先で読む短いチェックリスト
 ```
 
-最初に`.isuscope/SETUP.md`を読み、少なくともベンチ起動方法、SSHとnode、アクセスログとslow log、route正規化、app binaryと主要serviceを実環境へ合わせます。その後、shellの構文、setup、doctorを順に確認します。
+最初に`.isuscope/SETUP.md`を読み、少なくともベンチ起動方法、initializeと負荷走行の境界（出力のmarkerか`routes.toml`の`[initialize]`）、SSHとnode、アクセスログ（MariaDBなどではslow logも）、route正規化、app binaryと主要serviceを実環境へ合わせます。その後、shellの構文、setup、doctorを順に確認します。
 
 ```console
 bash -n .isuscope/benchmark.sh
