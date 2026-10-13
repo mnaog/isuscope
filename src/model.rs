@@ -370,15 +370,6 @@ pub enum BenchmarkMessageKind {
     Error,
 }
 
-impl BenchmarkMessageKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Failure => "failure",
-            Self::Error => "error",
-        }
-    }
-}
-
 /// A benchmark output line kept verbatim by a parser. Metrics carry counts; messages keep
 /// the text needed to tell what actually happened (a failed validation, an error target).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

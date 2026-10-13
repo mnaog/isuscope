@@ -351,8 +351,6 @@ pub struct BriefRun {
     /// 出さない。runはトップレベルの`run`（短縮ID）で指す。
     #[serde(skip)]
     pub id: String,
-    #[serde(skip)]
-    pub short_id: String,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub state: String,
@@ -822,7 +820,6 @@ pub fn build(
         run: short.to_owned(),
         review: None,
         summary: BriefRun {
-            short_id: crate::runner::short_id(&run.id).into(),
             id: run.id,
             started_at: crate::model::display_time(run.started_at),
             finished_at: run.finished_at.map(crate::model::display_time),
