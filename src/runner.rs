@@ -20,10 +20,7 @@ use std::fs;
 use uuid::Uuid;
 
 pub struct RunOutcome {
-    pub id: String,
     pub passed: bool,
-    pub state: RunState,
-    pub score: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -512,10 +509,7 @@ pub async fn execute(
     }
 
     Ok(RunOutcome {
-        id,
         passed: manifest.benchmark.passed == Some(true),
-        state: manifest.state,
-        score: manifest.benchmark.score,
     })
 }
 

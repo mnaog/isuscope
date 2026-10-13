@@ -13,11 +13,7 @@ include = [
     "templates/**",
     "scripts/**",
     "examples/**",
-    "docs/contest-day.md",
-    "docs/profile-acceptance-isucon13.md",
-    "docs/report-architecture.md",
     "docs/standard-observability.md",
-    "docs/validation-history.md",
     "README.md",
     "LICENSE",
 ]
