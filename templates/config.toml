@@ -1345,7 +1345,7 @@ phase = "before"
 transport = "ssh"
 sequence = "mysql-log"
 roles = ["db", "mysql"]
-preflight = ["sh", "-c", "command -v sha256sum >/dev/null || { echo sha256sum missing; exit 1; }; sudo -n test -e @@MYSQL_SLOW_LOG@@ || { echo 'slow log is off (statement digests are used)'; exit 75; }; sudo -n test -r @@MYSQL_SLOW_LOG@@ && echo readable via sudo @@MYSQL_SLOW_LOG@@"]
+preflight = ["sh", "-c", "command -v sha256sum >/dev/null || { echo sha256sum missing; exit 1; }; sudo -n test -e @@MYSQL_SLOW_LOG@@ || { if sudo -n mysql -N -B -e \"SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME='statements_digest'\" 2>/dev/null | grep -qx YES; then echo 'slow log is off; SQL comes from statement digests'; exit 0; fi; echo 'no slow log and no statement digests'; exit 75; }; sudo -n test -r @@MYSQL_SLOW_LOG@@ && echo readable via sudo @@MYSQL_SLOW_LOG@@"]
 command = ["sh", "-c", '''
 set -eu
 log=@@MYSQL_SLOW_LOG@@
@@ -1493,7 +1493,7 @@ phase = "after"
 transport = "ssh"
 sequence = "mysql-log"
 roles = ["db", "mysql"]
-preflight = ["sh", "-c", "sudo -n test -e @@MYSQL_SLOW_LOG@@ || { echo 'slow log is off (statement digests are used)'; exit 75; }; command -v slp >/dev/null 2>&1 || { echo 'slp is not installed; install it with the Ansible observability role'; exit 1; }; echo slp available"]
+preflight = ["sh", "-c", "sudo -n test -e @@MYSQL_SLOW_LOG@@ || { if sudo -n mysql -N -B -e \"SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME='statements_digest'\" 2>/dev/null | grep -qx YES; then echo 'slow log is off; SQL comes from statement digests'; exit 0; fi; echo 'neither the slow log nor statement digests are available (MariaDB or performance_schema=OFF), so no SQL would be recorded; turn the slow log on'; exit 1; }; command -v slp >/dev/null 2>&1 || { echo 'slp is not installed; install it with the Ansible observability role'; exit 1; }; echo slp available"]
 command = ["sh", "-c", '''
 set -eu
 input=/tmp/isuscope-{run_id}.mysql.log

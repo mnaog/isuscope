@@ -292,3 +292,76 @@ fn limits_collector_reads_the_limits_without_changing_anything() {
         );
     }
 }
+
+/// Without a slow log, the slow-log collectors' preflights pass when statement digests carry the
+/// SQL (practice-14-forth: six warnings on every doctor), and slp fails when neither source
+/// exists, so a baseline without any SQL is not started.
+#[cfg(unix)]
+#[test]
+fn slow_log_preflights_follow_whether_statement_digests_carry_the_sql() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rendered = isuscope::init::render_config(&isuscope::init::ConfigOptions::default());
+    let config: toml::Value = toml::from_str(&rendered).unwrap();
+    let preflight = |name: &str| {
+        config["collectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|collector| collector["name"].as_str() == Some(name))
+            .unwrap()["preflight"][2]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let directory = tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let run = |script: &str, digests: &str, slow_log: Option<&str>| {
+        for (name, body) in [
+            (
+                "sudo",
+                "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n".to_owned(),
+            ),
+            ("mysql", format!("#!/bin/sh\necho {digests}\n")),
+            ("slp", "#!/bin/sh\nexit 0\n".to_owned()),
+        ] {
+            let path = bin.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log = directory.path().join("slow.log");
+        let _ = fs::remove_file(&log);
+        if let Some(contents) = slow_log {
+            fs::write(&log, contents).unwrap();
+        }
+        let script = script.replace("/var/log/mysql/mysql-slow.log", log.to_str().unwrap());
+        let output = Command::new("sh")
+            .args(["-c", &script])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        (
+            output.status.code().unwrap(),
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )
+    };
+    for name in ["slp", "mysql-log-mark"] {
+        let script = preflight(name);
+        let (code, message) = run(&script, "YES", None);
+        assert_eq!(code, 0, "{name}: {message}");
+        assert!(message.contains("statement digests"), "{name}: {message}");
+    }
+    let (code, message) = run(&preflight("slp"), "NO", None);
+    assert_eq!(code, 1, "{message}");
+    assert!(message.contains("no SQL would be recorded"), "{message}");
+    assert_eq!(run(&preflight("mysql-log-mark"), "NO", None).0, 75);
+    assert_eq!(
+        run(&preflight("slp"), "NO", Some("")).0,
+        0,
+        "an existing slow log is used"
+    );
+}
