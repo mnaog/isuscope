@@ -121,6 +121,103 @@ fn digest_collector_splits_cumulative_snapshots_into_initialize_and_load() {
     assert!(!std::path::Path::new(&format!("{}.digest", prefix.display())).exists());
 }
 
+/// Server-side prepared statements (sqlx's binary protocol) never reach the digest table; the
+/// collector reads `prepared_statements_instances` per SQL text instead. A statement whose
+/// connection closed mid-run drops out of that table, and its counts must not go negative.
+#[cfg(unix)]
+#[test]
+fn digest_collector_counts_prepared_statements_across_closed_connections() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rendered = isuscope::init::render_config(&isuscope::init::ConfigOptions::default());
+    let config: toml::Value = toml::from_str(&rendered).unwrap();
+    let collector = |name: &str| {
+        config["collectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|collector| collector["name"].as_str() == Some(name))
+            .unwrap()["command"][2]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(collector("mysql-digest-sampler").contains("prepared_statements_instances"));
+    assert!(
+        collector("mysql-digest-start")
+            .contains("TRUNCATE TABLE performance_schema.prepared_statements_instances")
+    );
+    let template = collector("mysql-digest");
+
+    let directory = tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    for (name, body) in [
+        ("sudo", "#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n"),
+        (
+            "mysql",
+            "#!/bin/sh\ncase \"$*\" in\n*prepared_statements_instances*) printf 'ps:a1\\t9000000000\\t\\t\\tSELECT * FROM user_present_all_received_history WHERE user_id=? AND present_all_id=?\\n' ;;\n*) : ;;\nesac\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let prefix = directory.path().join("isuscope-t");
+    // Two connections' rows summed per SQL text; at 1030 one connection closed and the sum fell.
+    fs::write(
+        format!("{}.digest", prefix.display()),
+        "T\t1004.0\nps:a1\t1\t1000000000\t0\t1\t240000\tSELECT * FROM user_present_all_received_history WHERE user_id=? AND present_all_id=?\n\
+         T\t1020.0\nps:a1\t100\t100000000000\t0\t100\t24000000\tSELECT * FROM user_present_all_received_history WHERE user_id=? AND present_all_id=?\n\
+         T\t1025.0\nps:b2\t7\t7000000000\t0\t7\t7\tINSERT INTO user_sessions(id, user_id) VALUES (?, ?)\n\
+         T\t1030.0\nps:a1\t40\t40000000000\t0\t40\t9600000\n\
+         T\t1060.0\nps:a1\t90\t90000000000\t0\t90\t21600000\n",
+    )
+    .unwrap();
+    let script = template
+        .replace("/tmp/isuscope-{run_id}", prefix.to_str().unwrap())
+        .replace("{benchmark_started_at}", "1000.0")
+        .replace("{load_started_at}", "1005.0")
+        .replace("{benchmark_finished_at}", "1070.0");
+    let output = Command::new("sh")
+        .args(["-c", &script])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let load = stdout
+        .lines()
+        .map(|line| line.split('\t').collect::<Vec<_>>())
+        .find(|row| row[0] == "load")
+        .unwrap_or_else(|| panic!("no load row:\n{stdout}"));
+    // 100 by 1020, then 90 more on the rows still open: 190 in all, 1 of them in initialize.
+    assert_eq!(load[1], "189", "{stdout}");
+    assert!(
+        load[2].starts_with("SELECT * FROM user_present_all_received_history"),
+        "{stdout}"
+    );
+    assert_eq!(
+        load[4], "0.009000000",
+        "the maximum comes from MAX_TIMER_EXECUTE"
+    );
+    assert_eq!(load[9], "45360000", "{stdout}");
+    // b2's connection closed before the benchmark ended: its text comes from the snapshot.
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("load\t7\tINSERT INTO user_sessions(id, user_id)")),
+        "{stdout}"
+    );
+}
+
 /// The template `limits` collector reads the limits before the benchmark: nginx's own (not the
 /// upstream's keepalive_requests), each service unit's open-file limit and MySQL's connections.
 #[cfg(unix)]
