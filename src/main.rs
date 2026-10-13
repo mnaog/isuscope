@@ -317,6 +317,10 @@ struct AnnotationArgs {
     /// 検索用tag。複数回指定できます。
     #[arg(long = "tag")]
     tags: Vec<String>,
+    /// 直前のベンチと同じ構成をもう一度測る理由（ばらつきの確認、観測の追加など）。
+    /// isuscopeから見える違いが無いrunは、これが無いとベンチを始めません。
+    #[arg(long, value_name = "REASON")]
+    repeat: Option<String>,
 }
 
 impl From<AnnotationArgs> for RunAnnotations {
@@ -325,6 +329,7 @@ impl From<AnnotationArgs> for RunAnnotations {
             hypothesis: value.hypothesis,
             note: value.note,
             tags: value.tags,
+            repeat: value.repeat,
         }
     }
 }
@@ -398,7 +403,7 @@ fn main() -> ExitCode {
     // The benchmark lock is taken before the async runtime starts so that marking it held in
     // the environment happens while this process is still single-threaded.
     let _run_lock = match acquire_run_lock(&cli) {
-        Ok(lock) => lock,
+        Ok(lock) => lock.map(isuscope::lock::hold_run_lock),
         Err(error) => return exit_for_error(error),
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()

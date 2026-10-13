@@ -597,6 +597,14 @@ pub fn build(
     let (hosts, quiet_hosts) = split_quiet_hosts(host_nodes(&diagnostics.host));
     let benchmark_messages = benchmark_messages(&run);
     let mut warnings = benchmark.warnings;
+    if run.benchmark.mode != "not-started"
+        && run.benchmark.started_at.is_some()
+        && run.benchmark.initialize_finished_at.is_none()
+    {
+        warnings.push(
+            "this run has no initialize boundary, so hosts, clients and database summarize the whole benchmark including initialize; set [benchmark] initialize markers, or [initialize] method and path in routes.toml".into(),
+        );
+    }
     if let Some(legacy) = diagnostics
         .transition_order
         .legacy_events

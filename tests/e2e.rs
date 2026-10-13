@@ -56,6 +56,8 @@ mod agent_context;
 mod analysis;
 #[path = "e2e/app_logs.rs"]
 mod app_logs;
+#[path = "e2e/benchmark_guard.rs"]
+mod benchmark_guard;
 #[path = "e2e/benchmark_messages.rs"]
 mod benchmark_messages;
 #[path = "e2e/brief_shape.rs"]

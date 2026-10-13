@@ -60,7 +60,13 @@ command = ["sh", "-c", "sed -E \"s/\\\"timestamp\\\":[0-9]+/\\\"timestamp\\\":$(
         "--analysis",
         "比較の土台",
     ]);
-    isuscope(&["run", "--hypothesis", "candidate"]);
+    isuscope(&[
+        "run",
+        "--hypothesis",
+        "candidate",
+        "--repeat",
+        "check the variance",
+    ]);
     let runs = isuscope(&["list"]);
     let candidate = runs["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
     let base = runs["runs"]["rows"][1]["id"].as_str().unwrap().to_owned();

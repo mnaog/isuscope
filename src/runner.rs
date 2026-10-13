@@ -4,10 +4,12 @@ use crate::{
     config::{CollectorPhase, LoadedConfig, Transport},
     enrichment::{self, EnrichmentOutput},
     git_snapshot,
+    hooks::{self, HookContext},
     model::{
         AnalysisStatus, BenchmarkMessageKind, BenchmarkResult, RunManifest, RunMode, RunState,
         SourceSnapshot, StageTiming, ToolingSnapshot,
     },
+    repeat,
     shutdown::Shutdown,
     storage::Store,
     tooling,
@@ -29,6 +31,8 @@ pub struct RunAnnotations {
     pub hypothesis: String,
     pub note: Option<String>,
     pub tags: Vec<String>,
+    /// `--repeat`: why the same configuration as the last benchmark is measured again.
+    pub repeat: Option<String>,
 }
 
 pub async fn execute(
@@ -140,6 +144,9 @@ pub async fn execute(
         transition_count: 0,
         structured_snapshot: None,
         stages: Vec::new(),
+        hooks: Vec::new(),
+        identity: None,
+        repeat: None,
     };
     store.begin(&manifest)?;
 
@@ -149,29 +156,76 @@ pub async fn execute(
     let mut transitions = Vec::new();
     let mut after_outputs = None;
 
-    println!("→ collectors: before");
-    let before = timed(
-        "collectors_before",
-        &mut manifest.stages,
-        collector::run_phase(
-            &config,
-            mode,
-            CollectorPhase::Before,
-            &id,
-            &staging,
-            Some(shutdown.clone()),
-        ),
-    )
-    .await;
-    let required_failed = before.iter().any(|output| {
-        output.result.status == "failed"
-            && config.config.collectors.iter().any(|collector| {
-                matches!(collector.phase, CollectorPhase::Before)
-                    && collector.name == output.result.name
-                    && collector.required
-            })
-    });
-    let unreachable = unreachable_ssh_nodes(&config, &before);
+    let repeat_reason = annotations
+        .repeat
+        .take()
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty());
+    let hook_context = HookContext {
+        config: &config,
+        run_id: &id,
+        run_dir: &staging,
+        mode,
+        env: repeat_reason
+            .iter()
+            .map(|reason| ("ISUSCOPE_REPEAT_REASON", reason.clone()))
+            .collect(),
+    };
+    let benchmark_config = &config.config.benchmark;
+    if let Some(command) = &benchmark_config.identity_command {
+        println!("→ identity");
+        let output = hooks::run(&hook_context, "identity", command).await;
+        if output.result.status == "complete" {
+            manifest.identity = Some(repeat::identity(&output.stdout));
+        }
+        absorb_hook(output, &mut manifest);
+    }
+    let mut prepare_error = None;
+    if let Some(command) = &benchmark_config.prepare_command {
+        println!("→ prepare");
+        let output = timed(
+            "prepare",
+            &mut manifest.stages,
+            hooks::run(&hook_context, "prepare", command),
+        )
+        .await;
+        if output.result.status != "complete" {
+            prepare_error = Some(format!(
+                "prepare_command failed: {}",
+                output.result.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        absorb_hook(output, &mut manifest);
+    }
+
+    let (before, required_failed, unreachable) = if prepare_error.is_some() {
+        (Vec::new(), false, Vec::new())
+    } else {
+        println!("→ collectors: before");
+        let before = timed(
+            "collectors_before",
+            &mut manifest.stages,
+            collector::run_phase(
+                &config,
+                mode,
+                CollectorPhase::Before,
+                &id,
+                &staging,
+                Some(shutdown.clone()),
+            ),
+        )
+        .await;
+        let required_failed = before.iter().any(|output| {
+            output.result.status == "failed"
+                && config.config.collectors.iter().any(|collector| {
+                    matches!(collector.phase, CollectorPhase::Before)
+                        && collector.name == output.result.name
+                        && collector.required
+                })
+        });
+        let unreachable = unreachable_ssh_nodes(&config, &before);
+        (before, required_failed, unreachable)
+    };
     absorb(
         before,
         &mut manifest,
@@ -179,8 +233,25 @@ pub async fn execute(
         &mut fingerprints,
         &mut transitions,
     );
+    if prepare_error.is_none() {
+        manifest.repeat = check_repeat(&store, &manifest, &fingerprints, repeat_reason.clone())?;
+    }
+    let refused_as_repeat = manifest
+        .repeat
+        .as_ref()
+        .is_some_and(|check| check.changed.is_empty() && check.reason.is_none());
 
-    if shutdown.is_cancelled() {
+    if let Some(error) = prepare_error {
+        eprintln!("! {error}");
+        manifest.benchmark = BenchmarkResult {
+            mode: "not-started".into(),
+            passed: Some(false),
+            error: Some(error),
+            ..Default::default()
+        };
+        // before collectorを動かしていないので、後片付けするものも無い。
+        after_outputs = Some(Vec::new());
+    } else if shutdown.is_cancelled() {
         manifest.benchmark = interrupted_benchmark();
     } else if required_failed {
         manifest.benchmark = BenchmarkResult {
@@ -193,6 +264,22 @@ pub async fn execute(
         let error = format!(
             "SSH failed for every before collector on {}; fix SSH (host keys, identity, reachability) before benchmarking",
             unreachable.join(", ")
+        );
+        eprintln!("! {error}");
+        manifest.benchmark = BenchmarkResult {
+            mode: "not-started".into(),
+            passed: Some(false),
+            error: Some(error),
+            ..Default::default()
+        };
+    } else if refused_as_repeat {
+        let base = manifest
+            .repeat
+            .as_ref()
+            .map(|check| short_id(&check.base_run_id).to_owned())
+            .unwrap_or_default();
+        let error = format!(
+            "nothing isuscope can see changed since run {base} (deployment, node fingerprints, observation settings); deploy the change, or pass --repeat \"<reason>\" to measure the same configuration again"
         );
         eprintln!("! {error}");
         manifest.benchmark = BenchmarkResult {
@@ -226,8 +313,49 @@ pub async fn execute(
         .await;
         manifest.benchmark = execution.result;
         manifest.logs.extend(execution.logs);
-        store.checkpoint(&manifest)?;
         metrics.extend(execution.metrics);
+        if let Some(stopped_by) = manifest.benchmark.stopped_by.clone() {
+            eprintln!(
+                "! benchmark stopped by isuscope ({stopped_by}): {}",
+                manifest.benchmark.error.as_deref().unwrap_or_default()
+            );
+            if let Some(command) = &benchmark_config.cleanup_command {
+                println!("→ cleanup");
+                let output = timed(
+                    "cleanup",
+                    &mut manifest.stages,
+                    hooks::run(&hook_context, "cleanup", command),
+                )
+                .await;
+                absorb_hook(output, &mut manifest);
+            }
+        }
+        // ベンチの出力に境界が無ければ、collector（access logの最後のinitialize要求など）から取る。
+        // during collectorの解析とafter collectorの区間はこの境界で決まるので、その前に済ませる。
+        if manifest.benchmark.started_at.is_some()
+            && manifest.benchmark.initialize_finished_at.is_none()
+            && collector::selected(&config, mode, CollectorPhase::Boundary)
+                .next()
+                .is_some()
+        {
+            store.checkpoint(&manifest)?;
+            println!("→ collectors: boundary");
+            let boundary = timed(
+                "collectors_boundary",
+                &mut manifest.stages,
+                collector::run_phase(&config, mode, CollectorPhase::Boundary, &id, &staging, None),
+            )
+            .await;
+            apply_boundary(&mut manifest, &staging, &boundary);
+            absorb(
+                boundary,
+                &mut manifest,
+                &mut metrics,
+                &mut fingerprints,
+                &mut transitions,
+            );
+        }
+        store.checkpoint(&manifest)?;
 
         // benchmark parserはベンチの出力だけを読むので、during collectorの停止とafter collectorを
         // 待たずに並行して動かす。表示と保存の順は、並行にする前と同じにする。
@@ -289,6 +417,8 @@ pub async fn execute(
         &mut fingerprints,
         &mut transitions,
     );
+    // nodeへの操作はここまで。保存の間に次のdeployを始められるよう、共通lockを先に手放す。
+    crate::lock::release_run_lock();
 
     if let (Some(start), Some(end)) = (
         manifest.benchmark.initialize_started_at,
@@ -336,6 +466,9 @@ pub async fn execute(
     println!("state     {}", manifest.state.as_str());
     if !manifest.stages.is_empty() {
         println!("timing    {}", describe_stages(&manifest.stages));
+    }
+    for line in describe_configuration(&manifest) {
+        println!("{line}");
     }
     for reason in manifest.failure_reasons().iter().take(3) {
         println!("failure   {reason}");
@@ -388,12 +521,154 @@ async fn timed<T>(
     value
 }
 
+/// What was measured and how it relates to the last benchmark: the deployment identity, the
+/// differences (or the reason for measuring the same thing again), why isuscope stopped the
+/// benchmark, and where the initialize boundary came from.
+fn describe_configuration(manifest: &RunManifest) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(identity) = &manifest.identity {
+        let mut fields = identity
+            .values
+            .iter()
+            .take(6)
+            .map(|(key, value)| format!("{key}={}", value.chars().take(16).collect::<String>()))
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            fields.push(identity.sha256.chars().take(12).collect());
+        }
+        lines.push(format!("identity  {}", fields.join(" ")));
+    }
+    if let Some(check) = &manifest.repeat {
+        let base = short_id(&check.base_run_id);
+        match &check.reason {
+            Some(reason) => lines.push(format!("repeat    of {base}: {reason}")),
+            None if check.changed.is_empty() => {
+                lines.push(format!("repeat    refused: same as {base}"))
+            }
+            None => {
+                let mut changed = check.changed.iter().take(5).cloned().collect::<Vec<_>>();
+                if check.changed.len() > 5 {
+                    changed.push(format!("+{} more", check.changed.len() - 5));
+                }
+                lines.push(format!("changed   {} (since {base})", changed.join(", ")));
+            }
+        }
+    }
+    if let Some(stopped_by) = &manifest.benchmark.stopped_by {
+        lines.push(format!("stopped   {stopped_by}"));
+    }
+    if manifest.benchmark.mode != "not-started" && manifest.benchmark.started_at.is_some() {
+        lines.push(format!(
+            "initialize {}",
+            manifest
+                .benchmark
+                .initialize_source
+                .as_deref()
+                .unwrap_or("unknown (summaries include initialize)")
+        ));
+    }
+    lines
+}
+
 fn describe_stages(stages: &[StageTiming]) -> String {
     stages
         .iter()
         .map(|stage| format!("{} {:.1}s", stage.name, stage.duration_ms as f64 / 1_000.0))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn absorb_hook(output: hooks::HookOutput, manifest: &mut RunManifest) {
+    let result = &output.result;
+    let seconds = result.duration_ms.unwrap_or_default() as f64 / 1_000.0;
+    if result.status == "complete" {
+        println!("✓ {} ({seconds:.1}s)", result.name);
+    } else {
+        println!(
+            "! {} ({seconds:.1}s): {}",
+            result.name,
+            result.error.as_deref().unwrap_or("failed")
+        );
+    }
+    manifest.logs.extend(output.logs);
+    manifest.hooks.push(output.result);
+}
+
+/// Compares this run with the last one whose benchmark started. `None` when there is none.
+fn check_repeat(
+    store: &Store,
+    manifest: &RunManifest,
+    fingerprints: &[crate::model::Fingerprint],
+    reason: Option<String>,
+) -> Result<Option<crate::model::RepeatCheck>> {
+    let Some(base) = store.last_started_run(&manifest.id)? else {
+        return Ok(None);
+    };
+    let base_fingerprints = store.fingerprint_index(&base.id)?.unwrap_or_default();
+    let mut current_fingerprints = std::collections::BTreeMap::new();
+    for fingerprint in fingerprints {
+        current_fingerprints.insert(
+            crate::storage::fingerprint_key(&fingerprint.name, &fingerprint.labels)?,
+            fingerprint.value.clone(),
+        );
+    }
+    Ok(Some(repeat::compare(
+        &base,
+        &base_fingerprints,
+        manifest,
+        &current_fingerprints,
+        reason,
+    )))
+}
+
+/// Takes the initialize boundary that a boundary collector reported. Several nodes (more
+/// than one nginx) may answer; the latest end within the benchmark wins, since the load
+/// starts after the last initialize.
+fn apply_boundary(
+    manifest: &mut RunManifest,
+    run_dir: &std::path::Path,
+    outputs: &[collector::CollectorOutput],
+) {
+    let (Some(begin), Some(end)) = (
+        manifest.benchmark.started_at,
+        manifest.benchmark.finished_at,
+    ) else {
+        return;
+    };
+    let epoch = |value: Option<&serde_json::Value>| {
+        let seconds = value?.as_f64()?;
+        chrono::DateTime::from_timestamp_micros((seconds * 1_000_000.0).round() as i64)
+    };
+    let mut best: Option<(chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)> = None;
+    for output in outputs {
+        for event in collector::read_events(run_dir, output) {
+            if event.get("name").and_then(serde_json::Value::as_str) != Some("initialize") {
+                continue;
+            }
+            let Some(finished) = epoch(event.get("finished_at")) else {
+                continue;
+            };
+            if finished < begin || finished >= end {
+                continue;
+            }
+            if best.is_none_or(|(current, _)| finished > current) {
+                best = Some((finished, epoch(event.get("started_at"))));
+            }
+        }
+    }
+    if let Some((finished, started)) = best {
+        let started = started
+            .filter(|started| *started <= finished)
+            .unwrap_or(begin);
+        manifest.benchmark.initialize_started_at =
+            Some(crate::model::to_micros(started.max(begin)));
+        manifest.benchmark.initialize_finished_at = Some(crate::model::to_micros(finished));
+        manifest.benchmark.initialize_source = Some("access_log".into());
+        println!(
+            "initialize boundary from the access log: load starts at {}",
+            finished.to_rfc3339()
+        );
+    }
 }
 
 fn absorb_enrichments(

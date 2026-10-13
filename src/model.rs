@@ -161,6 +161,14 @@ pub struct BenchmarkResult {
     /// Organizer-only lines dropped by `[benchmark] operator_line_pattern` before saving.
     #[serde(default)]
     pub operator_lines_dropped: usize,
+    /// Why isuscope stopped the benchmark: `timeout` (`[benchmark] timeout_seconds`), `idle`
+    /// (no output for `idle_timeout_seconds`) or `interrupted` (a signal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<String>,
+    /// Where the initialize boundary came from: `benchmark_output` (a marker or event line) or
+    /// `access_log` (the last initialize request). Absent when the run has no boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initialize_source: Option<String>,
 }
 
 impl BenchmarkResult {
@@ -496,6 +504,49 @@ pub struct RunManifest {
     pub structured_snapshot: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<StageTiming>,
+    /// `prepare_command`, `identity_command` and `cleanup_command`, in the order they ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hooks: Vec<HookResult>,
+    /// What `identity_command` reported was deployed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<RunIdentity>,
+    /// The comparison with the last run whose benchmark started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<RepeatCheck>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HookResult {
+    /// `prepare`, `identity` or `cleanup`.
+    pub name: String,
+    pub command: Vec<String>,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub log_ids: Vec<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunIdentity {
+    /// SHA-256 of the whole output; equal digests mean the same deployment.
+    pub sha256: String,
+    /// The output's fields when it is a JSON object, as text. Shown and compared per field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepeatCheck {
+    /// The last run whose benchmark started.
+    pub base_run_id: String,
+    /// What differs from it (`identity.<field>`, `fingerprint.<name>`, `observation`, ...).
+    /// Empty when nothing that isuscope can see changed.
+    pub changed: Vec<String>,
+    /// `--repeat`: why the same configuration is measured again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]

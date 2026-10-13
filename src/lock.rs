@@ -102,6 +102,33 @@ impl OperationLock {
     }
 }
 
+/// The operation lock `run` holds. Kept here so the run can hand it back as soon as it is
+/// done with the nodes, while it is still saving locally.
+static RUN_LOCK: std::sync::Mutex<Option<OperationLock>> = std::sync::Mutex::new(None);
+
+/// Keeps `lock` until `release_run_lock` or the returned guard is dropped.
+pub fn hold_run_lock(lock: OperationLock) -> RunLockGuard {
+    if let Ok(mut held) = RUN_LOCK.lock() {
+        *held = Some(lock);
+    }
+    RunLockGuard
+}
+
+/// Releases the lock `hold_run_lock` keeps. Nothing happens when none is held.
+pub fn release_run_lock() {
+    let lock = RUN_LOCK.lock().ok().and_then(|mut held| held.take());
+    drop(lock);
+}
+
+/// Releases the run lock when dropped, so an early return does not leave a stale owner.
+pub struct RunLockGuard;
+
+impl Drop for RunLockGuard {
+    fn drop(&mut self) {
+        release_run_lock();
+    }
+}
+
 impl Drop for OperationLock {
     fn drop(&mut self) {
         // The `flock` is released when `_file` closes; drop the explanation with it.

@@ -166,6 +166,30 @@ pub struct BenchmarkConfig {
     pub parsers: Vec<BenchmarkParserConfig>,
     /// Saved real benchmark stdout; `doctor` runs every parser against it.
     pub sample_output: Option<PathBuf>,
+    /// Runs before every benchmark, ahead of the before collectors (for example to restart
+    /// the application). A failure records the run as FAIL without starting the benchmark.
+    #[serde(default)]
+    pub prepare_command: Option<Vec<String>>,
+    /// Prints what is deployed (a JSON object of names to values, or any text). isuscope
+    /// compares it, with the node fingerprints and the observation settings, against the last
+    /// run whose benchmark started, and refuses an identical run unless `--repeat` is given.
+    #[serde(default)]
+    pub identity_command: Option<Vec<String>>,
+    /// Runs when isuscope stops the benchmark (timeout, no output, or a signal), to stop
+    /// whatever the adapter started elsewhere (a benchmarker on another node).
+    #[serde(default)]
+    pub cleanup_command: Option<Vec<String>>,
+    /// Limit for the whole benchmark. The adapter gets it as
+    /// `ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS` and is expected to stop by then; isuscope stops the
+    /// benchmark itself only after a further grace period, so the two never race.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Stops the benchmark when it prints nothing on stdout or stderr for this long.
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+    /// Limit for each of `prepare_command`, `identity_command` and `cleanup_command`.
+    #[serde(default = "default_hook_timeout")]
+    pub hook_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -227,6 +251,10 @@ pub struct NodeConfig {
 pub enum CollectorPhase {
     Before,
     During,
+    /// Right after the benchmark, only when its output gave no initialize boundary. These
+    /// collectors report the boundary (for example from the access log) before the during
+    /// collectors are parsed and the after collectors are given the windows.
+    Boundary,
     After,
 }
 
@@ -235,6 +263,7 @@ impl CollectorPhase {
         match self {
             Self::Before => "before",
             Self::During => "during",
+            Self::Boundary => "boundary",
             Self::After => "after",
         }
     }
@@ -324,6 +353,9 @@ fn default_ssh_user() -> String {
 }
 fn default_connect_timeout() -> u64 {
     5
+}
+fn default_hook_timeout() -> u64 {
+    120
 }
 fn default_collector_timeout() -> u64 {
     90

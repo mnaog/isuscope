@@ -108,7 +108,20 @@ fn every_output_follows_the_same_contract() {
         .status
         .success()
     );
-    assert!(cli(p, &["run", "--hypothesis", "next"]).status.success());
+    assert!(
+        cli(
+            p,
+            &[
+                "run",
+                "--hypothesis",
+                "next",
+                "--repeat",
+                "check the variance"
+            ]
+        )
+        .status
+        .success()
+    );
     let list = raw(p, &["list"]);
     let run = list["runs"]["rows"][0][0].as_str().unwrap().to_owned();
     assert_eq!(list["runs"]["columns"][0], "run");

@@ -1,5 +1,11 @@
 # 動的な値を含むURIを安定したroute名へ正規化します。
 # ALPでも同じ規則を使えるよう、各patternは単一のcanonical routeへ対応させます。
+
+# ベンチのinitialize要求。ベンチの出力から境界が取れないrunでは、access logでこの要求が
+# 最後に応答を返し終えた時刻を負荷の始まりにします（pathはquery stringを除いて完全一致）。
+# [initialize]
+# method = "POST"
+# path = "/api/initialize"
 [[routes]]
 pattern = "^/etag/[^/]+$"
 replace = "/etag/:key"

@@ -15,11 +15,16 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
+
+/// isuscopeの全体期限は、adapterへ渡した期限よりこれだけ後ろに置く。adapterが自分の期限で
+/// 止め、後始末と結果の出力を終えるための時間で、両方が同時に止めに行かないようにする。
+pub const TIMEOUT_GRACE: Duration = Duration::from_secs(30);
 
 pub struct BenchmarkExecution {
     pub result: BenchmarkResult,
@@ -36,6 +41,8 @@ struct Observation {
     initialize_started_at: Option<chrono::DateTime<Utc>>,
     initialize_finished_at: Option<chrono::DateTime<Utc>>,
     protocol_result_count: usize,
+    /// 最後にstdoutかstderrへ行が出た時刻（運営向けで捨てた行も含む）。
+    last_output: Option<Instant>,
 }
 
 pub async fn execute(
@@ -122,7 +129,11 @@ async fn execute_command(
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(seconds) = benchmark.timeout_seconds {
+        command.env("ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS", seconds.to_string());
+    }
     process::configure_group(&mut command);
+    let spawned = Instant::now();
     let mut child = command.spawn().with_context(|| {
         format!(
             "cannot start benchmark command `{}`",
@@ -166,17 +177,42 @@ async fn execute_command(
         operator_pattern,
         benchmark.clone(),
     ));
-    let (status, interrupted) = tokio::select! {
-        status = child.wait() => {
-            (status.context("cannot wait for benchmark process")?, false)
-        }
-        _ = shutdown.cancelled() => {
-            let status = process::terminate_group(&mut child)
-                .await
-                .context("cannot terminate interrupted benchmark process group")?;
-            (status, true)
-        }
+    // 全体の期限はadapterへ渡した値に猶予を足した時刻。出力の途絶えは0.5秒ごとに確かめる。
+    let deadline = benchmark
+        .timeout_seconds
+        .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds) + TIMEOUT_GRACE);
+    let idle_limit = benchmark.idle_timeout_seconds.map(Duration::from_secs);
+    let (status, stopped_by) = loop {
+        let stop = tokio::select! {
+            status = child.wait() => {
+                break (status.context("cannot wait for benchmark process")?, None);
+            }
+            _ = shutdown.cancelled() => "interrupted",
+            _ = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => "timeout",
+            _ = tokio::time::sleep(Duration::from_millis(500)), if idle_limit.is_some() => {
+                let last = observation
+                    .lock()
+                    .ok()
+                    .and_then(|observation| observation.last_output)
+                    .unwrap_or(spawned);
+                if idle_limit.is_some_and(|limit| last.elapsed() >= limit) {
+                    "idle"
+                } else {
+                    continue;
+                }
+            }
+        };
+        let status = process::terminate_group(&mut child)
+            .await
+            .context("cannot terminate the benchmark process group")?;
+        break (status, Some(stop));
     };
+    let interrupted = stopped_by == Some("interrupted");
     // 中断後にpipeを握ったままの相手が残っていても、取り込みを待ち続けて止まらないようにする。
     let mut abandoned = Vec::new();
     for (task, stream) in [(stdout_task, "stdout"), (stderr_task, "stderr")] {
@@ -225,7 +261,7 @@ async fn execute_command(
     let duplicate_result = observation.protocol_result_count > 1;
     // 判定はadapterが`pass`で伝えたものだけを使う。終了コードとscoreから推測すると、判定の抽出を
     // 書き漏らしたadapterのFAILもPASSとして記録され、採否の比較に紛れ込む。
-    let passed = if interrupted || !status.success() || duplicate_result {
+    let passed = if stopped_by.is_some() || !status.success() || duplicate_result {
         Some(false)
     } else {
         observation.passed
@@ -241,11 +277,26 @@ async fn execute_command(
             messages: observation.messages,
             started_at: None,
             finished_at: None,
+            initialize_source: observation
+                .initialize_finished_at
+                .map(|_| "benchmark_output".into()),
             initialize_started_at: observation.initialize_started_at,
             initialize_finished_at: observation.initialize_finished_at,
             operator_lines_dropped: observation.operator_lines_dropped,
+            stopped_by: stopped_by.map(str::to_owned),
             error: if interrupted {
                 Some("interrupted by signal".into())
+            } else if stopped_by == Some("timeout") {
+                Some(format!(
+                    "benchmark ran past [benchmark] timeout_seconds ({}s) and the {}s grace; isuscope stopped it",
+                    benchmark.timeout_seconds.unwrap_or_default(),
+                    TIMEOUT_GRACE.as_secs()
+                ))
+            } else if stopped_by == Some("idle") {
+                Some(format!(
+                    "benchmark printed nothing for [benchmark] idle_timeout_seconds ({}s); isuscope stopped it",
+                    benchmark.idle_timeout_seconds.unwrap_or_default()
+                ))
             } else if duplicate_result {
                 Some(format!(
                     "benchmark emitted {} isuscope.result records; expected exactly one",
@@ -317,6 +368,9 @@ where
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         let line = String::from_utf8_lossy(raw);
         let line = line.as_ref();
+        if let Ok(mut observation) = observation.lock() {
+            observation.last_output = Some(Instant::now());
+        }
         // Organizer-only lines are part of the rules. Drop them before anything is written,
         // so no saved log, metric or view can be read back from them.
         if operator_pattern
@@ -518,6 +572,12 @@ mod tests {
             operator_line_pattern: None,
             parsers: Vec::new(),
             sample_output: None,
+            prepare_command: None,
+            identity_command: None,
+            cleanup_command: None,
+            timeout_seconds: None,
+            idle_timeout_seconds: None,
+            hook_timeout_seconds: 120,
         }
     }
 

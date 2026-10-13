@@ -38,6 +38,26 @@ stream_output = false
 # 判断に使わないための設定です。当日のbenchmarkerの出力を見て決めます。
 # operator_line_pattern = "^\\[ADMIN\\]"
 
+# 毎回のベンチの前（before collectorより前）に動かすcommand。アプリの再起動など。失敗したrunは
+# ベンチを始めずにFAILとして残ります。環境変数はisuscopeを起動したshellから引き継ぎ、
+# `ISUSCOPE_RUN_ID`・`ISUSCOPE_RUN_DIR`・`ISUSCOPE_RUN_MODE`・`ISUSCOPE_PROJECT_ROOT`と、`--repeat`を
+# 付けたときは`ISUSCOPE_REPEAT_REASON`が加わります。
+# prepare_command = [".isuscope/prepare.sh"]
+# 配ったものを識別する値をstdoutへ出すcommand（JSON objectならfieldごとに比べて表示します）。
+# isuscopeはこれとnodeのfingerprint、計測の設定を、ベンチを始めた直前のrunと比べ、何も
+# 変わっていなければ`--repeat "<理由>"`が無い限りベンチを始めません。
+# identity_command = [".isuscope/identity.sh"]
+# isuscopeがベンチを止めたとき（期限、出力の途絶え、signal）に動かす後始末。別nodeで動く
+# benchmarkerを止めるなど。
+# cleanup_command = [".isuscope/benchmark.sh", "--cleanup"]
+# ベンチ全体の期限。adapterへ`ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS`で渡し、isuscope自身は
+# さらに30秒の猶予の後で止めます（adapterが先に止めて結果を出せるように）。
+# timeout_seconds = 900
+# stdoutにもstderrにも何も出ない時間がこれを超えたら止めます。
+# idle_timeout_seconds = 180
+# prepare・identity・cleanupそれぞれの期限（既定120秒）。
+# hook_timeout_seconds = 120
+
 # 問題固有の件数などがbenchmark stdoutに現れる場合に有効化します。
 # parserはベンチ終了後に実行され、保存済みrunへ`isuscope enrich`で再適用できます。
 # [[benchmark.parsers]]
@@ -595,6 +615,46 @@ mv "$temporary" "$output"
 # 差分はこのnodeに置いたまま、後のalpが集計する。ここでは大きさだけを残す。
 printf '{"type":"metric","name":"http.access_log_bytes","value":%s,"unit":"bytes"}\n' "$(wc -c < "$output" | tr -d ' ')"
 ''']
+unavailable_exit_codes = [75]
+
+# ベンチの出力からinitializeの境界が取れなかったときだけ、ベンチの直後に動きます。
+# routes.tomlの`[initialize]`（methodとpath）に一致する要求のうち、ベンチの間で最後に応答を
+# 返し終えた時刻（`$msec`）を負荷の始まりにします。`[initialize]`が無ければ何もしません。
+[[collectors]]
+name = "initialize-boundary"
+phase = "boundary"
+transport = "ssh"
+roles = ["nginx", "edge"]
+command = ["sh", "-c", '''
+set -eu
+log=@@NGINX_ACCESS_LOG@@
+marker=/tmp/isuscope-{run_id}.nginx.marker
+method='{initialize_method}'
+path='{initialize_path}'
+test -n "$method" && test -n "$path" || exit 75
+test -r "$log" && test -r "$marker" || exit 75
+read -r offset _ < "$marker" || exit 75
+case "$offset" in ''|*[!0-9]*) exit 75 ;; esac
+# logが回転していたら（今のfileがmarkより小さい）、ここでは追わない。境界の無いrunとして進む。
+test "$(wc -c < "$log" | tr -d ' ')" -ge "$offset" || exit 75
+tail -c +$((offset + 1)) "$log" | awk -F '\t' -v method="$method" -v path="$path" \
+  -v begin='{benchmark_started_at}' -v end='{benchmark_finished_at}' '
+  {
+    delete field
+    for (i = 1; i <= NF; i++) { at = index($i, ":"); if (at) field[substr($i, 1, at - 1)] = substr($i, at + 1) }
+    if (field["method"] != method) next
+    uri = field["uri"]; query = index(uri, "?"); if (query) uri = substr(uri, 1, query - 1)
+    if (uri != path || field["msec"] !~ /^[0-9]+(\.[0-9]+)?$/) next
+    at = field["msec"] + 0
+    if ((begin != "" && at < begin + 0) || (end != "" && at >= end + 0)) next
+    if (at > last) { last = at; took = (field["reqtime"] ~ /^[0-9.]+$/) ? field["reqtime"] + 0 : 0 }
+  }
+  END {
+    if (last == 0) exit 75
+    printf "{\"type\":\"isuscope.event\",\"name\":\"initialize\",\"started_at\":%.6f,\"finished_at\":%.6f}\n", last - took, last
+  }'
+''']
+timeout_seconds = 30
 unavailable_exit_codes = [75]
 
 # survey-runでは、区間ごとの集計に加えて生のaccess logも持ち帰る。行動遷移を作るためと、

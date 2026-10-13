@@ -14,6 +14,46 @@ use std::{
 pub struct RouteRules {
     #[serde(default)]
     routes: Vec<RouteRuleConfig>,
+    /// The benchmark's initialize request. When the benchmark output has no initialize
+    /// boundary, the end of the last such request in the access log becomes the load start.
+    #[serde(default)]
+    initialize: Option<InitializeRoute>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InitializeRoute {
+    pub method: String,
+    /// The request path without the query string, compared exactly.
+    pub path: String,
+}
+
+/// `routes.toml`の`[initialize]`。fileが無いか、指定が無ければ`None`。
+pub fn initialize_route(path: Option<&Path>) -> Result<Option<InitializeRoute>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("cannot read route rules {}", path.display()))?;
+    let config: RouteRules =
+        toml::from_str(&raw).with_context(|| format!("invalid route rules {}", path.display()))?;
+    let Some(route) = config.initialize else {
+        return Ok(None);
+    };
+    // node上のawkへそのまま渡すので、HTTPの方法とpathに使う文字だけを受け付ける。
+    let method_ok =
+        !route.method.is_empty() && route.method.chars().all(|c| c.is_ascii_uppercase());
+    let path_ok = route.path.starts_with('/')
+        && route
+            .path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/-_.~:@!$&()*+,;=%".contains(c));
+    if !method_ok || !path_ok {
+        anyhow::bail!(
+            "[initialize] in {} needs an upper-case method and a path such as \"/api/initialize\"",
+            path.display()
+        );
+    }
+    Ok(Some(route))
 }
 
 #[derive(Debug, Clone, Deserialize)]

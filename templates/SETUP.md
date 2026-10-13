@@ -9,7 +9,7 @@
 5. SSH可能なnode、role、identity fileを`[[nodes]]`と`[ssh]`へ設定する。roleは固定的な種類ではなく、複数指定・run間の変更が可能なcollector選択tag
 6. Nginxアクセスログに時刻、匿名化session、method、URI、接続番号（`conn:$connection`）、応答完了時刻（`msec:$msec`）、接続先（`upstream_addr`）と`upstream_connect`・`upstream_header`があるか確認する。接続番号とmsecが無いとベンチ側の接続の使い方（`client.*`）は出ず、upstream系が無いと接続先別の内訳（briefの`upstreams`）は出ない
 7. 生成済みのsysstat、perf、host-sampler、service-sampler、alp、slp、optionalなperf-flamegraph/offcpu collectorを確認する。`[observability].service_units`には実際に負荷を担う少数のsystemd unitだけを指定し、不要なら空のままにする。アクセスログ・slow logのpathとformat（時系列用field名を含む）を実環境へ合わせる。Flame Graph scriptsや`offcputime-bpfcc`がなければcollectorは`unavailable`になる。既定commandはalp 1.0.21とslp 0.2.1で検証済み（awkはmawk・gawk・BSD awkで動く）。alpとslpはnodeに入っている前提で、無ければcollectorは`failed`になる。ALPの正確なcount、status、sum/avg、p50/p95/p99集約のため、`routes.toml`はpatternにcommaと`?`（alpは`?`を含むgroupに一致させられない。省略できる部分は選択肢で書く）、replaceに`$1`などのcaptureを使わず、1規則から固定canonical routeへ置換する。同じrouteへ置換する規則は隣り合わせて並べる（alpへ1つのgroupとして渡し、分位点を正しく出す。離れていると、そのrouteの分位点は出さない）
-8. `fingerprint.sh`のapp binaryやservice名を問題環境へ合わせ、各nodeへ冪等配置する
+8. `fingerprint.sh`を各nodeへ冪等配置し、比べたいpath（app binary、配置したsource、unit、環境変数file）を1行ずつ`/usr/local/lib/isuscope/fingerprint-paths`へ書く
 9. `bash -n benchmark.sh`、`bash -n parse-benchmark.sh`、`bash -n setup.sh`、`isuscope list`を実行してから、不足する場合だけ`setup.sh`の`apply_environment`へ冪等な導入処理を追加する
 10. ここで初めて`setup.sh`を実行し、`setup-state.json`が生成されることを確認する。標準ツールは自動installされない
 11. `isuscope doctor`を実行し、failureを解消する

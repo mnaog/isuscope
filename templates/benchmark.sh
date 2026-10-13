@@ -28,6 +28,14 @@ set -euo pipefail
 #   ISUSCOPE_PROJECT_ROOT=<対象プロジェクトの絶対path>
 #   ISUSCOPE_RUN_DIR=<今回の一時run directoryの絶対path>
 #   ISUSCOPE_RUN_MODE=run|survey-run
+#   ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS=<[benchmark] timeout_secondsを設定したときだけ>
+#     この秒数で自分から止め、結果を出して終わります。isuscopeはさらに30秒待ってから止めます。
+#     別nodeでbenchmarkerを動かす場合は、そのnode側でも止まるようにします（例: ssh先で
+#     `timeout -k 10 "$ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS" ./bench`）。手元のsshを止めても、
+#     別nodeのprocessが止まるとは限りません。
+#
+# isuscopeがベンチを止めたとき（期限、出力の途絶え、signal）は`[benchmark] cleanup_command`が
+# 動きます。別nodeのbenchmarkerを止める処理は、このscriptの`--cleanup`などにまとめて指定します。
 #
 # `survey-run`で`discovery-http`（HTTP中継でrequest/response bodyを記録するcollector）を使う場合は、
 # この値で接続先を切り替えます。通常のrunは実アプリへ、調査走行だけ中継へ向けます。

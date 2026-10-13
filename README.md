@@ -180,6 +180,20 @@ collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope ini
 
 `[benchmark] operator_line_pattern`に一致する行は、保存する前に捨てます。ISUCON12の`[ADMIN]`行のように、benchmarkerが運営向けにだけ出す情報はルール側であり、選手は見られません。捨てた行数だけを`run`の`operator`行と`brief`の`operator_lines_dropped`に残すので、log・metric・parser・briefのどこからも中身を読み戻せません。`doctor`が`sample_output`へparserを当てるときも同じ行を落とします。`[[nodes]]`に`rule_side = true`を付けたnode（benchmarker自身のmachineなど）では、collectorもdisk検査も動きません。
 
+### ベンチの前後：準備、同じ構成の再測定、期限
+
+`[benchmark]`の3つのcommandは、どれも手元でproject rootをcurrent directoryにして動きます。環境変数はisuscopeを起動したshellから引き継ぎ（`BENCH_REPEAT=...`のような指定もそのまま届きます）、`ISUSCOPE_RUN_ID`・`ISUSCOPE_RUN_DIR`・`ISUSCOPE_RUN_MODE`・`ISUSCOPE_PROJECT_ROOT`と、`--repeat`を付けたときは`ISUSCOPE_REPEAT_REASON`が加わります。stdoutとstderrは`benchmark-<name>-stdout`などのlogとしてrunに残り、結果は`run.json`の`hooks`に入ります。期限は`hook_timeout_seconds`（既定120秒）です。
+
+- `prepare_command`：毎回のベンチの前、before collectorより前に動きます（アプリの再起動など）。失敗したrunはcollectorもベンチも動かさず、FAILとして残します。
+- `identity_command`：配ったものを識別する値をstdoutへ出します。JSON objectならfieldごとに比べ、`run`の終了時に`identity`行へ並べます。
+- `cleanup_command`：isuscopeがベンチを止めたとき（下の期限、出力の途絶え、signal）に動きます。別nodeのbenchmarkerを止める処理はここにまとめます。
+
+**同じ構成は理由なしに測り直しません。** before collectorの後で、ベンチを実際に始めた直前のrun（prepareで止まったrunや、ここで止めたrunは含めない）と、配ったもの（`identity_command`の出力。無ければsourceの状態）、nodeのfingerprint、計測の設定（`config.toml`、`routes.toml`、`[tooling] include`のfile、isuscopeの版）、runの種類を比べます。違いが1つも無ければベンチを始めずにFAILとして残すので、deployし忘れや編集の失敗に、ベンチ1回分の時間を使いません。ばらつきの確認や観測の追加で同じ構成を測るときは`--repeat "<理由>"`を付けます。比べた結果は`run.json`の`repeat`（比較元、違った項目、理由）に残り、`run`の終了時に`changed`行（違った項目）か`repeat`行（理由）で出ます。片方にしか無いfingerprintは「同じ」とは扱いません。nodeのfingerprintは`/usr/local/lib/isuscope/fingerprint.sh`が出し、比べたいfile・directoryは`/usr/local/lib/isuscope/fingerprint-paths`へ1行ずつ書きます。
+
+**期限。** `timeout_seconds`はベンチ全体の期限で、adapterへ`ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS`として渡します。adapterがその秒数で自分から止めて結果を出せるよう、isuscope自身が止めるのはさらに30秒後です。`idle_timeout_seconds`は、stdoutにもstderrにも何も出ない時間の上限です（initializeやpollの間に黙る時間より長くします）。isuscopeが止めたrunは`benchmark.stopped_by`に`timeout`・`idle`・`interrupted`のどれかが残り、`run`の終了時に`stopped`行で出ます。手元のsshを止めても別nodeのbenchmarkerが止まるとは限らないので、adapterはそのnode側でも止まるようにし（例：`timeout -k 10 "$ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS" ./bench`）、`cleanup_command`でも止めます。
+
+**initializeの境界。** まずベンチの出力（`initialize_start_marker`・`initialize_finish_marker`の文言か、`isuscope.event`の行）が届いた時刻から取ります。取れなかったrunでは、ベンチの直後に`phase = "boundary"`のcollectorが動きます。雛形の`initialize-boundary`は、`routes.toml`の`[initialize]`（`method`と、query stringを除いて完全一致する`path`）に一致する要求のうち、ベンチの間で最後に応答を返し終えた時刻（access logの`$msec`）を負荷の始まりにします。どこから取ったかは`benchmark.initialize_source`（`benchmark_output`か`access_log`）に残り、`run`の終了時に`initialize`行で出ます。境界の無いrunは、hosts・clients・databaseがinitializeを含むベンチ全体の要約になるので、`brief`の`warnings`で伝えます。
+
 parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例（categoryごとに最初の5件、最大20 category、各1000文字）で、runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure_reason`、`brief`の`benchmark_messages`、`run`終了時の`failure`／`error`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
 
 ### 最初のrunで確認すること
@@ -214,7 +228,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 
-`[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockはdirectoryの中の`lock` fileを`flock`で握るもので、kernelが所有processの終了時に外すため、落ちたprocessのlockは残りません。`owner`は誰が握っているかの説明だけで、生きた所有者がいれば終了code 75で止まります。lock fileは消さずに残ります。
+`[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。after collectorが終わってnodeへの操作が無くなった時点で手放すので、runが手元で保存している間に次のdeployを始められます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockはdirectoryの中の`lock` fileを`flock`で握るもので、kernelが所有processの終了時に外すため、落ちたprocessのlockは残りません。`owner`は誰が握っているかの説明だけで、生きた所有者がいれば終了code 75で止まります。lock fileは消さずに残ります。
 
 `[lock]`が無くても、同じdata directoryで2つの`run`は重なりません。`run`は入口で`runs/.incomplete`のdirectoryを`flock`で握って終わるまで持ち、同時に始めた2本目は、1本目がまだディスク確認やgit snapshotの途中でも開始を拒みます。実行中のrunは`runs/.incomplete/<run-id>.running`も`flock`で握ります。握られていない`.incomplete`のrunだけを、中断されたrunとして`aborted`で確定します。
 

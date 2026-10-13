@@ -54,6 +54,26 @@ type QueueKey = (String, Option<String>);
 /// 超えると新しい接続を落とし始めるので、それより少なく抑える。
 const MAX_CONCURRENT_PER_NODE: usize = 8;
 
+/// `{"type":"isuscope.event",...}`の行を、collectorが保存したstdoutから読む。
+pub fn read_events(run_dir: &Path, output: &CollectorOutput) -> Vec<Value> {
+    use std::io::BufRead;
+    let Some(log) = output.logs.iter().find(|log| log.kind.ends_with(":stdout")) else {
+        return Vec::new();
+    };
+    let Ok(file) = fs::File::open(run_dir.join("logs").join(format!("{}.zst", log.id))) else {
+        return Vec::new();
+    };
+    let Ok(decoder) = zstd::stream::read::Decoder::new(file) else {
+        return Vec::new();
+    };
+    std::io::BufReader::new(decoder)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .filter(|value| value.get("type").and_then(Value::as_str) == Some("isuscope.event"))
+        .collect()
+}
+
 pub async fn cleanup_abandoned(config: &LoadedConfig, run_ids: &[String]) {
     for run_id in run_ids {
         if Uuid::parse_str(run_id).is_err() {
@@ -2134,6 +2154,16 @@ fn make_spec(
     } else {
         None
     };
+    let initialize = if collector
+        .command
+        .iter()
+        .any(|argument| argument.contains("{initialize_"))
+    {
+        let path = config.project_root.join(".isuscope/routes.toml");
+        crate::transition::initialize_route(path.is_file().then_some(path.as_path()))?
+    } else {
+        None
+    };
     let windows = RunWindows::read(run_dir);
     let expanded = collector
         .command
@@ -2150,6 +2180,16 @@ fn make_spec(
             .replace("{benchmark_started_at}", &windows.started_at)
             .replace("{load_started_at}", &windows.load_started_at)
             .replace("{benchmark_finished_at}", &windows.finished_at)
+            .replace(
+                "{initialize_method}",
+                initialize
+                    .as_ref()
+                    .map_or("", |route| route.method.as_str()),
+            )
+            .replace(
+                "{initialize_path}",
+                initialize.as_ref().map_or("", |route| route.path.as_str()),
+            )
         })
         .collect::<Vec<_>>();
     let (program, args) = expanded
