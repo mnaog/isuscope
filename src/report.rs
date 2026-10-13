@@ -613,6 +613,17 @@ fn coverage(
     series: &[Metric],
 ) -> Vec<CoverageSummary> {
     let metrics = summary.iter().chain(series).collect::<Vec<_>>();
+    // nginxが動いていても要求の来なかったnode（ベンチの宛先でないapp2〜5など）は、HTTPの値が無くて
+    // 当然なので欠落として数えない。access logが1byteも増えなかったnodeだけを対象にする。
+    let idle_http_nodes = metrics
+        .iter()
+        .filter(|metric| metric.name == "http.access_log_bytes")
+        .fold(BTreeMap::<&str, bool>::new(), |mut nodes, metric| {
+            if let Some(node) = metric.labels.get("node") {
+                *nodes.entry(node.as_str()).or_insert(true) &= metric.value == 0.0;
+            }
+            nodes
+        });
     let mut coverage = Vec::new();
     for section in ["http", "database", "cpu", "host", "profiles"] {
         let section_collectors = collectors
@@ -635,8 +646,14 @@ fn coverage(
             continue;
         }
         for collector in section_collectors {
+            let idle = section == "http"
+                && collector
+                    .node
+                    .as_deref()
+                    .is_some_and(|node| idle_http_nodes.get(node) == Some(&true));
             let missing_metrics = expected_collector_metrics(&collector.name)
                 .iter()
+                .filter(|_| !idle)
                 .filter(|name| {
                     !metrics.iter().any(|metric| {
                         metric.name == **name && metric_matches_collector(metric, collector)
@@ -1192,6 +1209,31 @@ mod tests {
             partial.iter().find(|row| row.node == "db2").unwrap().status,
             "complete"
         );
+        // practice-12-sixth: the benchmark only reached app1; app2's access log did not grow, so
+        // its alp output is empty without anything being missing. app3's log grew and stays missing.
+        let mut idle_log = metric("http.access_log_bytes", "app2", "nginx-log-delta");
+        idle_log.value = 0.0;
+        let idle = coverage(
+            &[
+                collector("alp", "app2", "complete"),
+                collector("alp", "app3", "complete"),
+            ],
+            &[
+                idle_log,
+                metric("http.access_log_bytes", "app3", "nginx-log-delta"),
+            ],
+            &[],
+        );
+        let app2 = idle.iter().find(|row| row.node == "app2").unwrap();
+        assert_eq!(
+            (app2.status.as_str(), app2.missing_metrics.len()),
+            ("complete", 0)
+        );
+        assert_eq!(
+            idle.iter().find(|row| row.node == "app3").unwrap().status,
+            "missing"
+        );
+
         let metrics = vec![
             metric("http.requests", "app1", "alp"),
             metric("http.request_duration", "app1", "alp"),
