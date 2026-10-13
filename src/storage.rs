@@ -297,8 +297,9 @@ impl Store {
             )?;
         }
         for metric in metrics {
-            transaction.execute(
+            transaction.prepare_cached(
                 "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?.execute(
                 params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
             )?;
         }
@@ -494,12 +495,29 @@ impl Store {
             let labels =
                 serde_json::from_str::<std::collections::BTreeMap<String, String>>(&labels)
                     .context("invalid fingerprint labels")?;
-            // JSON encoding of a tuple is unambiguous and BTreeMap makes the complete label set
-            // canonical. Do not collapse custom dimensions such as service or path into node.
-            let key = serde_json::to_string(&(name, labels))?;
-            index.insert(key, value);
+            index.insert(fingerprint_key(&name, &labels)?, value);
         }
         Ok((!index.is_empty()).then_some(index))
+    }
+
+    /// The newest run, other than `exclude`, whose benchmark actually started. A run that
+    /// stopped in `prepare_command` or was refused as a repeat is never the base.
+    pub fn last_started_run(&self, exclude: &str) -> Result<Option<RunManifest>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM runs WHERE id != ?1 AND state != 'running' ORDER BY started_at DESC LIMIT 200",
+        )?;
+        let ids = statement
+            .query_map([exclude], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in ids {
+            let Ok(manifest) = self.load(&id) else {
+                continue;
+            };
+            if manifest.benchmark.mode != "not-started" && manifest.benchmark.started_at.is_some() {
+                return Ok(Some(manifest));
+            }
+        }
+        Ok(None)
     }
 
     pub fn metrics(&self, id: &str) -> Result<Vec<Metric>> {
@@ -833,8 +851,9 @@ impl Store {
                 )?;
             }
             for metric in &output.metrics {
-                transaction.execute(
+                transaction.prepare_cached(
                     "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?.execute(
                     params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
                 )?;
             }
@@ -1084,8 +1103,9 @@ impl Store {
             )?;
         }
         for metric in metrics {
-            transaction.execute(
+            transaction.prepare_cached(
                 "INSERT INTO metrics (run_id, name, value, unit, observed_at, labels_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?.execute(
                 params![manifest.id, metric.name, metric.value, metric.unit, metric.timestamp.map(|value| value.to_rfc3339()), serde_json::to_string(&metric.labels)?],
             )?;
         }
@@ -1171,6 +1191,16 @@ fn is_snapshot_name(name: &str) -> bool {
         && name.ends_with(".json.zst")
         && !name.contains('/')
         && !name.contains('\\')
+}
+
+/// The key `fingerprint_index` uses for one fingerprint. JSON encoding of a tuple is
+/// unambiguous and BTreeMap makes the complete label set canonical. Do not collapse custom
+/// dimensions such as service or path into node.
+pub fn fingerprint_key(
+    name: &str,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    Ok(serde_json::to_string(&(name, labels))?)
 }
 
 fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) -> Result<()> {
@@ -1619,6 +1649,10 @@ mod tests {
             fingerprint_count: 0,
             transition_count: 0,
             structured_snapshot: None,
+            stages: Vec::new(),
+            hooks: Vec::new(),
+            identity: None,
+            repeat: None,
         };
         store.begin(&manifest).unwrap();
         drop(store);

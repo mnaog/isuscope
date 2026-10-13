@@ -213,7 +213,16 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     );
 
     // Analysis, not adoption, controls the next benchmark.
-    ok(p, &["run", "--hypothesis", "follow-up without a decision"]);
+    ok(
+        p,
+        &[
+            "run",
+            "--hypothesis",
+            "follow-up without a decision",
+            "--repeat",
+            "check the variance",
+        ],
+    );
     let brief = json(p, &["brief", &candidate]);
     assert_eq!(brief["review"]["comparison"]["score_delta_percent"], -10.0);
 

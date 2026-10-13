@@ -1,11 +1,9 @@
-//! Commands around the benchmark itself: `[benchmark] prepare_command`, which runs before every
-//! collector, and `[benchmark] rescore_command`, which `isuscope rescore` uses to judge a run
-//! whose result the adapter left pending.
+//! `[benchmark] rescore_command`, which `isuscope rescore` uses to judge a run whose result the
+//! adapter left pending.
 use crate::{
-    benchmark::compress_log,
     collector::capture_capped,
     config::LoadedConfig,
-    model::{AnalysisStatus, LogRef, RunManifest},
+    model::{AnalysisStatus, RunManifest},
     process,
     storage::Store,
 };
@@ -107,41 +105,6 @@ async fn run_command(
         stdout,
         stderr,
     })
-}
-
-/// Runs `[benchmark] prepare_command` before any collector. Its output is kept as the
-/// `benchmark-prepare` logs; the returned error means the benchmark must not start.
-pub async fn prepare(
-    config: &LoadedConfig,
-    run_id: &str,
-    run_dir: &Path,
-    logs: &mut Vec<LogRef>,
-) -> Option<String> {
-    let benchmark = &config.config.benchmark;
-    let finished = match run_command(
-        config,
-        "benchmark-prepare",
-        &benchmark.prepare_command,
-        run_id,
-        run_dir,
-        Duration::from_secs(benchmark.prepare_timeout_seconds),
-    )
-    .await
-    {
-        Ok(finished) => finished,
-        Err(error) => return Some(format!("{error:#}")),
-    };
-    for (raw, stream) in [(&finished.stdout, "stdout"), (&finished.stderr, "stderr")] {
-        let id = format!("benchmark-prepare-{stream}");
-        if compress_log(raw, &run_dir.join("logs").join(format!("{id}.zst"))).is_ok() {
-            logs.push(LogRef {
-                id,
-                kind: format!("benchmark-prepare:{stream}"),
-                node: None,
-            });
-        }
-    }
-    finished.error
 }
 
 pub struct RescoreOutcome {

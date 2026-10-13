@@ -166,13 +166,30 @@ pub struct BenchmarkConfig {
     pub parsers: Vec<BenchmarkParserConfig>,
     /// Saved real benchmark stdout; `doctor` runs every parser against it.
     pub sample_output: Option<PathBuf>,
-    /// Runs before any collector and the benchmark, for example to restart the application so
-    /// that transactions left open by an earlier, interrupted benchmark cannot block initialize.
-    /// A failure records the run as not started.
+    /// Runs before every benchmark, ahead of the before collectors (for example to restart
+    /// the application). A failure records the run as FAIL without starting the benchmark.
     #[serde(default)]
-    pub prepare_command: Vec<String>,
-    #[serde(default = "default_prepare_timeout")]
-    pub prepare_timeout_seconds: u64,
+    pub prepare_command: Option<Vec<String>>,
+    /// Prints what is deployed (a JSON object of names to values, or any text). isuscope
+    /// compares it, with the node fingerprints and the observation settings, against the last
+    /// run whose benchmark started, and refuses an identical run unless `--repeat` is given.
+    #[serde(default)]
+    pub identity_command: Option<Vec<String>>,
+    /// Runs when isuscope stops the benchmark (timeout, no output, or a signal), to stop
+    /// whatever the adapter started elsewhere (a benchmarker on another node).
+    #[serde(default)]
+    pub cleanup_command: Option<Vec<String>>,
+    /// Limit for the whole benchmark. The adapter gets it as
+    /// `ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS` and is expected to stop by then; isuscope stops the
+    /// benchmark itself only after a further grace period, so the two never race.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Stops the benchmark when it prints nothing on stdout or stderr for this long.
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+    /// Limit for each of `prepare_command`, `identity_command` and `cleanup_command`.
+    #[serde(default = "default_hook_timeout")]
+    pub hook_timeout_seconds: u64,
     /// Reads the saved stdout of a run whose result the adapter left pending, once the adapter
     /// can judge it (`isuscope rescore`). Takes the same placeholders as parsers, such as
     /// `{benchmark_stdout}`, and prints one `isuscope.result`.
@@ -239,6 +256,10 @@ pub struct NodeConfig {
 pub enum CollectorPhase {
     Before,
     During,
+    /// Right after the benchmark, only when its output gave no initialize boundary. These
+    /// collectors report the boundary (for example from the access log) before the during
+    /// collectors are parsed and the after collectors are given the windows.
+    Boundary,
     After,
 }
 
@@ -247,6 +268,7 @@ impl CollectorPhase {
         match self {
             Self::Before => "before",
             Self::During => "during",
+            Self::Boundary => "boundary",
             Self::After => "after",
         }
     }
@@ -286,6 +308,11 @@ pub struct CollectorConfig {
     pub roles: Vec<String>,
     #[serde(default)]
     pub modes: Vec<RunMode>,
+    /// Collectors on the same node and phase with the same `sequence` run one at a time in
+    /// configured order; different sequences run in parallel. Collectors without one share a
+    /// single sequence per node.
+    #[serde(default)]
+    pub sequence: Option<String>,
     pub command: Vec<String>,
     /// Optional adapter for a standard tool's native stdout.
     pub parser: Option<CollectorParser>,
@@ -332,6 +359,9 @@ fn default_ssh_user() -> String {
 fn default_connect_timeout() -> u64 {
     5
 }
+fn default_hook_timeout() -> u64 {
+    120
+}
 fn default_collector_timeout() -> u64 {
     90
 }
@@ -343,9 +373,6 @@ fn default_unavailable_exit_codes() -> Vec<i32> {
 }
 fn default_parser_timeout() -> u64 {
     30
-}
-fn default_prepare_timeout() -> u64 {
-    120
 }
 fn default_parser_output_bytes() -> u64 {
     16 * 1024 * 1024

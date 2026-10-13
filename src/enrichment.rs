@@ -95,7 +95,9 @@ async fn run_one(
     run_dir: &Path,
     generation: &str,
 ) -> EnrichmentOutput {
-    match execute(config, parser, run_id, run_dir, generation).await {
+    let started_at = chrono::Utc::now();
+    let started = std::time::Instant::now();
+    let mut output = match execute(config, parser, run_id, run_dir, generation).await {
         Ok(output) => output,
         Err(error) => EnrichmentOutput {
             result: EnrichmentResult {
@@ -108,11 +110,16 @@ async fn run_one(
                 tooling_path: None,
                 messages: Vec::new(),
                 omitted_message_count: 0,
+                started_at: None,
+                duration_ms: None,
             },
             logs: Vec::new(),
             metrics: Vec::new(),
         },
-    }
+    };
+    output.result.started_at = Some(started_at);
+    output.result.duration_ms = Some(started.elapsed().as_millis() as u64);
+    output
 }
 
 async fn execute(
@@ -306,6 +313,8 @@ async fn execute(
             tooling_path: None,
             messages,
             omitted_message_count,
+            started_at: None,
+            duration_ms: None,
         },
         logs,
         metrics,

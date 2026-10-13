@@ -87,3 +87,206 @@ command = ["sleep 1; echo second"]
         "collectors did not overlap: {elapsed:?}"
     );
 }
+
+/// The only saved run's `run.json`.
+fn only_manifest(config_dir: &std::path::Path) -> serde_json::Value {
+    let runs = fs::read_dir(config_dir.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().join("run.json").is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 1);
+    parsed(&fs::read(runs[0].path().join("run.json")).unwrap()).unwrap()
+}
+
+fn stage<'a>(manifest: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    manifest["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["name"] == name)
+        .unwrap_or_else(|| panic!("no stage {name}: {manifest}"))
+}
+
+fn stage_span(manifest: &serde_json::Value, name: &str) -> (i64, i64) {
+    let stage = stage(manifest, name);
+    let start = chrono::DateTime::parse_from_rfc3339(stage["started_at"].as_str().unwrap())
+        .unwrap()
+        .timestamp_millis();
+    (start, start + stage["duration_ms"].as_i64().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn sequences_on_one_node_run_at_once_and_keep_their_own_order() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    let tools = project.path().join("tools");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&tools).unwrap();
+    let fake_ssh = tools.join("ssh");
+    fs::write(
+        &fake_ssh,
+        "#!/bin/sh\nfor last; do :; done\nexec /bin/sh -c \"$last\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let order_log = project.path().join("order.log");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{{\"type\":\"isuscope.result\",\"pass\":true,\"score\":1}}'"]
+
+[disk]
+paths = []
+
+[[nodes]]
+name = "app1"
+host = "app1.internal"
+
+[[collectors]]
+name = "perf-like-start"
+phase = "before"
+transport = "ssh"
+sequence = "perf"
+command = ["sh", "-c", "sleep 1; echo start >> {log}"]
+
+[[collectors]]
+name = "perf-like-report"
+phase = "before"
+transport = "ssh"
+sequence = "perf"
+command = ["sh", "-c", "echo report >> {log}"]
+
+[[collectors]]
+name = "log-mark"
+phase = "before"
+transport = "ssh"
+sequence = "log"
+command = ["sh", "-c", "sleep 1; echo mark >> {log}"]
+"#,
+            log = order_log.display()
+        ),
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "sequences run at once"])
+        .env(
+            "PATH",
+            format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+        )
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let logged = fs::read_to_string(&order_log).unwrap();
+    let position = |line: &str| logged.lines().position(|logged| logged == line).unwrap();
+    // The same sequence keeps the configured order.
+    assert!(position("start") < position("report"), "{logged}");
+    let manifest = only_manifest(&config_dir);
+    // Two one second sequences on one node overlap: about one second, not two.
+    let before = stage(&manifest, "collectors_before")["duration_ms"]
+        .as_u64()
+        .unwrap();
+    assert!(before < 1_800, "sequences did not overlap: {before} ms");
+    // Outputs stay in configured order, and each collector records how long it took.
+    let collectors = manifest["collectors"].as_array().unwrap();
+    let names = collectors
+        .iter()
+        .map(|collector| collector["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["perf-like-start", "perf-like-report", "log-mark"]);
+    assert!(collectors[0]["duration_ms"].as_u64().unwrap() >= 1_000);
+    assert!(collectors[0]["started_at"].is_string());
+}
+
+#[cfg(unix)]
+#[test]
+fn during_collectors_stop_at_once_and_parsers_overlap_the_after_phase() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    // Both ignore SIGTERM, so each one holds its stop for the whole two second grace period.
+    let stubborn = "trap '' TERM; while :; do sleep 0.1; done";
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{{\"type\":\"isuscope.result\",\"pass\":true,\"score\":1}}'"]
+
+[[benchmark.parsers]]
+name = "slow-parser"
+command = ["sh", "-c", "sleep 1"]
+
+[disk]
+paths = []
+
+[[collectors]]
+name = "stubborn-one"
+phase = "during"
+command = ["sh", "-c", "{stubborn}"]
+
+[[collectors]]
+name = "stubborn-two"
+phase = "during"
+command = ["sh", "-c", "{stubborn}"]
+
+[[collectors]]
+name = "slow-after"
+phase = "after"
+command = ["sh", "-c", "sleep 1"]
+"#
+        ),
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "stop at once"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("\ntiming    "), "{stdout}");
+
+    let manifest = only_manifest(&config_dir);
+    // Two two second grace periods side by side, not one after the other.
+    let stop = stage(&manifest, "collectors_during_stop")["duration_ms"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        stop < 3_500,
+        "during collectors stopped one by one: {stop} ms"
+    );
+    let names = manifest["collectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|collector| collector["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["stubborn-one", "stubborn-two", "slow-after"]);
+    // The benchmark parser reads only the benchmark output, so it runs while the during
+    // collectors stop and the after collectors run.
+    let parsers = stage_span(&manifest, "benchmark_parsers");
+    let stopping = stage_span(&manifest, "collectors_during_stop");
+    assert!(
+        parsers.0 < stopping.1 && stopping.0 < parsers.1,
+        "parsers {parsers:?} did not overlap {stopping:?}"
+    );
+    assert!(manifest["enrichments"][0]["duration_ms"].as_u64().unwrap() >= 1_000);
+}

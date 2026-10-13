@@ -1118,6 +1118,7 @@ mod tests {
             exit_code: Some(0),
             error: None,
             log_ids: vec!["perf-flamegraph-app1-after-stdout".into()],
+            ..Default::default()
         };
         let run_logs = std::path::Path::new("runs/old/logs");
         let historical = profile_artifacts(std::slice::from_ref(&collector), run_logs, None);
@@ -1152,6 +1153,7 @@ mod tests {
             exit_code: (status == "complete").then_some(0),
             error: None,
             log_ids: Vec::new(),
+            ..Default::default()
         };
         let metric = |name: &str, node: &str, collector: &str| Metric {
             name: name.into(),

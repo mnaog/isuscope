@@ -92,7 +92,15 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
         "--analysis",
         "比較元として記録する",
     ]);
-    isuscope(&["run", "--hypothesis", "candidate", "--tag", "bench:v2"]);
+    isuscope(&[
+        "run",
+        "--hypothesis",
+        "candidate",
+        "--tag",
+        "bench:v2",
+        "--repeat",
+        "compare the same deployment under another bench condition",
+    ]);
     let candidate: serde_json::Value = parsed(&isuscope(&["list", "--limit", "1"])).unwrap();
     let candidate_id = candidate["runs"]["rows"][0]["id"]
         .as_str()
@@ -417,7 +425,7 @@ fn brief_cuts_every_table_to_fit_the_output_limit() {
         r#"
 [benchmark]
 mode = "command"
-command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"score\":100,\"pass\":true}'"]
+command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.event\",\"name\":\"initialize-started\"}' '{\"type\":\"isuscope.event\",\"name\":\"initialize-finished\"}' '{\"type\":\"isuscope.result\",\"score\":100,\"pass\":true}'"]
 
 [[collectors]]
 name = "app-log-delta"
