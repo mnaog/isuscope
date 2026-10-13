@@ -192,7 +192,7 @@ collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope ini
 
 ### ベンチの前後：準備、同じ構成の再測定、期限
 
-`[benchmark]`の3つのcommandは、どれも手元でproject rootをcurrent directoryにして動きます。環境変数はisuscopeを起動したshellから引き継ぎ（`BENCH_REPEAT=...`のような指定もそのまま届きます）、`ISUSCOPE_RUN_ID`・`ISUSCOPE_RUN_DIR`・`ISUSCOPE_RUN_MODE`・`ISUSCOPE_PROJECT_ROOT`と、`--repeat`を付けたときは`ISUSCOPE_REPEAT_REASON`が加わります。stdoutとstderrは`benchmark-<name>-stdout`などのlogとしてrunに残り、結果は`run.json`の`hooks`に入ります。期限は`hook_timeout_seconds`（既定120秒）です。
+`[benchmark]`の3つのcommandは、どれも手元でproject rootをcurrent directoryにして動きます。環境変数はisuscopeを起動したshellから引き継ぎ（`FOO=... isuscope run`のような指定もそのまま届きます）、`ISUSCOPE_RUN_ID`・`ISUSCOPE_RUN_DIR`・`ISUSCOPE_RUN_MODE`・`ISUSCOPE_PROJECT_ROOT`と、`--repeat`を付けたときは`ISUSCOPE_REPEAT_REASON`が加わります。stdoutとstderrは`benchmark-<name>-stdout`などのlogとしてrunに残り、結果は`run.json`の`hooks`に入ります。期限は`hook_timeout_seconds`（既定120秒）です。
 
 - `prepare_command`：毎回のベンチの前、before collectorより前に動きます（アプリの再起動など）。失敗したrunはcollectorもベンチも動かさず、FAILとして残します。
 - `identity_command`：配ったものを識別する値をstdoutへ出します。JSON objectならfieldごとに比べ、`run`の終了時に`identity`行へ並べます。
@@ -226,7 +226,9 @@ access logに`conn:$connection`と`msec:$msec`があると、`alp` collectorがn
 
 `host-sampler`はコア別の使用率（`host.core_busy_percent`と、最も詰まっているコアの`host.core_busy_max_percent`）と、PSI（`host.psi_cpu_some_percent`など、CPU・memory・I/Oの不足でtaskが足止めされた時間の割合）も出します。全体のCPUに余裕があっても1コアだけ飽和している構成を見落とさないためです。`service-throttle`は、cgroupのCPU上限で止められた時間（`service.cpu_throttled_percent`、`service.cpu_throttled_periods_per_second`）と割当量（`service.cpu_quota_cores`）をunitごとに出します。
 
-slow logは、`mysql-log-delta`がベンチ中の差分をDB node上に用意し、`slp`がその場でinitializeと負荷区間に分けて集計します。区間は各文の開始時刻で決めます。`SET timestamp=`は開始の秒（epoch）しか持たないので、`# Time:`（書き終えた時刻、マイクロ秒）の秒以下から`Query_time`を引いて補い、負荷の始まりの直後の文をinitializeへ入れません。秒以下だけを使うのでtimezoneに依存せず、`# Time:`の無い文は秒で振り分けて`db.slow_log_coarse_time`に数を残します。一括INSERTの`VALUES`と`IN`の並びは`--bundle-values --bundle-where-in`で1つの文にまとめます。文ごとに回数・合計・最大・p95・p99・lock・rowsを`window` label付きで出し、DB全体の5秒ごとの回数と時間（`db.calls`、`db.duration`）も出します。briefのDB欄は負荷区間（`database_window`）の行だけで順位を付けるので、initializeの一括投入が上位を占めません。区間は`isuscope query latest --view database --window load`で選べます。生のslow logは通常のrunでは運ばず、`survey-run`でだけ`mysql-log-raw`が持ち帰ります（DB 1台あたり1 runで数十MBになるため）。slpはAnsibleのobservability roleが入れる前提で、無いnodeでは`doctor`と`slp` collectorが失敗します。
+SQLの回数と時間は、既定ではperformance_schemaのstatement digestから取ります（`mysql-digest`）。ベンチの前にdigest表を空にし、ベンチの間は1秒ごとに累積値を写し、ベンチの後にinitializeと負荷区間の差を出します。slow log（`long_query_time=0`）は全文を書くのでベンチ中のDBの負荷になり、後のslpの集計も数十秒かかるためです。出力はslpと同じ形なので、briefとqueryのdatabase viewは同じように使えます（両方あればdigestを使います）。p95・p99・最大はinitializeを含むベンチ全体の分布です。MariaDBやperformance_schemaが無効な環境では`mysql-digest`が`unavailable`になるので、slow logを有効にします。
+
+slow logを有効にした場合は、`mysql-log-delta`がベンチ中の差分をDB node上に用意し、`slp`がその場でinitializeと負荷区間に分けて集計します。区間は各文の開始時刻で決めます。`SET timestamp=`は開始の秒（epoch）しか持たないので、`# Time:`（書き終えた時刻、マイクロ秒）の秒以下から`Query_time`を引いて補い、負荷の始まりの直後の文をinitializeへ入れません。秒以下だけを使うのでtimezoneに依存せず、`# Time:`の無い文は秒で振り分けて`db.slow_log_coarse_time`に数を残します。一括INSERTの`VALUES`と`IN`の並びは`--bundle-values --bundle-where-in`で1つの文にまとめます。文ごとに回数・合計・最大・p95・p99・lock・rowsを`window` label付きで出し、DB全体の5秒ごとの回数と時間（`db.calls`、`db.duration`）も出します。briefのDB欄は負荷区間（`database_window`）の行だけで順位を付けるので、initializeの一括投入が上位を占めません。区間は`isuscope query latest --view database --window load`で選べます。生のslow logは通常のrunでは運ばず、`survey-run`でだけ`mysql-log-raw`が持ち帰ります（DB 1台あたり1 runで数十MBになるため）。slow logがあるのにslpが無いnodeでは、`doctor`と`slp` collectorが失敗します（slow logが無ければ`slp`は`unavailable`で飛ばします）。
 
 `mysql-status`は2秒ごとに`SHOW GLOBAL STATUS`から、実行中thread、行lock待ちの回数と時間、log flush待ち、buffer poolの読み込み、fsyncを出します（`mysql.threads_running`、`mysql.row_lock_waits_per_second`など）。SQLが遅い理由が実行そのものか、競合やI/Oかを分けるための最小限で、Performance Schemaは有効化しません（有効化すると測る対象が変わるため、必要なときだけ別に行います）。
 
@@ -249,7 +251,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 ## 観測の考え方
 
-標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、slow query、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。5秒ごとに集計する値（HTTP、DB、perf、client）は負荷の始まりから区切るので、負荷の最初のbucketが落ちたりinitializeへ混ざったりしません。briefの`hosts`と`clients`は、initializeの終わりが分かるrunでは負荷区間だけで要約し、どちらで要約したかを`hosts_window`（`load`か`whole`）に出します。
+標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、SQL（statement digest、またはslow log）、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。5秒ごとに集計する値（HTTP、DB、perf、client）は負荷の始まりから区切るので、負荷の最初のbucketが落ちたりinitializeへ混ざったりしません。briefの`hosts`と`clients`は、initializeの終わりが分かるrunでは負荷区間だけで要約し、どちらで要約したかを`hosts_window`（`load`か`whole`）に出します。
 
 ALPはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。標準collectorを最初から全部入れる理由と、その受け入れ基準は[標準observability](docs/standard-observability.md)にあります。
 

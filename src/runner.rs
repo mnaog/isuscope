@@ -260,13 +260,6 @@ pub async fn execute(
         after_outputs = Some(Vec::new());
     } else if shutdown.is_cancelled() {
         manifest.benchmark = interrupted_benchmark();
-    } else if let Some(error) = &prepare_error {
-        manifest.benchmark = BenchmarkResult {
-            mode: "not-started".into(),
-            passed: Some(false),
-            error: Some(format!("prepare_command failed: {error}")),
-            ..Default::default()
-        };
     } else if required_failed {
         manifest.benchmark = BenchmarkResult {
             mode: "not-started".into(),

@@ -1,7 +1,7 @@
 //! `[benchmark]`の`prepare_command`・`identity_command`・`cleanup_command`を動かす。
 //!
 //! どれも手元で、project rootをcurrent directoryにして動かす。環境変数はisuscopeを起動した
-//! shellのものをそのまま引き継ぎ（`BENCH_REPEAT=...`のような指定もそのまま届く）、runの情報を
+//! shellのものをそのまま引き継ぎ（`FOO=... isuscope run`のような指定もそのまま届く）、runの情報を
 //! `ISUSCOPE_*`で足す。stdoutとstderrはrunのlogへ残す。
 
 use crate::{
