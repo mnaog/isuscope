@@ -81,6 +81,13 @@ pub async fn execute(
             short_id(&run.id),
         );
     }
+    if let Some(run) = store.pending_results()?.first() {
+        bail!(
+            "run {} has a pending result; make the benchmark adapter judge its saved output (logs/benchmark-stdout.zst), then run `isuscope rescore {}` before starting another benchmark",
+            short_id(run),
+            short_id(run),
+        );
+    }
     check_node_disks(&config).await?;
     let agent_context = agent_context::resolve(&config)?;
     let id = Uuid::now_v7().to_string();
@@ -253,6 +260,13 @@ pub async fn execute(
         after_outputs = Some(Vec::new());
     } else if shutdown.is_cancelled() {
         manifest.benchmark = interrupted_benchmark();
+    } else if let Some(error) = &prepare_error {
+        manifest.benchmark = BenchmarkResult {
+            mode: "not-started".into(),
+            passed: Some(false),
+            error: Some(format!("prepare_command failed: {error}")),
+            ..Default::default()
+        };
     } else if required_failed {
         manifest.benchmark = BenchmarkResult {
             mode: "not-started".into(),
@@ -452,6 +466,7 @@ pub async fn execute(
         match manifest.benchmark.passed {
             Some(true) => "PASS",
             Some(false) => "FAIL",
+            None if manifest.benchmark.pending => "PENDING",
             None => "UNKNOWN",
         }
     );
@@ -488,6 +503,13 @@ pub async fn execute(
         );
     }
     println!("analysis  {}", manifest.analysis_status.as_str());
+    if manifest.benchmark.pending {
+        println!();
+        println!(
+            "next      make the adapter judge logs/benchmark-stdout.zst of this run, then isuscope rescore {}",
+            short_id(&id)
+        );
+    }
     if manifest.analysis_status == AnalysisStatus::Pending {
         println!();
         println!(

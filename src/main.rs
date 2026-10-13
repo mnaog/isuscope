@@ -8,6 +8,7 @@ use isuscope::{
     model::{AnalysisVerdict, RunManifest, RunMode},
     query::{self, DatabaseQueryOptions, HttpQueryOptions, MetricQueryOptions, QueryScope},
     report::{self, RunDiagnostics},
+    result_commands,
     runner::{self, RunAnnotations},
     shutdown::Shutdown,
     storage::{RunSummary, Store},
@@ -200,6 +201,11 @@ enum Commands {
     },
     /// 保存済みbenchmark logへ現在のparserを適用します。
     Enrich {
+        /// run ID、一意な短縮ID、または一意なtagを指定します。
+        run: String,
+    },
+    /// adapterが判定を保留したrunを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定します。
+    Rescore {
         /// run ID、一意な短縮ID、または一意なtagを指定します。
         run: String,
     },
@@ -681,6 +687,37 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 }
             );
             Ok(!outcome.failed)
+        }
+        Commands::Rescore { run } => {
+            let outcome = result_commands::rescore(&config, &run).await?;
+            let manifest = &outcome.manifest;
+            println!("run       {}", runner::short_id(&manifest.id));
+            println!(
+                "result    {}",
+                if manifest.benchmark.passed == Some(true) {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
+            );
+            println!(
+                "score     {}",
+                manifest
+                    .benchmark
+                    .score
+                    .map(|score| score.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            println!("state     {}", manifest.state.as_str());
+            println!("analysis  {}", manifest.analysis_status.as_str());
+            if manifest.analysis_status == isuscope::model::AnalysisStatus::Pending {
+                println!();
+                println!(
+                    "next      isuscope analyze {} <supported|rejected|inconclusive> --analysis <text>",
+                    runner::short_id(&manifest.id)
+                );
+            }
+            Ok(true)
         }
         Commands::Doctor => {
             let report = doctor::run(&config).await?;
@@ -1785,10 +1822,11 @@ fn preferred_cpu(row: &BucketRow) -> &[f64] {
 }
 
 fn series_coverage(collectors: &[isuscope::model::CollectorResult]) -> Vec<SeriesCoverage> {
-    const SERIES_COLLECTORS: [&str; 9] = [
+    const SERIES_COLLECTORS: [&str; 10] = [
         "host-sampler",
         "sysstat",
         "service-sampler",
+        "process-sampler",
         "nginx-log-delta",
         "alp",
         "nginx-series",
@@ -2306,10 +2344,28 @@ fn build_brief(
     );
     let mut brief = brief::build(diagnostics, benchmark, score_inputs, limit);
     let mut extra = Vec::new();
-    for prefix in ["log.", "db.file.", "db.memory."] {
+    for prefix in ["log.", "db.file.", "db.memory.", "net."] {
         extra.extend(store.query_metrics(&brief.summary.id, &[], Some(prefix), Some(false))?);
     }
     brief::attach_logs_and_database_io(&mut brief, &extra, limit);
+    // 上限：ベンチ前の値（limit.）、logの型、listen overflow、接続数のピーク。
+    let mut limits = extra
+        .into_iter()
+        .filter(|metric| metric.name == "log.error_lines")
+        .collect::<Vec<_>>();
+    limits.extend(store.query_metrics(&brief.summary.id, &[], Some("limit."), Some(false))?);
+    limits.extend(store.query_metrics(
+        &brief.summary.id,
+        &[
+            "host.tcp_listen_overflows".into(),
+            "host.tcp_established".into(),
+            "mysql.threads_connected".into(),
+            "client.connection_requests_max".into(),
+        ],
+        None,
+        None,
+    )?);
+    brief::attach_limits(&mut brief, &limits, limit);
     brief.review = Some(brief::review(review));
     brief::next_steps(&mut brief);
     Ok(brief)

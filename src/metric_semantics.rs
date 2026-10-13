@@ -86,6 +86,8 @@ fn is_additive(name: &str) -> bool {
             | "host.tcp_listen_drops"
             | "host.tcp_syn_cookies_sent"
             | "host.tcp_time_wait_overflow"
+            | "service.process_restarts"
+            | "net.allowance_exceeded"
             | "benchmark.error"
             | "benchmark.dns.failed"
             | "benchmark.dns.resolved"

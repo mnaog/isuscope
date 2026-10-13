@@ -2568,6 +2568,29 @@ mod tests {
     }
 
     #[test]
+    fn statement_digest_rows_use_the_slp_windows_shape() {
+        // mysql-digest collectorの行。分位の無いMySQL（8.0より前）では空の列になる。
+        let raw = "load\t996\tSELECT * FROM `t` WHERE `id` = ?\t0.996000000\t0.005000000\t0.003000000\t0.004000000\t0.002000000\t996\t4980\n\
+                   initialize\t1\tINSERT INTO `t` VALUES (...)\t1.000000000\t1.000000000\t\t\t0.000000000\t0\t100\n";
+        let metrics = parse_slp_windows(raw);
+        let value = |window: &str, name: &str| {
+            metrics
+                .iter()
+                .find(|metric| metric.name == name && metric.labels["window"] == window)
+                .map(|metric| metric.value)
+        };
+        assert_eq!(value("load", "db.query.calls"), Some(996.0));
+        assert_eq!(
+            value("load", "db.query.total_duration").map(|ms| ms.round()),
+            Some(996.0)
+        );
+        assert_eq!(value("load", "db.query.rows_examined"), Some(4980.0));
+        assert_eq!(value("load", "db.query.p95_duration"), Some(3.0));
+        assert_eq!(value("initialize", "db.query.calls"), Some(1.0));
+        assert_eq!(value("initialize", "db.query.p95_duration"), None);
+    }
+
+    #[test]
     fn slp_windows_keep_initialize_and_load_apart() {
         // 実際のcollectorとslp 0.2.1で、practice-12のslow logの抜粋を集計した出力。
         let raw = include_str!("../tests/fixtures/slp-windows-v0.2.1.out");

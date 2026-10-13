@@ -94,6 +94,8 @@ mod operation_lock;
 mod output_contract;
 #[path = "e2e/parallel.rs"]
 mod parallel;
+#[path = "e2e/prepare_rescore.rs"]
+mod prepare_rescore;
 #[path = "e2e/query.rs"]
 mod query;
 #[path = "e2e/score_inputs.rs"]
@@ -102,3 +104,5 @@ mod score_inputs;
 mod slow_log;
 #[path = "e2e/sql.rs"]
 mod sql;
+#[path = "e2e/statement_digest.rs"]
+mod statement_digest;

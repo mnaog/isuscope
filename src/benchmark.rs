@@ -37,6 +37,7 @@ struct Observation {
     operator_lines_dropped: usize,
     score: Option<i64>,
     passed: Option<bool>,
+    pending: bool,
     messages: Vec<String>,
     initialize_started_at: Option<chrono::DateTime<Utc>>,
     initialize_finished_at: Option<chrono::DateTime<Utc>>,
@@ -266,13 +267,17 @@ async fn execute_command(
     } else {
         observation.passed
     };
+    // 判定できない出力をadapterが`pending`で返したら、FAILにせず後から`rescore`で確定する。
+    // 実出力でparserを確かめる前の初回だけに使う。
+    let pending = passed.is_none() && observation.pending;
     Ok(BenchmarkExecution {
         result: BenchmarkResult {
             mode: "command".into(),
             command: benchmark.command.clone(),
             exit_code: status.code(),
-            score: observation.score,
+            score: if pending { None } else { observation.score },
             passed,
+            pending,
             interrupted,
             messages: observation.messages,
             started_at: None,
@@ -304,7 +309,7 @@ async fn execute_command(
                 ))
             } else if !status.success() {
                 Some(format!("benchmark command exited with {status}"))
-            } else if passed.is_none() {
+            } else if passed.is_none() && !pending {
                 Some(
                     "benchmark adapter reported no `pass` in its isuscope.result; fix .isuscope/benchmark.sh to emit the benchmark's own verdict"
                         .into(),
@@ -450,6 +455,9 @@ fn observe_line(
             if let Some(passed) = value.get("pass").and_then(Value::as_bool) {
                 observation.passed = Some(passed);
             }
+            if value.get("pending").and_then(Value::as_bool) == Some(true) {
+                observation.pending = true;
+            }
             if let Some(messages) = value.get("messages").and_then(Value::as_array) {
                 observation.messages.extend(
                     messages
@@ -578,6 +586,7 @@ mod tests {
             timeout_seconds: None,
             idle_timeout_seconds: None,
             hook_timeout_seconds: 120,
+            rescore_command: Vec::new(),
         }
     }
 

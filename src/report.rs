@@ -448,10 +448,10 @@ pub fn supports_database_windows(run: &RunManifest, metrics: &[Metric]) -> bool 
         .iter()
         .any(|metric| metric.labels.contains_key("window"))
         || (metrics.is_empty()
-            && run
-                .collectors
-                .iter()
-                .any(|collector| collector.name == "slp" && collector.status == "complete"))
+            && run.collectors.iter().any(|collector| {
+                matches!(collector.name.as_str(), "slp" | "mysql-digest")
+                    && collector.status == "complete"
+            }))
 }
 
 pub fn cpu_symbols(metrics: &[Metric]) -> Vec<CpuSummary> {
@@ -697,9 +697,9 @@ fn coverage(
 fn collector_section(name: &str) -> Option<&'static str> {
     match name {
         "alp" | "nginx-series" | "user-transition" => Some("http"),
-        "slp" | "mysql-log-delta" | "pg-stat-statements" => Some("database"),
+        "slp" | "mysql-digest" | "mysql-log-delta" | "pg-stat-statements" => Some("database"),
         "perf-report" | "perf-series" => Some("cpu"),
-        "host-sampler" | "sysstat" | "service-sampler" => Some("host"),
+        "host-sampler" | "sysstat" | "service-sampler" | "process-sampler" => Some("host"),
         "perf-flamegraph" | "offcpu" => Some("profiles"),
         _ => None,
     }
@@ -719,11 +719,14 @@ fn expected_collector_metrics(collector: &str) -> &'static [&'static str] {
     match collector {
         "alp" | "nginx-series" => &["http.requests", "http.request_duration"],
         // mysql-log-deltaはslow logの差分をnode上に用意するだけで、集計はslpが行う。
-        "slp" | "pg-stat-statements" => &["db.query.calls", "db.query.total_duration"],
+        "slp" | "mysql-digest" | "pg-stat-statements" => {
+            &["db.query.calls", "db.query.total_duration"]
+        }
         "perf-report" | "perf-series" => &["cpu.sample_percent"],
         "host-sampler" => &["host.cpu_percent", "host.memory_used_bytes"],
         "sysstat" => &["host.cpu_percent"],
         "service-sampler" => &["service.cpu_cores", "service.memory_bytes"],
+        "process-sampler" => &["service.process_rss_bytes", "service.process_threads"],
         _ => &[],
     }
 }

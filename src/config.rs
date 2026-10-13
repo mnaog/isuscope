@@ -190,6 +190,11 @@ pub struct BenchmarkConfig {
     /// Limit for each of `prepare_command`, `identity_command` and `cleanup_command`.
     #[serde(default = "default_hook_timeout")]
     pub hook_timeout_seconds: u64,
+    /// Reads the saved stdout of a run whose result the adapter left pending, once the adapter
+    /// can judge it (`isuscope rescore`). Takes the same placeholders as parsers, such as
+    /// `{benchmark_stdout}`, and prints one `isuscope.result`.
+    #[serde(default)]
+    pub rescore_command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

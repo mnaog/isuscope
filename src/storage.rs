@@ -646,6 +646,41 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Runs whose benchmark ran but whose result the adapter left to `isuscope rescore`.
+    pub fn pending_results(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM runs WHERE state='pending' ORDER BY started_at")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Records the result `isuscope rescore` read for a pending run. The caller holds
+    /// [`Self::lock_run`] and passes the manifest it read after taking the lock.
+    pub fn set_result(&mut self, _lock: &RunLock, manifest: &RunManifest) -> Result<()> {
+        let final_dir = self.final_dir(&manifest.id);
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE runs SET score=?2, passed=?3, state=?4, analysis_status=?5 WHERE id=?1",
+            params![
+                manifest.id,
+                manifest.benchmark.score,
+                manifest.benchmark.passed,
+                manifest.state.as_str(),
+                manifest.analysis_status.as_str(),
+            ],
+        )?;
+        write_manifest(&final_dir, manifest)?;
+        transaction.execute(
+            "UPDATE runs SET manifest_stamp=?2 WHERE id=?1",
+            params![manifest.id, manifest_stamp(&final_dir.join("run.json"))],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn append_analysis_with_base(
         &mut self,
         id: &str,

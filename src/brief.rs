@@ -30,13 +30,15 @@ pub struct BriefOutput {
     pub score_inputs: BriefSection<MetricQueryRow>,
     /// Parser-kept benchmark output lines: why it failed and what the errors were.
     pub benchmark_messages: BriefBenchmarkMessages,
+    /// 当たった、または近づいた接続・fdの上限を、設定の名前と証拠で示す。何も無ければ空。
+    pub limits: BriefSection<BriefLimit>,
     /// ベンチの間にアプリ（`service_units`）・nginxのerror log・kernelが出したエラーの型。多い順。
     pub logs: BriefSection<BriefLogPattern>,
     pub http: BriefSection<HttpRouteSummary>,
     /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
     pub database_rows_filtered_out: usize,
-    /// MySQLがfileの読み書きで待った時間の長い順。ベンチの前後の差なのでinitializeも含む。
+    /// MySQLがfileの読み書きとそれ以外の操作（fsyncなど）で待った時間の長い順。ベンチの前後の差なのでinitializeも含む。
     pub database_io: BriefSection<BriefDatabaseFile>,
     /// buffer poolの大きさと、tableのdataとindexの合計（ベンチ後）。
     pub database_memory: BriefSection<BriefDatabaseMemory>,
@@ -71,6 +73,7 @@ impl BriefOutput {
         self.coverage_issues.cut(rows);
         self.benchmark.cut(rows);
         self.score_inputs.cut(rows);
+        self.limits.cut(rows);
         self.logs.cut(rows);
         self.http.cut(rows);
         self.database.cut(rows);
@@ -331,7 +334,16 @@ pub struct BriefPressure {
 #[derive(Debug, Serialize)]
 pub struct BriefService {
     pub service: String,
-    pub cpu_max_cores: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_max_cores: Option<f64>,
+    /// processのRSSの合計のピーク（`process-sampler`）。cgroupの`memory.current`とは別の値。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_max_mib: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_max: Option<f64>,
+    /// ベンチの間にMainPIDが変わった回数。クラッシュやOOM killによる再起動の手がかり。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarts: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -435,6 +447,178 @@ impl<T> BriefSection<T> {
     }
 }
 
+/// 当たった（または80%以上まで使った）上限。`setting`は上げる設定の名前、`evidence`はそう判断した観測。
+#[derive(Debug, Serialize)]
+pub struct BriefLimit {
+    pub node: String,
+    pub setting: String,
+    pub evidence: String,
+}
+
+/// error logの文言と、それが示す上限。小文字で照合する。
+const LIMIT_SIGNATURES: &[(&[&str], &str)] = &[
+    (
+        &["too many open files", "emfile"],
+        "file descriptors (LimitNOFILE of the unit, nginx worker_rlimit_nofile)",
+    ),
+    (
+        &["worker_connections are not enough"],
+        "nginx worker_connections",
+    ),
+    (&["too many connections"], "MySQL max_connections"),
+    (
+        &["possible syn flooding"],
+        "listen backlog (nginx listen backlog=, net.core.somaxconn)",
+    ),
+    (
+        &["cannot assign requested address"],
+        "ephemeral ports (net.ipv4.ip_local_port_range, net.ipv4.tcp_tw_reuse)",
+    ),
+    (
+        &[
+            "upstream prematurely closed",
+            "connection reset by peer) while reading response header from upstream",
+        ],
+        "upstream connections (keepalive to the app, or the app closed them)",
+    ),
+    (
+        &[
+            "no live upstreams",
+            "connection refused) while connecting to upstream",
+        ],
+        "upstream availability (the app was down or refused connections)",
+    ),
+];
+/// nginxの`keepalive_requests`の既定値（1.19.10から1000、それより前は100）。
+const NGINX_KEEPALIVE_REQUESTS_DEFAULTS: [f64; 2] = [1000.0, 100.0];
+
+/// `limit.`（ベンチ前の上限値）と、logの型・listen overflow・接続数から`limits`欄を作る。
+/// 当たった証拠のあるものと、上限の80%以上まで使ったものだけを出す。
+pub fn attach_limits(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let mut found = BTreeMap::<(String, String), String>::new();
+    let mut values = BTreeMap::<(String, String), f64>::new();
+    let mut peaks = BTreeMap::<(String, String), f64>::new();
+    let mut overflows = BTreeMap::<String, f64>::new();
+    let mut nofile = BTreeMap::<String, Vec<String>>::new();
+    let mut log_hits = BTreeMap::<(String, &str), (u64, String)>::new();
+    for metric in metrics {
+        let node = label(metric, "node");
+        match metric.name.as_str() {
+            "limit.service_nofile" => nofile.entry(node).or_default().push(format!(
+                "{} {}",
+                label(metric, "service"),
+                metric.value
+            )),
+            name if name.starts_with("limit.") => {
+                values.insert((node, name.to_owned()), metric.value);
+            }
+            "host.tcp_listen_overflows" => *overflows.entry(node).or_default() += metric.value,
+            "host.tcp_established"
+            | "mysql.threads_connected"
+            | "client.connection_requests_max" => {
+                let peak = peaks.entry((node, metric.name.clone())).or_insert(0.0);
+                *peak = peak.max(metric.value);
+            }
+            "log.error_lines" => {
+                let text = format!("{} {}", label(metric, "pattern"), label(metric, "example"))
+                    .to_lowercase();
+                if let Some((_, setting)) = LIMIT_SIGNATURES
+                    .iter()
+                    .find(|(needles, _)| needles.iter().any(|needle| text.contains(needle)))
+                {
+                    let entry = log_hits
+                        .entry((node, setting))
+                        .or_insert((0, label(metric, "example")));
+                    entry.0 += metric.value as u64;
+                }
+            }
+            _ => {}
+        }
+    }
+    let value = |node: &str, name: &str| values.get(&(node.to_owned(), name.to_owned())).copied();
+    for (node, count) in &overflows {
+        if *count > 0.0 {
+            let somaxconn = value(node, "limit.somaxconn")
+                .map(|v| format!(" (somaxconn {v})"))
+                .unwrap_or_default();
+            found.insert(
+                (
+                    node.clone(),
+                    "listen backlog (nginx listen backlog=, net.core.somaxconn)".into(),
+                ),
+                format!("{count} TCP listen overflows during the run{somaxconn}"),
+            );
+        }
+    }
+    for ((node, setting), (count, example)) in log_hits {
+        let mut evidence = format!(
+            "{count} log lines: {}",
+            crate::model::excerpt(&example, 120).0
+        );
+        if setting.starts_with("file descriptors")
+            && let Some(limits) = nofile.get(&node)
+        {
+            evidence.push_str(&format!(" (LimitNOFILE: {})", limits.join(", ")));
+        }
+        found.entry((node, setting.to_owned())).or_insert(evidence);
+    }
+    for ((node, name), peak) in &peaks {
+        match name.as_str() {
+            "client.connection_requests_max" => {
+                let configured = value(node, "limit.nginx_keepalive_requests");
+                let hit = match configured {
+                    Some(limit) => *peak >= limit,
+                    None => NGINX_KEEPALIVE_REQUESTS_DEFAULTS.contains(peak),
+                };
+                if hit {
+                    found.insert(
+                        (node.clone(), "nginx keepalive_requests".into()),
+                        format!(
+                            "a client connection served {peak} requests, the keepalive_requests limit{}; nginx then closes it, and a request sent at that moment fails",
+                            configured.map(|_| String::new()).unwrap_or_else(|| " (nginx default)".into())
+                        ),
+                    );
+                }
+            }
+            "mysql.threads_connected" => {
+                if let Some(max) = value(node, "limit.mysql_max_connections")
+                    && *peak >= max * 0.8
+                {
+                    found.insert(
+                        (node.clone(), "MySQL max_connections".into()),
+                        format!("{peak} of {max} connections in use at the peak"),
+                    );
+                }
+            }
+            "host.tcp_established" => {
+                if let (Some(connections), Some(workers)) = (
+                    value(node, "limit.nginx_worker_connections"),
+                    value(node, "limit.nginx_workers"),
+                ) && *peak >= connections * workers * 0.8
+                {
+                    found.insert(
+                        (node.clone(), "nginx worker_connections".into()),
+                        format!(
+                            "{peak} established TCP connections at the peak against {connections} × {workers} worker connections (client and upstream connections both count)"
+                        ),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let rows = found
+        .into_iter()
+        .map(|((node, setting), evidence)| BriefLimit {
+            node,
+            setting,
+            evidence,
+        })
+        .collect::<Vec<_>>();
+    brief.limits = section(rows, limit);
+}
+
 /// logの1つの型（数字を含む語を`<N>`へ置き換えた行）。briefには型の最初の1行だけを出す。
 /// 型そのものはほぼ同じ文の繰り返しになるので、`query --metric log.error_lines`で見る。
 #[derive(Debug, Serialize)]
@@ -451,6 +635,8 @@ pub struct BriefDatabaseFile {
     pub file: String,
     pub read_wait_ms: f64,
     pub write_wait_ms: f64,
+    /// 読み書き以外の操作（fsync・open・close・statなど）で待った時間。fsyncだけの時間ではない。
+    pub misc_wait_ms: f64,
     pub read_mib: f64,
     pub write_mib: f64,
 }
@@ -466,7 +652,8 @@ pub struct BriefDatabaseMemory {
 const JOURNAL_RATE_LIMIT_BURST: f64 = 10_000.0;
 
 /// `app-log-delta`と`mysql-io-delta`のmetric（`log.`・`db.file.`・`db.memory.`）から、
-/// `logs`・`database_io`・`database_memory`の欄を作る。
+/// `logs`・`database_io`・`database_memory`の欄を作る。`network-allowance-delta`の`net.`は
+/// 上限を超えたcounterだけを`warnings`へ出す。
 pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
     const MIB: f64 = 1024.0 * 1024.0;
     let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
@@ -488,6 +675,13 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
             )),
             // journaldは1 unitあたり既定で30秒に10000行までしか残さない。捨てたことを知らせる
             // `Suppressed`の行は区間が明けて次の行が来たときに出るので、runの終わりには数えられない。
+            // ENAが上限を超えて捨てた・遅らせたpacket。0でなければ、そのnodeはCPU以外の上限に当たっている。
+            "net.allowance_exceeded" if metric.value > 0.0 => brief.warnings.push(format!(
+                "network: {} on {node} {} increased by {} during the run (including initialize); the instance network allowance dropped or delayed packets",
+                label(metric, "counter"),
+                label(metric, "device"),
+                metric.value
+            )),
             "log.lines" if metric.value >= JOURNAL_RATE_LIMIT_BURST && source != "nginx-error" => {
                 brief.warnings.push(format!(
                     "logs: {source} on {node} wrote {} lines; journald keeps about {JOURNAL_RATE_LIMIT_BURST} lines per 30s per unit by default, so its error counts may be low",
@@ -515,12 +709,14 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
                     file,
                     read_wait_ms: 0.0,
                     write_wait_ms: 0.0,
+                    misc_wait_ms: 0.0,
                     read_mib: 0.0,
                     write_mib: 0.0,
                 });
             match field {
                 "read_wait" => row.read_wait_ms += metric.value,
                 "write_wait" => row.write_wait_ms += metric.value,
+                "misc_wait" => row.misc_wait_ms += metric.value,
                 "read_bytes" => row.read_mib += metric.value / MIB,
                 "write_bytes" => row.write_mib += metric.value / MIB,
                 _ => {}
@@ -540,16 +736,15 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
             }
         }
     }
+    let waited = |row: &BriefDatabaseFile| row.read_wait_ms + row.write_wait_ms + row.misc_wait_ms;
     let mut files = files
         .into_values()
-        .filter(|row| row.read_wait_ms + row.write_wait_ms > 0.0)
+        .filter(|row| waited(row) > 0.0)
         .collect::<Vec<_>>();
-    files.sort_by(|a, b| {
-        (b.read_wait_ms + b.write_wait_ms).total_cmp(&(a.read_wait_ms + a.write_wait_ms))
-    });
+    files.sort_by(|a, b| waited(b).total_cmp(&waited(a)));
     brief.database_io = section(files, limit).more(|| {
         format!(
-            "isuscope query {short} --metric db.file.read_wait --metric db.file.write_wait --group-by file --limit 20"
+            "isuscope query {short} --metric db.file.read_wait --metric db.file.write_wait --metric db.file.misc_wait --group-by file --limit 20"
         )
     });
     brief.database_memory = section(memory.into_values().collect(), usize::MAX);
@@ -648,6 +843,7 @@ pub fn build(
         score_inputs: section(score_inputs.rows, limit)
             .more(|| format!("isuscope query {short} --metric-prefix score. --limit 20")),
         benchmark_messages,
+        limits: section(Vec::new(), limit),
         logs: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
@@ -775,6 +971,16 @@ fn preferred_database(
     run: &crate::model::RunManifest,
 ) -> (Vec<DatabaseSummary>, usize, Option<String>) {
     let total_count = database.len();
+    // performance_schemaのdigestから集計した行があれば、slow log（slp）の行は使わない。同じ文を
+    // 2つのsourceで数えて並べないため。
+    let database = if database.iter().any(|item| item.source == "mysql-digest") {
+        database
+            .into_iter()
+            .filter(|item| item.source == "mysql-digest")
+            .collect()
+    } else {
+        database
+    };
     // slp collectorが区間に分けて集計したrun。行が1つも無くても、slpが成功していれば区間は決まる。
     let windowed = database.iter().any(|item| item.window.is_some())
         || (database.is_empty() && crate::report::supports_database_windows(run, &[]));
@@ -895,15 +1101,50 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         .into(),
                     max_percent: query::round_to(row.peak, 2),
                 });
-            let mut services = rows
-                .iter()
-                .filter(|row| row.metric == "service.cpu_cores")
-                .map(|row| BriefService {
-                    service: row.target.clone(),
-                    cpu_max_cores: query::round_to(row.peak, 3),
-                })
-                .collect::<Vec<_>>();
-            services.sort_by(|a, b| b.cpu_max_cores.total_cmp(&a.cpu_max_cores));
+            let mut services = BTreeMap::<String, BriefService>::new();
+            for row in &rows {
+                if !matches!(
+                    row.metric.as_str(),
+                    "service.cpu_cores"
+                        | "service.process_rss_bytes"
+                        | "service.process_threads"
+                        | "service.process_restarts"
+                ) {
+                    continue;
+                }
+                let service = services
+                    .entry(row.target.clone())
+                    .or_insert_with(|| BriefService {
+                        service: row.target.clone(),
+                        cpu_max_cores: None,
+                        rss_max_mib: None,
+                        threads_max: None,
+                        restarts: None,
+                    });
+                match row.metric.as_str() {
+                    "service.cpu_cores" => {
+                        service.cpu_max_cores = Some(query::round_to(row.peak, 3))
+                    }
+                    "service.process_rss_bytes" => {
+                        service.rss_max_mib = Some(query::round_to(row.peak / 1_048_576.0, 1))
+                    }
+                    "service.process_threads" => service.threads_max = Some(row.peak),
+                    _ => service.restarts = row.value.map(|count| count as usize),
+                }
+            }
+            let mut services = services.into_values().collect::<Vec<_>>();
+            services.sort_by(|a, b| {
+                let key = |service: &BriefService| {
+                    (
+                        service.cpu_max_cores.unwrap_or(0.0),
+                        service.rss_max_mib.unwrap_or(0.0),
+                    )
+                };
+                key(b)
+                    .0
+                    .total_cmp(&key(a).0)
+                    .then(key(b).1.total_cmp(&key(a).1))
+            });
             services.truncate(3);
             BriefHostNode {
                 node: node.into(),
@@ -1357,6 +1598,89 @@ mod tests {
     }
 
     #[test]
+    fn database_prefers_statement_digests_over_the_slow_log() {
+        // slow logとperformance_schemaの両方で数えたrunでは、同じ文を2行並べない。
+        let row = |source: &str| DatabaseSummary {
+            node: "db1".into(),
+            engine: "mysql".into(),
+            digest: "SELECT * FROM t WHERE id = ?".into(),
+            source: source.into(),
+            window: Some("load".into()),
+            calls: 100.0,
+            ..Default::default()
+        };
+        let run: crate::model::RunManifest = serde_json::from_value(serde_json::json!({
+            "schema_version": 6, "id": "r", "mode": "run", "state": "complete",
+            "started_at": "2026-09-19T00:00:00Z", "finished_at": null,
+            "source": {"repository": ".", "git_available": false, "commit_hash": null,
+                "branch": null, "dirty": false, "state_sha256": "", "untracked": [], "error": null},
+            "benchmark": {"mode": "command", "command": [], "exit_code": 0, "score": 1,
+                "passed": true, "messages": [], "initialize_started_at": "2026-09-19T00:00:01Z",
+                "initialize_finished_at": "2026-09-19T00:00:10Z", "error": null},
+            "collectors": [], "logs": [], "metric_count": 0, "transition_count": 0
+        }))
+        .unwrap();
+        let (rows, omitted, window) =
+            preferred_database(vec![row("slp"), row("mysql-digest")], &run);
+        assert_eq!(window.as_deref(), Some("load"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "mysql-digest");
+        assert_eq!(omitted, 1);
+        let (rows, _, _) = preferred_database(vec![row("slp")], &run);
+        assert_eq!(rows[0].source, "slp");
+    }
+
+    #[test]
+    fn services_show_process_memory_threads_and_restarts_without_cgroup_cpu() {
+        // cgroup v1ではservice-samplerが動かず、process-samplerの値だけが来る。
+        let row = |metric: &str, target: &str, value: f64, peak: f64| HostSummary {
+            node: "app3".into(),
+            metric: metric.into(),
+            target: target.into(),
+            source: "process-sampler".into(),
+            labels: BTreeMap::new(),
+            unit: String::new(),
+            aggregation: crate::metric_semantics::MetricAggregation::Average,
+            value: Some(value),
+            peak,
+            peak_at: None,
+            samples: 60,
+        };
+        let nodes = host_nodes(&[
+            row("host.cpu_busy_percent", "host", 50.0, 90.0),
+            row(
+                "service.process_rss_bytes",
+                "core.service",
+                600.0 * 1_048_576.0,
+                1254.0 * 1_048_576.0,
+            ),
+            row("service.process_threads", "core.service", 99.0, 228.0),
+            row("service.process_restarts", "core.service", 1.0, 1.0),
+            row(
+                "service.process_rss_bytes",
+                "nginx.service",
+                20.0 * 1_048_576.0,
+                30.0 * 1_048_576.0,
+            ),
+            row("service.memory_bytes", "core.service", 1.0, 1.0),
+        ]);
+        let services = &nodes[0].top_services;
+        assert_eq!(services.len(), 2);
+        let core = &services[0];
+        assert_eq!(core.service, "core.service");
+        assert_eq!(
+            (
+                core.cpu_max_cores,
+                core.rss_max_mib,
+                core.threads_max,
+                core.restarts
+            ),
+            (None, Some(1254.0), Some(228.0), Some(1))
+        );
+        assert_eq!(services[1].restarts, None);
+    }
+
+    #[test]
     fn new_connections_per_second_divide_the_window_total_by_its_length() {
         // 60秒の負荷で、5秒bucketごとに10接続（合計120）なら毎秒2。1 bucketの5秒で割ると24になる。
         let row = HostSummary {
@@ -1507,6 +1831,108 @@ mod tests {
     }
 
     #[test]
+    fn limits_name_the_setting_behind_each_observed_limit() {
+        // practice-14のSSE化で順に当たった上限と、80%まで使った接続数。
+        let diagnostics = crate::report::diagnose(
+            test_run(),
+            Vec::new(),
+            Vec::new(),
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+        );
+        let options = || query::MetricQueryOptions {
+            scope: query::QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: None,
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        };
+        let empty = || query::metric_query("run".into(), Vec::new(), options());
+        let metric = |node: &str, name: &str, value: f64, labels: &[(&str, &str)]| Metric {
+            name: name.into(),
+            value,
+            unit: String::new(),
+            timestamp: None,
+            labels: labels
+                .iter()
+                .chain(&[("node", node)])
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        };
+        let mut brief = build(diagnostics, empty(), empty(), 10);
+        attach_limits(
+            &mut brief,
+            &[
+                metric(
+                    "app3",
+                    "log.error_lines",
+                    37.0,
+                    &[
+                        ("source", "isuride-rust.service"),
+                        ("example", "accept error: Too many open files (os error 24)"),
+                    ],
+                ),
+                metric(
+                    "app3",
+                    "limit.service_nofile",
+                    1024.0,
+                    &[("service", "isuride-rust.service")],
+                ),
+                metric("app1", "host.tcp_listen_overflows", 300.0, &[]),
+                metric("app1", "host.tcp_listen_overflows", 211.0, &[]),
+                metric("app1", "limit.somaxconn", 4096.0, &[]),
+                metric("app1", "client.connection_requests_max", 1000.0, &[]),
+                metric("app1", "limit.nginx_worker_connections", 4096.0, &[]),
+                metric("app1", "limit.nginx_workers", 2.0, &[]),
+                metric("app1", "host.tcp_established", 7000.0, &[]),
+                metric("app2", "mysql.threads_connected", 140.0, &[]),
+                metric("app2", "limit.mysql_max_connections", 151.0, &[]),
+                // Below 80% and an ordinary error: nothing to report.
+                metric("app2", "host.tcp_established", 100.0, &[]),
+                metric("app2", "limit.nginx_worker_connections", 4096.0, &[]),
+                metric("app2", "limit.nginx_workers", 2.0, &[]),
+                metric(
+                    "app2",
+                    "log.error_lines",
+                    5.0,
+                    &[("example", "invalid ride id")],
+                ),
+                metric("app2", "client.connection_requests_max", 640.0, &[]),
+            ],
+            10,
+        );
+        let rows = brief
+            .limits
+            .items
+            .iter()
+            .map(|row| {
+                (
+                    row.node.as_str(),
+                    row.setting.as_str(),
+                    row.evidence.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let find = |node: &str, setting: &str| {
+            rows.iter()
+                .find(|(n, s, _)| *n == node && s.starts_with(setting))
+                .map(|(_, _, evidence)| *evidence)
+                .unwrap_or_else(|| panic!("no {setting} on {node}: {rows:?}"))
+        };
+        assert!(find("app3", "file descriptors").contains("isuride-rust.service 1024"));
+        assert!(find("app1", "listen backlog").starts_with("511 TCP listen overflows"));
+        assert!(find("app1", "nginx keepalive_requests").contains("1000"));
+        assert!(find("app1", "nginx worker_connections").contains("7000"));
+        assert!(find("app2", "MySQL max_connections").contains("140 of 151"));
+        assert_eq!(rows.len(), 5, "{rows:?}");
+    }
+
+    #[test]
     fn logs_and_database_io_rank_by_count_and_wait() {
         let diagnostics = crate::report::diagnose(
             test_run(),
@@ -1558,7 +1984,19 @@ mod tests {
                 ),
                 metric("log.lines", 37_500.0, &[("source", "isu")]),
                 metric("log.lines", 41.0, &[("source", "nginx-error")]),
+                metric(
+                    "net.allowance_exceeded",
+                    1234.0,
+                    &[("device", "ens5"), ("counter", "bw_out_allowance_exceeded")],
+                ),
+                metric(
+                    "net.allowance_exceeded",
+                    0.0,
+                    &[("device", "ens5"), ("counter", "pps_allowance_exceeded")],
+                ),
                 file("isucon/users.ibd", "read_wait", 2.0),
+                // redo logはcommitごとのfsyncで待つ。読み書きの待ちが無くてもMISCだけで出す。
+                file("#innodb_redo", "misc_wait", 9_000.0),
                 file("isucon/user_presents.ibd", "read_wait", 51_100.0),
                 file(
                     "isucon/user_presents.ibd",
@@ -1579,12 +2017,21 @@ mod tests {
         );
         assert_eq!(logs[1].count, 3);
         // 1万行を超えたunitだけ、journaldが捨てた可能性を知らせる。
-        assert_eq!(brief.warnings.len(), 1, "{:?}", brief.warnings);
-        assert!(brief.warnings[0].contains("isu on app1 wrote 37500 lines"));
+        assert_eq!(brief.warnings.len(), 2, "{:?}", brief.warnings);
+        let warned = |text: &str| brief.warnings.iter().any(|warning| warning.contains(text));
+        assert!(warned("isu on app1 wrote 37500 lines"));
+        // 上限に当たったcounterだけを出す。
+        assert!(warned(
+            "bw_out_allowance_exceeded on app1 ens5 increased by 1234"
+        ));
         let files = &brief.database_io.items;
-        assert_eq!(files.len(), 2);
+        assert_eq!(files.len(), 3);
         assert_eq!(files[0].file, "isucon/user_presents.ibd");
         assert_eq!(files[0].read_mib, 452.0);
+        assert_eq!(
+            (files[1].file.as_str(), files[1].misc_wait_ms),
+            ("#innodb_redo", 9_000.0)
+        );
         let memory = &brief.database_memory.items[0];
         assert_eq!(
             (memory.buffer_pool_mib, memory.tables_mib),

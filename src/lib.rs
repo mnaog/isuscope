@@ -20,6 +20,7 @@ pub mod project_tools;
 pub mod query;
 pub mod repeat;
 pub mod report;
+pub mod result_commands;
 pub mod runner;
 pub mod shutdown;
 pub mod sql;

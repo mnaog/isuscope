@@ -78,7 +78,7 @@ fn mysql_io_collector_reports_the_waits_between_the_two_snapshots() {
         &before,
         "Uptime\t100\n\
          F\t/var/lib/mysql/isucon/user_presents.ibd\t1000000000000\t0\t1048576\t0\n\
-         F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t5000000000\t0\t4096\n\
+         F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t5000000000\t0\t4096\t1000000000\n\
          T\tisucon.user_presents\t2000000000\t0\t10\t0\n",
     )
     .unwrap();
@@ -86,8 +86,8 @@ fn mysql_io_collector_reports_the_waits_between_the_two_snapshots() {
         format!(
             "Uptime\t{uptime}\n\
              F\t/var/lib/mysql/isucon/user_presents.ibd\t52100000000000\t0\t475004928\t0\n\
-             F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t9000000000\t0\t8192\n\
-             F\t/var/lib/mysql/#innodb_redo/#ib_redo2\t0\t2000000000\t0\t4096\n\
+             F\t/var/lib/mysql/#innodb_redo/#ib_redo1\t0\t9000000000\t0\t8192\t8000000000\n\
+             F\t/var/lib/mysql/#innodb_redo/#ib_redo2\t0\t2000000000\t0\t4096\t3000000000\n\
              F\t/var/lib/mysql/isucon/users.ibd\t3000000000\t0\t16384\t0\n\
              F\t/var/lib/mysql/#ib_16384_0.dblwr\t0\t0\t0\t0\n\
              T\tisucon.user_presents\t5000000000\t1000000000\t30\t4\n\
@@ -130,6 +130,15 @@ fn mysql_io_collector_reports_the_waits_between_the_two_snapshots() {
     assert_eq!(
         value(&metrics, "db.file.write_wait", ("file", "#innodb_redo")),
         Some(6.0)
+    );
+    // fsyncなど読み書き以外の待ちも同じようにまとめる（7ms + 新しいfileの3ms）。古い形の行は0から数える。
+    assert_eq!(
+        value(&metrics, "db.file.misc_wait", ("file", "#innodb_redo")),
+        Some(10.0)
+    );
+    assert_eq!(
+        value(&metrics, "db.file.misc_wait", ("file", "isucon/users.ibd")),
+        Some(0.0)
     );
     assert!(
         !metrics.iter().any(|metric| metric["labels"]["file"]
@@ -291,4 +300,142 @@ esac
         Some(2.0)
     );
     assert!(!prefix.with_extension("app-log.marker").exists());
+}
+
+/// unitのprocessのRSSとthread数を/procから読み、MainPIDが変わったら再起動として数える。
+/// cgroupが見つからない環境（v1でsystemd階層が無いなど）ではMainPIDだけを見る。
+#[cfg(target_os = "linux")]
+#[test]
+fn process_sampler_reads_rss_threads_and_counts_main_pid_changes() {
+    let directory = tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let main = directory.path().join("main-pid");
+    stub(
+        &bin,
+        "systemctl",
+        "case \"$*\" in *MainPID*) cat \"$MAIN_PID_FILE\" ;; esac\n",
+    );
+    let script = template_script(
+        "process-sampler",
+        &directory.path().join("access.log"),
+        &directory.path().join("isuscope-t"),
+    );
+    let mut first = Command::new("sleep").arg("30").spawn().unwrap();
+    let mut second = Command::new("sleep").arg("30").spawn().unwrap();
+    fs::write(&main, first.id().to_string()).unwrap();
+    let sampler = Command::new("sh")
+        .args(["-c", &script])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("MAIN_PID_FILE", &main)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    fs::write(&main, second.id().to_string()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // isuscopeはduring collectorをSIGTERMで止める。
+    Command::new("kill")
+        .args(["-TERM", &sampler.id().to_string()])
+        .status()
+        .unwrap();
+    let output = sampler.wait_with_output().unwrap();
+    for child in [&mut first, &mut second] {
+        child.kill().ok();
+        child.wait().ok();
+    }
+    let metrics = metrics(&output.stdout);
+    let service = ("service", "isu.service");
+    assert!(value(&metrics, "service.process_rss_bytes", service).is_some_and(|rss| rss > 0.0));
+    assert_eq!(
+        value(&metrics, "service.process_threads", service),
+        Some(1.0)
+    );
+    assert_eq!(value(&metrics, "service.processes", service), Some(1.0));
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|metric| metric["name"] == "service.process_restarts")
+            .count(),
+        1,
+        "{metrics:?}"
+    );
+}
+
+/// ENAの`*_allowance_exceeded`の前後の差をdevice・counterごとに出す。0も出し、
+/// `conntrack_allowance_available`は後の値をそのまま出す。counterを持たないNICだけならunavailable。
+#[cfg(target_os = "linux")]
+#[test]
+fn network_allowance_collector_reports_exceeded_packets_between_the_snapshots() {
+    let directory = tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let counters = directory.path().join("counters");
+    // loは読まない。どのdeviceにも同じcounterを返す。
+    stub(
+        &bin,
+        "ethtool",
+        "[ \"$2\" = lo ] && exit 1\ncat \"$COUNTERS\"\n",
+    );
+    let prefix = directory.path().join("isuscope-t");
+    let access_log = directory.path().join("access.log");
+    let mark = template_script("network-allowance-mark", &access_log, &prefix);
+    let delta = template_script("network-allowance-delta", &access_log, &prefix);
+    let env = [("COUNTERS", counters.to_str().unwrap())];
+
+    fs::write(
+        &counters,
+        "NIC statistics:\n     tx_timeout: 0\n     bw_in_allowance_exceeded: 10\n     bw_out_allowance_exceeded: 100\n     pps_allowance_exceeded: 0\n     conntrack_allowance_available: 136000\n",
+    )
+    .unwrap();
+    let output = run_script(&mark, &bin, &env);
+    assert!(output.status.success(), "{output:?}");
+    fs::write(
+        &counters,
+        "NIC statistics:\n     tx_timeout: 3\n     bw_in_allowance_exceeded: 10\n     bw_out_allowance_exceeded: 1334\n     pps_allowance_exceeded: 0\n     conntrack_allowance_available: 135000\n",
+    )
+    .unwrap();
+    let output = run_script(&delta, &bin, &env);
+    assert!(output.status.success(), "{output:?}");
+    let metrics = metrics(&output.stdout);
+    let device = fs::read_dir("/sys/class/net")
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| name != "lo")
+        .unwrap();
+    let exceeded = |counter: &str| {
+        metrics
+            .iter()
+            .find(|metric| {
+                metric["name"] == "net.allowance_exceeded"
+                    && metric["labels"]["device"] == device.as_str()
+                    && metric["labels"]["counter"] == counter
+            })
+            .and_then(|metric| metric["value"].as_f64())
+    };
+    assert_eq!(exceeded("bw_out_allowance_exceeded"), Some(1234.0));
+    assert_eq!(exceeded("bw_in_allowance_exceeded"), Some(0.0));
+    assert_eq!(exceeded("pps_allowance_exceeded"), Some(0.0));
+    assert_eq!(
+        value(
+            &metrics,
+            "net.conntrack_allowance_available",
+            ("device", device.as_str())
+        ),
+        Some(135_000.0)
+    );
+    assert!(
+        !metrics
+            .iter()
+            .any(|metric| metric["labels"]["counter"] == "tx_timeout"),
+        "{metrics:?}"
+    );
+
+    // ENA以外のNICはcounterを持たないので、markの時点でunavailable。
+    fs::write(&counters, "NIC statistics:\n     rx_packets: 5\n").unwrap();
+    let output = run_script(&mark, &bin, &env);
+    assert_eq!(output.status.code(), Some(75), "{output:?}");
 }
