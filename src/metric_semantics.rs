@@ -93,6 +93,14 @@ fn is_additive(name: &str) -> bool {
             | "benchmark.dns.resolved"
             | "benchmark.scenario.failure"
             | "benchmark.scenario.success"
+            | "state.lines"
+            | "state.invalid_lines"
+            | "state.dropped"
+            | "state.inconsistent"
+            | "state.transitions"
+            | "state.dwell.count"
+            | "state.dwell.total_duration"
+            | "state.dwell.open"
     )
 }
 

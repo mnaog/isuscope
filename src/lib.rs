@@ -24,6 +24,7 @@ pub mod result_commands;
 pub mod runner;
 pub mod shutdown;
 pub mod sql;
+pub mod states;
 pub mod storage;
 pub mod tooling;
 pub mod transition;

@@ -296,6 +296,8 @@ pub enum CollectorParser {
     Sysstat,
     ServiceCgroup,
     PerfScript,
+    /// アプリが状態の変化を1行ずつ書いたJSON行（状態ログ）。[`crate::states`]を参照。
+    StateLog,
 }
 
 #[derive(Debug, Clone, Deserialize)]

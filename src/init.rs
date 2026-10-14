@@ -3,6 +3,9 @@ use std::{fs, path::Path};
 
 const CONFIG: &str = include_str!("../templates/config.toml");
 
+/// 状態ログの既定のpath。アプリの書き手も、環境変数で変えなければここへ書く。
+pub const DEFAULT_STATE_LOG: &str = "/var/tmp/isuscope-state.jsonl";
+
 /// Values that differ per project. `init` fills them with defaults; the starter template
 /// passes the paths its Ansible role installed. The collectors themselves stay one file.
 #[derive(Debug, Clone)]
@@ -10,6 +13,8 @@ pub struct ConfigOptions {
     pub data_dir: String,
     pub nginx_access_log: String,
     pub mysql_slow_log: String,
+    /// アプリが状態の変化を書くfile（状態ログ）。アプリ側と同じpathにする。
+    pub state_log: String,
     pub service_units: Vec<String>,
     pub sample_output: Option<String>,
     /// Append commented `[lock]`, `[ssh]` and `[[nodes]]` examples. A project that adds its
@@ -23,6 +28,7 @@ impl Default for ConfigOptions {
             data_dir: ".isuscope/data".into(),
             nginx_access_log: "/var/log/nginx/access.log".into(),
             mysql_slow_log: "/var/log/mysql/mysql-slow.log".into(),
+            state_log: DEFAULT_STATE_LOG.into(),
             service_units: Vec::new(),
             sample_output: None,
             scaffold: true,
@@ -73,6 +79,7 @@ pub fn render_config(options: &ConfigOptions) -> String {
         .replace("@@DATA_DIR@@", &options.data_dir)
         .replace("@@NGINX_ACCESS_LOG@@", &options.nginx_access_log)
         .replace("@@MYSQL_SLOW_LOG@@", &options.mysql_slow_log)
+        .replace("@@STATE_LOG@@", &options.state_log)
         .replace("@@SERVICE_UNITS@@", &units)
         .replace("@@SAMPLE_OUTPUT@@", &sample);
     if options.scaffold {

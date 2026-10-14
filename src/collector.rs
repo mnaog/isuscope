@@ -476,13 +476,19 @@ fn finish_output(
         parse_protocol(&stdout_destination).unwrap_or_default();
     if let Some(parser) = spec.collector.parser {
         let routes = spec.working_dir.join(".isuscope/routes.toml");
-        match parse_standard_output(
-            &stdout_destination,
-            parser,
-            routes.is_file().then_some(routes.as_path()),
-            benchmark_interval(run_dir),
-            bucket_grid(run_dir),
-        ) {
+        let parsed = if matches!(parser, CollectorParser::StateLog) {
+            // 状態ログは負荷走行（initializeの終わりが分からなければベンチ全体）で集計する。
+            crate::states::parse_collector_output(&stdout_destination, state_window(run_dir))
+        } else {
+            parse_standard_output(
+                &stdout_destination,
+                parser,
+                routes.is_file().then_some(routes.as_path()),
+                benchmark_interval(run_dir),
+                bucket_grid(run_dir),
+            )
+        };
+        match parsed {
             Ok(parsed) => metrics.extend(parsed),
             Err(error) => compression_errors.push(format!("standard output parse failed: {error}")),
         }
@@ -620,6 +626,11 @@ pub(crate) fn parse_protocol(
     use std::io::BufRead;
     // Split on bytes so one line that is not UTF-8 is skipped instead of ending the parse.
     for line in reader.split(b'\n').map_while(Result::ok) {
+        // 生のlog（状態ログなど）をそのまま出すcollectorでは、ほとんどの行がrecordではない。
+        // `"type"`を含まない行は解析せずに飛ばす。
+        if !line.windows(6).any(|window| window == b"\"type\"") {
+            continue;
+        }
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
@@ -742,6 +753,14 @@ pub(crate) fn parse_standard_output(
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
         CollectorParser::ServiceCgroup => Ok(parse_service_cgroup(&raw, interval)),
         CollectorParser::PerfScript => parse_perf_script(&raw, grid, interval),
+        CollectorParser::StateLog => Ok(crate::states::metrics(
+            &crate::states::read(std::io::Cursor::new(raw)),
+            interval.map(|(start, end)| crate::states::Window {
+                name: "whole",
+                start: start.timestamp_micros(),
+                end: end.timestamp_micros(),
+            }),
+        )),
     }
 }
 
@@ -986,6 +1005,12 @@ fn bucket_grid(run_dir: &Path) -> crate::model::BucketGrid {
         .and_then(|raw| serde_json::from_slice::<crate::model::RunManifest>(&raw).ok())
         .map(|manifest| manifest.benchmark.bucket_grid())
         .unwrap_or_default()
+}
+
+fn state_window(run_dir: &Path) -> Option<crate::states::Window> {
+    let manifest: crate::model::RunManifest =
+        serde_json::from_slice(&fs::read(run_dir.join("run.json")).ok()?).ok()?;
+    crate::states::Window::of(&manifest.benchmark)
 }
 
 fn benchmark_interval(run_dir: &Path) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {

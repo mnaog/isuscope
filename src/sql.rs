@@ -57,7 +57,16 @@ pub fn schema(config: &LoadedConfig) -> Result<String> {
 }
 
 pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput> {
-    let connection = open(config)?;
+    run(&open(config)?, sql, [], limit)
+}
+
+/// `sql`を`connection`で実行し、`limit`行までを返す（`states`の一時的な索引も同じ形で出す）。
+pub fn run(
+    connection: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    limit: usize,
+) -> Result<SqlOutput> {
     let mut statement = connection
         .prepare(sql)
         .with_context(|| format!("cannot prepare `{sql}`"))?;
@@ -77,7 +86,7 @@ pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput
     }
     let mut rows = Vec::new();
     let mut total_count = 0;
-    let mut cursor = statement.query([])?;
+    let mut cursor = statement.query(params)?;
     while let Some(row) = cursor.next()? {
         total_count += 1;
         if rows.len() >= limit {

@@ -1143,6 +1143,98 @@ timeout_seconds = 60
 unavailable_exit_codes = [75]
 
 [[collectors]]
+# 状態ログ：アプリが状態の変化を1行ずつ書くJSON行（`{"t":<epochマイクロ秒>,"seq":..,"kind":..,"id":..,
+# "from":..|null,"to":..,"attrs":{..}}`）。ベンチの前後の差分だけを運び、runのlogに残す
+# （生のlogなのでGitには入らない）。集計（状態にいた時間、遷移の回数、状態ごとの対象の数）は
+# `parser = "state-log"`が作り、生の行は`isuscope states sql`・`states timeline`で読む。
+# アプリがまだ書いていなければunavailableになるだけで、runは止めない。
+# ここでは位置（device、inode、大きさ）だけを記録する。
+name = "state-log-mark"
+phase = "before"
+transport = "ssh"
+sequence = "state-log"
+roles = ["app"]
+preflight = ["sh", "-c", '''
+log=@@STATE_LOG@@
+test -e "$log" || { echo "no state log at $log yet (the app writes one once its state-log change is deployed)"; exit 75; }
+test -s "$log" || { echo "state log $log is empty"; exit 0; }
+line=$( (tail -n 1 "$log" || sudo -n tail -n 1 "$log") 2>/dev/null | cut -c1-300)
+if printf '%s' "$line" | grep -q '"dropped"' ||
+  { printf '%s' "$line" | grep -q '"kind"' && printf '%s' "$line" | grep -q '"to"'; }; then
+  echo "state log $log: $( (stat -c %s "$log" || sudo -n stat -c %s "$log") 2>/dev/null) bytes"
+else
+  echo "the last line of $log is not a state event: $line"
+  exit 1
+fi
+''']
+command = ["sh", "-c", '''
+set -eu
+log=@@STATE_LOG@@
+marker=/tmp/isuscope-{run_id}.state-log.marker
+position() { (stat -c '%d %i %s' "$log" || sudo -n stat -c '%d %i %s' "$log") 2>/dev/null; }
+if ! now=$(position); then
+  # まだ無い。ベンチの間に作られたら、deltaが先頭から読む。
+  echo absent > "$marker"
+  exit 75
+fi
+set -- $now
+# 前回までの差分は回収済み。上限を超えたら空にしてnodeのdiskを守る
+# （書き手はO_APPENDで開くので、次の行はfileの先頭から入る）。
+limit=1073741824
+if test "$3" -gt "$limit" && { truncate -s 0 "$log" 2>/dev/null || sudo -n truncate -s 0 "$log" 2>/dev/null; }; then
+  echo "truncated $log after it exceeded $limit bytes" >&2
+  now=$(position) || exit 75
+  set -- $now
+fi
+printf '%s %s %s\n' "$1" "$2" "$3" > "$marker"
+''']
+timeout_seconds = 15
+unavailable_exit_codes = [75]
+
+[[collectors]]
+# 差分の行をそのままstdoutへ出す。1 runで運ぶのは256MiBまでで、超えた分は捨てて
+# `state.truncated_bytes`に残す。
+name = "state-log-delta"
+phase = "after"
+transport = "ssh"
+sequence = "state-log"
+roles = ["app"]
+parser = "state-log"
+command = ["sh", "-c", '''
+set -eu
+log=@@STATE_LOG@@
+marker=/tmp/isuscope-{run_id}.state-log.marker
+trap 'rm -f "$marker"' EXIT
+test -r "$marker" || exit 75
+read device inode size < "$marker" || true
+# 書き手は100msごとにまとめて書くので、ベンチの最後の行がfileに届くのを待つ。
+sleep 0.5
+now=$( (stat -c '%d %i %s' "$log" || sudo -n stat -c '%d %i %s' "$log") 2>/dev/null) || exit 75
+set -- $now
+start=0
+# 同じfileが前より大きければ続きから、作り直された・空にされたなら今のfileの先頭から読む。
+if test "$device" != absent && test "$1 $2" = "$device $inode" && test "$3" -ge "$size"; then
+  start=$size
+fi
+length=$(( $3 - start ))
+limit=268435456
+cut=0
+if test "$length" -gt "$limit"; then
+  cut=$(( length - limit ))
+  length=$limit
+fi
+reader=tail
+test -r "$log" || reader="sudo -n tail"
+# 読む間にも追記されるので、大きさを測った時点までで止める。
+$reader -c +"$(( start + 1 ))" "$log" | head -c "$length"
+printf '\n{"type":"metric","name":"state.read_bytes","value":%s,"unit":"bytes"}\n' "$length"
+printf '{"type":"metric","name":"state.truncated_bytes","value":%s,"unit":"bytes"}\n' "$cut"
+''']
+timeout_seconds = 120
+max_output_bytes = 301989888
+unavailable_exit_codes = [75]
+
+[[collectors]]
 # SQLが遅い理由の切り分け用。実行中thread、行lock待ち、log flush待ち、buffer poolの読み込みを
 # 2秒ごとに見る。累積counterは区間差分、現在値はそのまま。Performance Schemaは使わない。
 name = "mysql-status"

@@ -34,6 +34,9 @@ pub struct BriefOutput {
     pub limits: BriefSection<BriefLimit>,
     /// ベンチの間にアプリ（`service_units`）・nginxのerror log・kernelが出したエラーの型。多い順。
     pub logs: BriefSection<BriefLogPattern>,
+    /// アプリの状態ログ（`state-log` collector）から、対象がその状態にいた時間の合計が長い順。
+    /// 状態ログが無いrunでは空。行は`isuscope states sql`・`states timeline`で読む。
+    pub states: BriefSection<BriefState>,
     pub http: BriefSection<HttpRouteSummary>,
     /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
@@ -75,6 +78,7 @@ impl BriefOutput {
         self.score_inputs.cut(rows);
         self.limits.cut(rows);
         self.logs.cut(rows);
+        self.states.cut(rows);
         self.http.cut(rows);
         self.database.cut(rows);
         self.database_io.cut(rows);
@@ -627,6 +631,105 @@ pub struct BriefLogPattern {
     pub example: String,
 }
 
+/// ある種類の対象がある状態にいた時間。`stays`はその状態を出た回数、`open`は区間の終わりで
+/// まだその状態にいた対象の数、`peak`は区間の中で同時にその状態にいた対象の数の最大。
+#[derive(Debug, Serialize)]
+pub struct BriefState {
+    pub node: String,
+    pub kind: String,
+    pub state: String,
+    pub stays: u64,
+    pub total_ms: f64,
+    pub p95_ms: Option<f64>,
+    pub open: u64,
+    pub peak: u64,
+}
+
+/// `state-log-delta`の集計metric（`state.`）から`states`欄を作り、欠けを`warnings`に出す。
+pub fn attach_states(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let short = brief.run.clone();
+    let mut rows = BTreeMap::<(String, String, String), BriefState>::new();
+    let mut window = None;
+    for metric in metrics.iter().filter(|metric| metric.timestamp.is_none()) {
+        // local transportのcollectorはnodeを持たない（`states sql`のnodeと同じく`local`）。
+        let node = metric
+            .labels
+            .get("node")
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        let field = match metric.name.as_str() {
+            "state.dwell.count"
+            | "state.dwell.total_duration"
+            | "state.dwell.p95_duration"
+            | "state.dwell.open"
+            | "state.occupancy_max" => metric.name.as_str(),
+            "state.dropped" if metric.value > 0.0 => {
+                brief.warnings.push(format!(
+                    "states: the app on {node} dropped {} state events because its writer queue was full; the state log has gaps",
+                    metric.value
+                ));
+                continue;
+            }
+            "state.invalid_lines" if metric.value > 0.0 => {
+                brief.warnings.push(format!(
+                    "states: {} lines of the state log on {node} did not follow the format and were skipped",
+                    metric.value
+                ));
+                continue;
+            }
+            "state.inconsistent" if metric.value > 0.0 => {
+                brief.warnings.push(format!(
+                    "states: {} state events on {node} started from a state other than the one the log had reached (lost or reordered lines)",
+                    metric.value
+                ));
+                continue;
+            }
+            "state.truncated_bytes" if metric.value > 0.0 => {
+                brief.warnings.push(format!(
+                    "states: {} bytes of the state log on {node} were over the per-run limit and were not collected",
+                    metric.value
+                ));
+                continue;
+            }
+            _ => continue,
+        };
+        window = window.or_else(|| metric.labels.get("window").cloned());
+        let (kind, state) = (label(metric, "kind"), label(metric, "state"));
+        let row = rows
+            .entry((node.clone(), kind.clone(), state.clone()))
+            .or_insert_with(|| BriefState {
+                node,
+                kind,
+                state,
+                stays: 0,
+                total_ms: 0.0,
+                p95_ms: None,
+                open: 0,
+                peak: 0,
+            });
+        match field {
+            "state.dwell.count" => row.stays = metric.value as u64,
+            "state.dwell.total_duration" => row.total_ms = metric.value,
+            "state.dwell.p95_duration" => row.p95_ms = Some(metric.value),
+            "state.dwell.open" => row.open = metric.value as u64,
+            _ => row.peak = metric.value as u64,
+        }
+    }
+    let mut rows = rows.into_values().collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.total_ms
+            .total_cmp(&a.total_ms)
+            .then_with(|| b.peak.cmp(&a.peak))
+            .then_with(|| (&a.node, &a.kind, &a.state).cmp(&(&b.node, &b.kind, &b.state)))
+    });
+    brief.states = section(rows, limit).window(window).more(|| {
+        format!(
+            "isuscope states sql {short} \"SELECT kind, state, COUNT(duration_ms) AS stays, SUM(duration_ms) AS total_ms FROM state_stays GROUP BY 1, 2 ORDER BY total_ms DESC\""
+        )
+    });
+}
+
 #[derive(Debug, Serialize)]
 pub struct BriefDatabaseFile {
     pub node: String,
@@ -842,6 +945,7 @@ pub fn build(
         benchmark_messages,
         limits: section(Vec::new(), limit),
         logs: section(Vec::new(), limit),
+        states: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
         database: section(database, limit)

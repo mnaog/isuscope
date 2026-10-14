@@ -106,3 +106,5 @@ mod slow_log;
 mod sql;
 #[path = "e2e/statement_digest.rs"]
 mod statement_digest;
+#[path = "e2e/states.rs"]
+mod states;

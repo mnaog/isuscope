@@ -45,6 +45,9 @@ enum Commands {
         /// slpとMySQL log collectorが読むslow log。
         #[arg(long, default_value = "/var/log/mysql/mysql-slow.log")]
         mysql_slow_log: String,
+        /// state-log collectorが読む、アプリが状態の変化を書くfile。
+        #[arg(long, default_value = isuscope::init::DEFAULT_STATE_LOG)]
+        state_log: String,
         /// cgroupから追うsystemd unit。空白区切り。
         #[arg(long, default_value = "")]
         service_units: String,
@@ -108,6 +111,11 @@ enum Commands {
         /// 出力形式。
         #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
         format: isuscope::sql::SqlFormat,
+    },
+    /// アプリの状態ログ（`state-log` collectorが運んだ生の行）を、runごとに読みます。
+    States {
+        #[command(subcommand)]
+        command: StatesCommand,
     },
     /// 時刻付きmetricをbucket化したJSONで出力します。
     Series {
@@ -309,6 +317,62 @@ enum RoutesCommand {
         /// 候補の書き込み先。省略時は標準出力です。
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StatesCommand {
+    /// runの状態ログを一時的なSQLiteへ載せ、読み取り専用のSQLを実行します。表は`--schema`で見ます。
+    #[command(after_help = "例:
+  isuscope states sql latest \"SELECT kind, to_state, COUNT(*) AS events FROM state_events GROUP BY 1, 2\"
+  isuscope states sql latest \"SELECT state, COUNT(*) AS stays, SUM(duration_ms) AS total_ms FROM state_stays WHERE kind = 'ride' GROUP BY 1 ORDER BY total_ms DESC\"
+  isuscope states sql --schema")]
+    Sql {
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
+        #[arg(required_unless_present = "schema")]
+        run: Option<String>,
+        /// 実行するSELECT。
+        #[arg(conflicts_with = "schema", required_unless_present = "schema")]
+        query: Option<String>,
+        /// 表とviewのCREATE文を出力します。
+        #[arg(long)]
+        schema: bool,
+        /// 返す行数の上限（`sql`と同じ既定値）。出力は約12KBでも切ります。
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// 出力形式。
+        #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
+        format: isuscope::sql::SqlFormat,
+    },
+    /// 1つの対象の状態の変化を時刻順に並べます。`--related`で、attrsでつながる対象の行も混ぜます。
+    #[command(after_help = "例:
+  isuscope states timeline latest --kind chair --id 01J8XYZ --related
+  isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09:10:47.5+09:00 --span 200ms --related")]
+    Timeline {
+        /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
+        #[arg(default_value = "latest")]
+        run: String,
+        /// 対象の種類（状態ログの`kind`）。
+        #[arg(long)]
+        kind: String,
+        /// 対象のID（状態ログの`id`）。
+        #[arg(long)]
+        id: String,
+        /// この時刻の前後`--span`に絞ります。RFC 3339（時差を付ける）、Unix時刻の秒、またはマイクロ秒。
+        #[arg(long)]
+        around: Option<String>,
+        /// `--around`の前後の幅。`--around`が無いときは、対象の最初と最後の行から関係する行を探す幅。
+        #[arg(long, default_value = "1s")]
+        span: String,
+        /// attrsの値でつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も並べます。
+        #[arg(long)]
+        related: bool,
+        /// 返す行数の上限。出力は約12KBでも切ります。
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// 出力形式。
+        #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
+        format: isuscope::sql::SqlFormat,
     },
 }
 
@@ -520,6 +584,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         data_dir,
         nginx_access_log,
         mysql_slow_log,
+        state_log,
         service_units,
         sample_output,
         no_scaffold,
@@ -529,6 +594,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             data_dir: data_dir.clone(),
             nginx_access_log: nginx_access_log.clone(),
             mysql_slow_log: mysql_slow_log.clone(),
+            state_log: state_log.clone(),
             service_units: service_units
                 .split_whitespace()
                 .map(ToOwned::to_owned)
@@ -603,6 +669,10 @@ async fn real_main(cli: Cli) -> Result<bool> {
                     isuscope::sql::write_tsv(&output, std::io::stdout().lock())?
                 }
             }
+            Ok(true)
+        }
+        Commands::States { command } => {
+            show_states(&config, command)?;
             Ok(true)
         }
         Commands::Series {
@@ -1921,6 +1991,157 @@ fn write_json(mut value: serde_json::Value, cap: Option<&RowCap>) -> Result<()> 
     print_json(&value)
 }
 
+/// `states sql`・`states timeline`。runの状態ログを一時的な索引へ載せ、`sql`と同じ形（`run`と
+/// `warnings`を足す）で返す。
+fn show_states(config: &LoadedConfig, command: StatesCommand) -> Result<()> {
+    use isuscope::states;
+    let (requested, format) = match &command {
+        StatesCommand::Sql { schema: true, .. } => {
+            print!("{}", states::SCHEMA);
+            return Ok(());
+        }
+        StatesCommand::Sql { run, format, .. } => (run.clone().unwrap_or_default(), *format),
+        StatesCommand::Timeline { run, format, .. } => (run.clone(), *format),
+    };
+    let store = Store::open(&config.data_dir)?;
+    let id = store.require_id(&requested, "run")?;
+    let short = runner::short_id(&id).to_owned();
+    let manifest = store.load(&id)?;
+    let mut collectors = config
+        .config
+        .collectors
+        .iter()
+        .filter(|collector| {
+            matches!(
+                collector.parser,
+                Some(isuscope::config::CollectorParser::StateLog)
+            )
+        })
+        .map(|collector| collector.name.clone())
+        .collect::<BTreeSet<_>>();
+    collectors.insert(states::DELTA_COLLECTOR.into());
+    let sources = states::sources(&manifest, &store.final_dir(&id).join("logs"), &collectors);
+    let mut warnings = Vec::new();
+    if sources.is_empty() {
+        let results = manifest
+            .collectors
+            .iter()
+            .filter(|result| collectors.contains(&result.name))
+            .map(|result| {
+                format!(
+                    "{} on {} was {}",
+                    result.name,
+                    result.node.as_deref().unwrap_or("local"),
+                    result.status
+                )
+            })
+            .collect::<Vec<_>>();
+        warnings.push(if results.is_empty() {
+            format!(
+                "run {short} has no state log: no state-log collector ran (add the state-log-mark and state-log-delta collectors from `isuscope init --print config`)"
+            )
+        } else {
+            format!(
+                "run {short} has no saved state log ({}); unavailable means the app did not write {} yet, and runs/<id>/logs is not in Git, so a cloned run has no raw lines",
+                results.join(", "),
+                isuscope::init::DEFAULT_STATE_LOG
+            )
+        });
+    }
+    let loaded = states::load(
+        &sources,
+        states::Window::of(&manifest.benchmark),
+        manifest.benchmark.started_at,
+    )?;
+    if loaded.invalid_lines > 0 {
+        warnings.push(format!(
+            "{} lines of the state log did not follow the format and were skipped",
+            loaded.invalid_lines
+        ));
+    }
+    if loaded.dropped > 0 {
+        warnings.push(format!(
+            "the app dropped {} state events because its writer queue was full; the log has gaps",
+            loaded.dropped
+        ));
+    }
+    let output = match command {
+        StatesCommand::Sql { query, limit, .. } => {
+            let query = query.context("a SELECT statement or --schema is required")?;
+            isuscope::sql::run(&loaded.connection, &query, [], limit)?
+        }
+        StatesCommand::Timeline {
+            kind,
+            id,
+            around,
+            span,
+            related,
+            limit,
+            ..
+        } => {
+            let around = around.as_deref().map(states::parse_time).transpose()?;
+            let span = states::parse_span(&span)?;
+            let output = isuscope::sql::run(
+                &loaded.connection,
+                states::TIMELINE,
+                rusqlite::named_params! {
+                    ":kind": kind,
+                    ":id": id,
+                    ":around": around,
+                    ":span": span,
+                    ":related": related,
+                },
+                limit,
+            )?;
+            if output.total_count == 0 && loaded.events > 0 {
+                let mut statement = loaded.connection.prepare(
+                    "SELECT kind, COUNT(DISTINCT id) FROM state_events GROUP BY kind ORDER BY kind",
+                )?;
+                let kinds = statement
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "{} ({} objects)",
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                warnings.push(format!(
+                    "no state events for kind={kind} id={id}{}; kinds in run {short}: {}",
+                    if around.is_some() {
+                        " around that time (widen --span or drop --around)"
+                    } else {
+                        ""
+                    },
+                    kinds.join(", ")
+                ));
+            }
+            output
+        }
+    };
+    match format {
+        isuscope::sql::SqlFormat::Json => {
+            let mut value = serde_json::json!({
+                "schema_version": output.schema_version,
+                "run": short,
+                "columns": output.columns,
+                "total_count": output.total_count,
+                "truncated": output.truncated,
+                "rows": output.rows,
+                "warnings": warnings,
+            });
+            fit_rows(&mut value, &SQL_CAP)?;
+            print_json(&value)
+        }
+        isuscope::sql::SqlFormat::Tsv => {
+            for warning in &warnings {
+                eprintln!("warning: {warning}");
+            }
+            isuscope::sql::write_tsv(&output, std::io::stdout().lock())
+        }
+    }
+}
+
 /// `sql`は保存値をそのまま返す。丸めも表への組み替えもせず（行は最初から値の並び）、大きさだけ抑える。
 fn write_sql_json(output: &isuscope::sql::SqlOutput) -> Result<()> {
     let mut value = serde_json::to_value(output)?;
@@ -2366,6 +2587,8 @@ fn build_brief(
         None,
     )?);
     brief::attach_limits(&mut brief, &limits, limit);
+    let states = store.query_metrics(&brief.summary.id, &[], Some("state."), Some(false))?;
+    brief::attach_states(&mut brief, &states, limit);
     brief.review = Some(brief::review(review));
     brief::next_steps(&mut brief);
     Ok(brief)
@@ -2393,6 +2616,7 @@ fn brief_json(brief: &brief::BriefOutput) -> Result<serde_json::Value> {
         ("cpu", &["node", "source"][..]),
         ("upstreams", &["node"][..]),
         ("logs", &["node", "source"][..]),
+        ("states", &["node", "kind"][..]),
         ("database_io", &["node"][..]),
     ] {
         if let Some(section) = brief.get_mut(section) {

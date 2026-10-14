@@ -127,11 +127,12 @@ isuscope doctor
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
+| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）を一時的なSQLiteへ載せて読む。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `rescore` | adapterが判定を保留した（pending）runを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定する |
 
-`list`、`brief`、`series`、`query`、`sql`、`change`は機械処理しやすいJSONを返します（`schema_version`は2。表を`columns`と`rows`で出す形になったときに上げました）。どの出力も同じ約束で書きます。
+`list`、`brief`、`series`、`query`、`sql`、`states`、`change`は機械処理しやすいJSONを返します（`schema_version`は2。表を`columns`と`rows`で出す形になったときに上げました）。どの出力も同じ約束で書きます。
 
 - runを指す値は、そのrunなら`run`、比較元なら`base`で、値は短縮IDです。完全なIDは`list`の`id`だけに出します。
 - 表は`total_count`（切る前の件数）と`truncated`を必ず持ちます。briefの各欄、`list`の`runs`、`change`の`changes`・`decisions`も同じです。
@@ -248,6 +249,48 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `[context.agent]`を設定すると、run開始時のCodexまたはClaude Codeのsessionと最後のUser inputを厳密に紐付けられます。sessionは`CODEX_SESSION_ID`／`CODEX_THREAD_ID`と`CLAUDE_CODE_SESSION_ID`から解決し、history fileの`- Agent:` headerと一致するものだけを採用します。旧名の`[context.codex]`、`codex-event`マーカー、既存runの`codex_context`も読み込めます。別sessionや通常ターミナルへ推測でfallbackせず、解決できない場合はベンチ開始前に停止します。
 会話履歴はcontextとして別途snapshotされるため、設定した`history_dir`は性能sourceのdirty判定とpatchから自動的に除外されます。
+
+### アプリの状態ログ
+
+HTTPとSQLの記録からは、アプリの中の対象（注文、予約、配車など）が**今どの状態で、いつ変わったか**が分かりません。それを知るために計測を足したrunを回すと、ベンチ1回分の時間を使います。状態ログは、アプリが状態の変化を1行ずつ書き、isuscopeが毎回のrunで運ぶ記録です。一度入れれば、状態についての問いは前のrunの記録を引くだけで答えられます。
+
+1行に1つの変化を、JSONで書きます（`/var/tmp/isuscope-state.jsonl`へ追記。pathは`init --state-log`で変えられます）。
+
+```json
+{"t":1760259047123456,"seq":81234,"kind":"ride","id":"01J9…","from":"MATCHING","to":"ENROUTE","attrs":{"chair":"01J8…","pickup_distance":512}}
+```
+
+- `t`はUnix時刻のマイクロ秒、`seq`はprocess内の通し番号（同じ`t`の順序）。`kind`と状態の名前はアプリが使う値のままで、isuscopeは問題を知りません。
+- 作られたときは`"from":null`。書き手が前の状態を知らないとき（状態の列を読まずにUPDATEするときなど）は`from`を書きません。isuscopeが追ってきた状態で補います。
+- `attrs`は集計に使う少しの値（関係する対象のID、距離、金額など）で、入れ子にしません。
+- 書けずに捨てた行は`{"t":...,"dropped":<数>}`の1行で残します。書き手はリクエストを待たせないよう、あふれたら捨てます。
+
+`state-log-mark`・`state-log-delta`（role `app`）がベンチの前後の差分を運び、runのlogに残します（生のlogなのでGitには入りません）。ファイルがまだ無ければ`unavailable`になるだけで、runは止まりません。`parser = "state-log"`が負荷走行の区間（initializeの終わりが分からなければベンチ全体）について集計します。
+
+| metric | label | 意味 |
+|---|---|---|
+| `state.dwell.count`・`total_duration`・`p50_duration`・`p95_duration`・`p99_duration`・`max_duration` | `kind`, `state`, `window` | 状態にいた時間（ms）。状態が変わった行から次に変わった行まで。区間の中で出たものだけ |
+| `state.dwell.open` | `kind`, `state`, `window` | 区間の終わりでまだその状態にいた対象の数 |
+| `state.transitions` | `kind`, `from`, `to`, `window` | 遷移の回数。作られたときの`from`は`-`、前の状態が分からなければ`?` |
+| `state.occupancy`（1秒ごと）・`state.occupancy_max`（区間の中の最大。変わるたびに数える） | `kind`, `state`（最大は`window`も） | その状態にいる対象の数（ログに現れた対象だけ） |
+| `state.lines`・`state.invalid_lines`・`state.dropped`・`state.inconsistent`・`state.truncated_bytes` | | 読んだ行、形の違う行、書き手が捨てた行、前の状態が合わなかった行、1 runの上限（256MiB）を超えて運ばなかった大きさ |
+
+`brief`の`states`欄は、状態にいた時間の合計が長い順に並べ、欠け（捨てた行、形の違う行、合わなかった行、上限）を`warnings`に出します。前のrunとの比較は`query --base`、時間の推移は`series`で読みます。
+
+```console
+isuscope query latest --base BASE_RUN --metric-prefix state.dwell.total_duration --limit 20
+isuscope series latest --metric state.occupancy --label kind=ride --label state=MATCHING
+```
+
+生の行は`states sql`で読みます。runの状態ログを一時的なin-memoryのSQLiteへ載せ（`state_events`表、区間の`state_window`表、状態にいた時間の`state_stays` view）、読み取り専用のSQLを当てます。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
+
+```console
+isuscope states sql --schema
+isuscope states sql latest "SELECT CASE WHEN json_extract(attrs, '$.pickup_distance') > 500 THEN 'far' ELSE 'near' END AS pickup, COUNT(*) AS stays, SUM(duration_ms) AS total_ms FROM state_stays WHERE kind = 'ride' AND state = 'ENROUTE' GROUP BY 1"
+isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09:10:47.5+09:00 --span 200ms --related
+```
+
+記録は「今どうなっているか」で、「ここを速くすると何点増えるか」は分かりません。ロジックを変える案は実装の前に記録で前提を確かめ（合わない案は実装しない）、採否はスコアで決めます。
 
 ## 観測の考え方
 
