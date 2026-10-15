@@ -581,7 +581,7 @@ timeout_seconds = 30
 max_output_bytes = 33554432
 unavailable_exit_codes = [75]
 
-# alp/slpはログ形式とpathが問題ごとに異なるため、docs/initial-automation.mdに従い以下の
+# alp/slpはログ形式とpathが問題ごとに異なるため、SETUP.mdに従い以下の
 # placeholderを実環境へ合わせます。設定から削除せず、対象がなければ75を返します。
 [[collectors]]
 name = "nginx-log-mark"
