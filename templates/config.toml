@@ -709,7 +709,7 @@ else
   cat "$log" >> "$temporary"
 fi
 mv "$temporary" "$output"
-# 差分はこのnodeに置いたまま、後のalpが集計する。ここでは大きさだけを残す。
+# 差分はこのnodeに置いたまま、後のalp collector（isuscope-node）が集計する。ここでは大きさだけを残す。
 printf '{"type":"metric","name":"http.access_log_bytes","value":%s,"unit":"bytes"}\n' "$(wc -c < "$output" | tr -d ' ')"
 ''']
 unavailable_exit_codes = [75]
@@ -768,21 +768,17 @@ command = ["sh", "-c", "input=/tmp/isuscope-{run_id}.nginx.log; test -r \"$input
 max_output_bytes = 1073741824
 unavailable_exit_codes = [75]
 
-# access logの差分を、node上でroute別に集計する。生のlogを運ばないので、1 nodeあたりの
-# 転送は数十KBで済む。集計はnodeに置いた`isuscope-node`（このisuscopeと同じ集計を1回の読み取りで
-# する静的binary。2コアで62万行を約1.2秒）が、下のawkとalpと同じ出力を作る。`isuscope-node`が無いか、
-# このisuscopeと違うbuildなら、stderrに書いてawkとalpで集計する（同じ62万行で約20秒）。
-# `isuscope doctor`のpreflightは、buildが違えば失敗、無ければ警告にする。alpも無ければ失敗させる
-# （黙ってHTTPの計測が欠けないように）。
-# - route別の集計（回数・status・合計・平均・min/max・p50/p95/p99・bytes）は差分全体をalpで。
-# - route別の5秒ごとの回数・error・p50/p95/p99は、ベンチの区間を5秒ごとのfileに分けてalpで。
+# access logの差分を、nodeに置いた`isuscope-node`（このisuscopeと同じ集計をする静的binary）が
+# route別に集計する。生のlogは運ばず、1 nodeあたりの転送は数十KBで済む。2コアで62万行を約1.2秒。
+# - route別の回数・status・合計・平均・min/max・p50/p95/p99・bytes（差分全体）。
+# - route別の5秒ごとの回数・error・p50/p95/p99（ベンチの区間を5秒ごとに）。
 # - ベンチ側の接続の使い方（同時接続数、新規接続、応答から次の要求までの間隔、接続あたりの
-#   要求数）とupstream別の回数・retry・connect/header/response時間は、同じawkの読み取りで。
-#   分位点は値をsortして取る（mawkにはasortが無い）。
-# 時刻は`$msec`（応答を返し終えたepoch秒）、接続は`$connection`と`$connection_requests`、
+#   要求数）と、upstream別の試行数・retry・connect/header/response時間（ベンチの区間）。
+# 時刻は`$msec`（応答を返し終えたepoch秒）、時間は`$request_time`（`reqtime`）、接続は`$connection`、
 # upstreamは`$upstream_addr`、`$upstream_connect_time`、`$upstream_header_time`、
 # `$upstream_response_time`をLTSVのfieldとして読む。無いfieldの値は出さない。
-# upstream別の値は試行単位で、要求数は試行数、retryはその接続先で失敗して次へ回された試行。
+# `isuscope-node`が無いか、このisuscopeと違うbuildならcollectorは失敗する（黙ってHTTPの計測が
+# 欠けないように）。準備で作り（isu-scaffoldの`make isuscope-node`）、Ansibleのobservability roleが置く。
 [[collectors]]
 name = "alp"
 phase = "after"
@@ -791,205 +787,21 @@ sequence = "nginx-log"
 roles = ["nginx", "edge"]
 preflight = ["sh", "-c", '''
 expected='{isuscope_node_build}'
-if command -v isuscope-node >/dev/null 2>&1; then
-  actual=$(isuscope-node --build-id 2>/dev/null || true)
-  test "$actual" = "$expected" || { echo "isuscope-node is build ${actual:-unknown}, this isuscope expects $expected; rebuild it and install it with the Ansible observability role"; exit 1; }
-  echo "isuscope-node $actual"
-  exit 0
-fi
-command -v alp >/dev/null 2>&1 || { echo 'neither isuscope-node nor alp is installed; install them with the Ansible observability role'; exit 1; }
-echo 'isuscope-node is not installed; the alp collector falls back to awk and alp (about 15x slower)'
-exit 75
+command -v isuscope-node >/dev/null 2>&1 || { echo 'isuscope-node is not installed; build it while preparing and install it with the Ansible observability role'; exit 1; }
+actual=$(isuscope-node --build-id 2>/dev/null || true)
+test "$actual" = "$expected" || { echo "isuscope-node is build ${actual:-unknown}, this isuscope expects $expected; rebuild it and install it with the Ansible observability role"; exit 1; }
+echo "isuscope-node $actual"
 ''']
 command = ["sh", "-c", '''
 set -eu
 input=/tmp/isuscope-{run_id}.nginx.log
 test -r "$input" || exit 75
-if command -v isuscope-node >/dev/null 2>&1 && test "$(isuscope-node --build-id 2>/dev/null || true)" = '{isuscope_node_build}'; then
-  trap 'rm -f "$input"' EXIT
-  isuscope-node access-summary --input "$input" --begin '{benchmark_started_at}' \
-    --load-start '{load_started_at}' --end '{benchmark_finished_at}' --matching-groups '{route_matching_groups}'
-  exit 0
-fi
-echo 'isuscope-node is missing or a different build; aggregating with awk and alp instead' >&2
-work=/tmp/isuscope-{run_id}.alp
-trap 'rm -rf "$input" "$work"' EXIT
-command -v alp >/dev/null 2>&1 || { echo 'alp is not installed on this node; install it with the Ansible observability role' >&2; exit 1; }
-mkdir -p "$work"
-awk -F '\t' -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='{benchmark_finished_at}' -v dir="$work" '
-  BEGIN { origin = (load_start != "") ? load_start + 0 : ((begin != "") ? begin + 0 : 0) }
-  # 5秒bucketは負荷の始まり（分からなければベンチの始まり）から区切る。epochの5の倍数で区切ると、
-  # 負荷の始まりをまたぐbucketができ、区間で絞ったときに負荷の最初の数秒が丸ごと落ちる。
-  # ベンチの始まりをまたぐbucketは、始まりを先頭にした短いbucketにする（先頭が始まりより前だと、
-  # wholeで絞ったときに落ちる）。
-  function bucket_end(t,   offset, index5) {
-    offset = (t - origin) / 5; index5 = int(offset); if (index5 > offset) index5--
-    return origin + (index5 + 1) * 5
-  }
-  function bucket_of(t,   start) {
-    start = bucket_end(t) - 5
-    if (begin != "" && t >= begin + 0 && start < begin + 0) start = begin + 0
-    return sprintf("%.6f", start)
-  }
-  function metric(name, value, unit, labels, at) {
-    printf "{\"type\":\"metric\",\"name\":\"%s\",\"value\":%.6f,\"unit\":\"%s\",\"labels\":{%s}", name, value, unit, labels
-    if (at != "") printf ",\"timestamp\":%s", at
-    printf "}\n"
-  }
-  # nginxはupstreamへの試行を、addressと各時間の変数に同じ並びで記録する（retryは`, `、
-  # 別のupstreamへ回ったときは` : `で区切る）。値の無い試行は`-`。
-  function attempts(raw, parts,   count, i) {
-    gsub(/ : /, ",", raw)
-    count = split(raw, parts, ",")
-    for (i = 1; i <= count; i++) gsub(/^ +| +$/, "", parts[i])
-    return count
-  }
-  function sample(key, value) { if (value != "") printf "%s\t%.6f\n", key, value > (dir "/samples") }
-  /^[ \t]*$/ { next }
-  {
-    lines++
-    delete field
-    for (i = 1; i <= NF; i++) { at = index($i, ":"); if (at) field[substr($i, 1, at - 1)] = substr($i, at + 1) }
-    if (!("method" in field) || !("uri" in field)) next
-    parsed++
-    if (field["msec"] !~ /^[0-9]+(\.[0-9]+)?$/) next
-    at = field["msec"] + 0
-    # 区間は[始まり, 終わり)。読む側と同じく、終わりちょうどの要求は含めない。
-    if ((begin != "" && at < begin + 0) || (end != "" && at >= end + 0)) next
-    bucket = bucket_of(at)
-    print > (dir "/" bucket ".bucket")
-    if (field["conn"] != "" && field["reqtime"] ~ /^[0-9.]+$/) {
-      id = field["conn"]; start = at - field["reqtime"]
-      if (id in last) {
-        # 同じ接続の中でも記録の順は前後するので、外側の端だけを持つ。
-        gap = (start - last[id]) * 1000
-        if (gap >= 0) sample("g" bucket, gap)
-        if (start < first[id]) first[id] = start
-        if (at > last[id]) last[id] = at
-        requests[id]++
-      } else {
-        first[id] = start; last[id] = at; requests[id] = 1; opened[bucket]++
-      }
-    }
-    # 時間は試行ごとにその接続先へ付ける。Aで1秒待って失敗しBで20 msで返ったなら、
-    # Aに1,000 ms、Bに20 ms（要求全体の時間はroute別の`http.request_duration`にある）。
-    count = attempts(field["upstream_addr"], addresses)
-    attempts(field["upstream_connect"], connects)
-    attempts(field["upstream_header"], headers)
-    attempts(field["apptime"], responses)
-    for (i = 1; i <= count; i++) {
-      address = addresses[i]; gsub(/["\\]/, "_", address)
-      if (address == "" || address == "-") continue
-      upstreams[address]++
-      # 最後でない試行は、その接続先で失敗して次へ回されたもの。
-      if (i < count) retried[address]++
-      if (connects[i] ~ /^[0-9.]+$/) sample("c" address, connects[i] * 1000)
-      if (headers[i] ~ /^[0-9.]+$/) sample("h" address, headers[i] * 1000)
-      if (responses[i] ~ /^[0-9.]+$/) sample("r" address, responses[i] * 1000)
-    }
-  }
-  END {
-    print lines + 0, parsed + 0 > (dir "/counts")
-    # 同時接続数は、各接続の最初の要求から最後の応答までを5秒ごとに積む（遊休中の保持は入らない）。
-    for (id in first) {
-      start = first[id]
-      if (begin != "" && start < begin + 0) start = begin + 0
-      while (1) {
-        bucket = bucket_of(start); stop = bucket_end(start); if (last[id] < stop) stop = last[id]
-        if (stop > start) busy[bucket] += stop - start
-        if (stop >= last[id]) break
-        start = stop
-      }
-      connections++; total += requests[id]; if (requests[id] > most) most = requests[id]
-    }
-    # 端のbucketは5秒より短いので、実際の長さで割る。
-    for (bucket in busy) {
-      span = bucket_end(bucket) - bucket
-      if (end != "" && bucket_end(bucket) > end + 0) span = end - bucket
-      if (span > 0) metric("client.connections_in_use", busy[bucket] / span, "connections", "", bucket)
-    }
-    for (bucket in opened) metric("client.connections_opened", opened[bucket], "connections", "", bucket)
-    if (connections) {
-      metric("client.connection_requests_mean", total / connections, "requests", "", "")
-      metric("client.connection_requests_max", most, "requests", "", "")
-      metric("client.connections_opened_total", connections, "connections", "", "")
-    }
-    for (address in upstreams) {
-      label = "\"upstream\":\"" address "\""
-      metric("http.upstream_requests", upstreams[address], "requests", label, "")
-      if (address in retried) metric("http.upstream_retried_requests", retried[address], "requests", label, "")
-    }
-  }' "$input"
-read lines parsed < "$work/counts"
-# 行はあるのにmethodとuriを1件も読めなければ、log formatと設定が合っていない。
-if [ "$lines" -gt 0 ] && [ "$parsed" = 0 ]; then
-  echo "none of $lines access-log lines had the method and uri fields" >&2
-  exit 65
-fi
-if [ -s "$work/samples" ]; then
-  LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2n "$work/samples" | awk -F '\t' '
-    function metric(name, value, labels, at) {
-      printf "{\"type\":\"metric\",\"name\":\"%s\",\"value\":%.6f,\"unit\":\"ms\",\"labels\":{%s}", name, value, labels
-      if (at != "") printf ",\"timestamp\":%s", at
-      printf "}\n"
-    }
-    function rank(q,   r, i) { r = q * n; i = int(r); if (i < r) i++; return i < 1 ? 1 : i }
-    function flush(   kind, rest, name, labels, at, i, sum, q) {
-      if (n == 0) return
-      kind = substr(key, 1, 1); rest = substr(key, 2); labels = ""; at = ""
-      if (kind == "g") { name = "client.request_gap"; at = rest }
-      else {
-        name = kind == "c" ? "http.upstream_connect_duration" : kind == "h" ? "http.upstream_header_duration" : "http.upstream_response_duration"
-        labels = "\"upstream\":\"" rest "\""
-        for (i = 1; i <= n; i++) sum += value[i]
-        metric(name "_sum", sum, labels, ""); metric(name "_mean", sum / n, labels, "")
-        metric(name "_min", value[1], labels, ""); metric(name "_max", value[n], labels, "")
-      }
-      split("0.50 0.95 0.99", q, " ")
-      for (i = 1; i <= 3; i++) {
-        sep = labels == "" ? "" : ","
-        metric(name, value[rank(q[i] + 0)], labels sep "\"quantile\":\"" q[i] "\"", at)
-      }
-      n = 0
-    }
-    $1 != key { flush(); key = $1 }
-    { value[++n] = $2 + 0 }
-    END { flush() }'
-fi
-# route別の集計は差分全体で1回、時系列は5秒ごとのfileごとに1回、alpで作る。
-# alpは`apptime`（upstreamの時間）があればそちらを使うので、`reqtime`（`$request_time`）を渡す。
-summarize() {
-  alp ltsv --file "$1" --format json --apptime-label reqtime \
-    --output count,1xx,2xx,3xx,4xx,5xx,method,uri,min,max,sum,avg,p50,p95,p99,sum_body \
-    --percentiles 50,95,99 --matching-groups '{route_matching_groups}' | tr -d '\n'
-}
-# 差分全体とbucketごとのalpは互いに独立なので並行に走らせ、出力は元の順に並べる。差分全体は
-# 一番長いので別に走らせ、bucketはcoreの数ずつ回す。
-parallel=$(nproc 2>/dev/null || echo 2)
-summarize "$input" > "$work/whole.json" &
-batch=
-running=0
-for file in "$work"/*.bucket; do
-  test -e "$file" || continue
-  summarize "$file" > "$file.json" &
-  batch="$batch $!"
-  running=$((running + 1))
-  if [ "$running" -ge "$parallel" ]; then
-    wait $batch
-    batch=
-    running=0
-  fi
-done
-wait
-printf 'whole\t%s\n' "$(cat "$work/whole.json")"
-# methodとuriを読めた行の数。alpは解釈できない行（`%ZZ`のような壊れたescapeのURIなど）を黙って
-# 飛ばすので、parserがalpの集計件数と比べ、全部飛ばされたら失敗にし、一部なら数を残す。
-printf 'lines\t%s\n' "$parsed"
-for file in "$work"/*.bucket; do
-  test -e "$file" || continue
-  bucket=${file##*/}
-  printf '%s\t%s\n' "${bucket%.bucket}" "$(cat "$file.json")"
-done
+trap 'rm -f "$input"' EXIT
+command -v isuscope-node >/dev/null 2>&1 || { echo 'isuscope-node is not installed on this node; build it while preparing and install it with the Ansible observability role' >&2; exit 1; }
+actual=$(isuscope-node --build-id 2>/dev/null || true)
+test "$actual" = '{isuscope_node_build}' || { echo "isuscope-node is build ${actual:-unknown}, this isuscope expects {isuscope_node_build}; rebuild it and install it again" >&2; exit 1; }
+isuscope-node access-summary --input "$input" --begin '{benchmark_started_at}' \
+  --load-start '{load_started_at}' --end '{benchmark_finished_at}' --matching-groups '{route_matching_groups}'
 ''']
 parser = "alp-windows"
 timeout_seconds = 120
