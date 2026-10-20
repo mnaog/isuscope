@@ -81,6 +81,8 @@ isuscope --version
 
 競技用bundleは`./scripts/build-release-bundle.sh`で作れます。生成物にはbinary、SHA-256、README、LICENSEが含まれます。
 
+nodeでaccess logを集計する`isuscope-node`は、`./scripts/build-node.sh <出力先>`でLinuxの静的binary（amd64とarm64）として作ります。依存はregexだけで、linkerはRustに付属するrust-lldを使うので、macOSからもDocker無しで作れます。nodeのOSに依存しないので、問題の公開前に作っておけます。nodeの`/usr/local/bin/isuscope-node`に置くと、`alp` collectorがaccess logの差分をnode上で集計します（2コアで62万行を約1.2秒。以前のawkとalpでは約20秒）。無いかbuildが違えばcollectorは失敗します。置いたbinaryが手元のisuscopeと同じsourceからのものかは、`isuscope-node --build-id`と`isuscope __access-summary --build-id`で照合でき、`isuscope doctor`も確かめます（[標準観測](docs/standard-observability.md#node上の集計binaryisuscope-node)）。
+
 ## プロジェクトへ導入する
 
 アプリケーションのGitリポジトリ直下で一度だけ初期化します。
@@ -127,7 +129,7 @@ isuscope doctor
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
-| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）を一時的なSQLiteへ載せて読む。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
+| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）をSQLiteへ載せて読む（runごとに残し、次からは開くだけ）。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `rescore` | adapterが判定を保留した（pending）runを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定する |
@@ -237,7 +239,7 @@ access logに`upstream_addr`と`upstream_connect`・`upstream_header`がある�
 
 `host-sampler`はCPU・memory・loadに加えて、接続とネットワークのcounterも1秒ごとに出します。`host.tcp_passive_opens_per_second`、`host.tcp_established`、`host.tcp_time_wait`、`host.tcp_listen_overflows_per_second`、`host.tcp_listen_drops_per_second`、`host.tcp_syn_cookies_sent_per_second`、`host.tcp_time_wait_overflow_per_second`、`host.tcp_retransmit_segments_per_second`、NICごとの`host.net_rx_packets_per_second`などと、`host.cpu_softirq_percent`です。取りこぼしのcounterが0のままなら、少なくとも受け付けの取りこぼしとしては説明できません（接続の失敗がサーバー側にないことの証明にはなりません）。毎秒値は`/proc/uptime`で測った実際の間隔で割るので、samplerが1秒より遅れても率が水増しされません。毎秒値は小数で出し、取りこぼし系（`host.tcp_listen_overflows`、`host.tcp_listen_drops`、`host.tcp_syn_cookies_sent`、`host.tcp_time_wait_overflow`、`host.tcp_retransmit_segments`）は区間の件数も整数で残します。整数で割っていたころは、1.01秒に1件の取りこぼしが0件/秒になり、「起きていない」と区別できませんでした。読むのは`/proc`の小さなfileだけで、追加のtoolもroot権限も要りません。
 
-ベンチ前後のcollectorは**node単位で並列**に実行し、同じnodeの中でも`sequence`の違うものは並行に動かします。同じ`sequence`の中では設定順を保つので、perf-stopの後にperf-series、log markの後にdeltaとalpという受け渡しは崩れません（標準設定はperf・off-CPU・nginx log・app log・slow log・MySQL I/Oをそれぞれ1つの`sequence`にしています。`sequence`の無いcollectorはnodeごとに1列で順に動きます）。sshdが認証前の接続を落とし始めないよう、1 nodeへ同時に走らせるのは8本までです。ベンチ中のcollectorは全部へ同時に停止を送って並行に回収し、benchmark parserはベンチの出力だけを読むので、その停止とafter collectorを待たずに並行して動かします。localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。各段階（`collectors_before`、`benchmark`、`collectors_during_stop`、`collectors_after`、`benchmark_parsers`など）の開始時刻と所要時間は`run.json`の`stages`に、collectorとparserごとの値は各結果の`started_at`・`duration_ms`に残り、`run`の終了時に`timing`の行へまとめて出します。practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。slow logとaccess logは生のまま運ばず、node上でslp・alpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。MySQLのSQLは、performance_schemaのstatement digestから`mysql-digest`がslpと同じ形で集計します。slow log（`long_query_time=0`）は全文を書くのでベンチ中のDBの負荷になり、slpの集計にも1回数十秒かかっていたためです（practice-14の序盤では後処理37.7秒のうち27秒）。slow logがあればslpも動き、両方あればbriefは`mysql-digest`を使います。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは`survey-run`でだけ`mysql-log-raw`・`nginx-log-raw`が持ち帰ります。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
+ベンチ前後のcollectorは**node単位で並列**に実行し、同じnodeの中でも`sequence`の違うものは並行に動かします。同じ`sequence`の中では設定順を保つので、perf-stopの後にperf-series、log markの後にdeltaとalpという受け渡しは崩れません（標準設定はperf・off-CPU・nginx log・app log・slow log・MySQL I/Oをそれぞれ1つの`sequence`にしています。`sequence`の無いcollectorはnodeごとに1列で順に動きます）。sshdが認証前の接続を落とし始めないよう、1 nodeへ同時に走らせるのは8本までです。ベンチ中のcollectorは全部へ同時に停止を送って並行に回収し、benchmark parserはベンチの出力だけを読むので、その停止とafter collectorを待たずに並行して動かします。localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。各段階（`collectors_before`、`benchmark`、`collectors_during_stop`、`collectors_after`、`benchmark_parsers`など）の開始時刻と所要時間は`run.json`の`stages`に、collectorとparserごとの値は各結果の`started_at`・`duration_ms`に残り、`run`の終了時に`timing`の行へまとめて出します。practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。slow logとaccess logは生のまま運ばず、node上でslp・`isuscope-node`が集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。MySQLのSQLは、performance_schemaのstatement digestから`mysql-digest`がslpと同じ形で集計します。slow log（`long_query_time=0`）は全文を書くのでベンチ中のDBの負荷になり、slpの集計にも1回数十秒かかっていたためです（practice-14の序盤では後処理37.7秒のうち27秒）。slow logがあればslpも動き、両方あればbriefは`mysql-digest`を使います。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは`survey-run`でだけ`mysql-log-raw`・`nginx-log-raw`が持ち帰ります。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
 
 `[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow logの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 
@@ -282,11 +284,15 @@ isuscope query latest --base BASE_RUN --metric-prefix state.dwell.total_duration
 isuscope series latest --metric state.occupancy --label kind=ride --label state=MATCHING
 ```
 
-生の行は`states sql`で読みます。runの状態ログを一時的なin-memoryのSQLiteへ載せ（`state_events`表、区間の`state_window`表、状態にいた時間の`state_stays` view）、読み取り専用のSQLを当てます。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
+生の行は`states sql`で読みます。runの状態ログをSQLiteへ載せ（`state_events`表、attrsの値を1つずつ持つ`state_attrs`表、区間の`state_window`表、状態にいた時間の`state_stays`表と、それぞれの索引）、読み取り専用のSQLを当てます。作ったSQLiteはdata directoryの`cache/states/`にrunごとに残し（最近使った3 runまで。Gitには入れません）、同じrunの次の問い合わせはそれを開くだけです（40万行・64 MBのlogで、作るのに約4秒、開くのは一瞬）。元のlog・区間・isuscopeの版が変われば作り直します。
+
+1つのSQLは既定で30秒で止め（`--timeout-seconds`、0で無制限。`states timeline`と`isuscope sql`も同じ）、索引を使う書き方を示します。行ごとに相関サブクエリで数え直すSQLは行数の2乗で重くなり、practice-14-seventhでは2分と5分待って手が止まりました。同じ問いは、attrsで結ぶなら`state_attrs`の索引（`key, value, kind, to_state, t`）から引き、ある状態にいる数の推移は`entered_t`で+1・`left_t`で-1した累積和（`SUM(d) OVER (ORDER BY t)`）で数えると、40万行でも0.1〜0.2秒で返ります。1秒ごとの数は`isuscope series latest --metric state.occupancy`にもあります。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
 
 ```console
 isuscope states sql --schema
 isuscope states sql latest "SELECT CASE WHEN json_extract(attrs, '$.pickup_distance') > 500 THEN 'far' ELSE 'near' END AS pickup, COUNT(*) AS stays, SUM(duration_ms) AS total_ms FROM state_stays WHERE kind = 'ride' AND state = 'ENROUTE' GROUP BY 1"
+# 椅子が空いた通知から、その椅子に次のライドが付くまで（state_attrsの索引で引く）
+isuscope states sql latest "SELECT COUNT(*) AS n, AVG(next_t - t) / 1000.0 AS avg_ms FROM (SELECT c.t, (SELECT MIN(m.t) FROM state_attrs m WHERE m.key = 'chair' AND m.value = json_extract(c.attrs, '$.chair') AND m.kind = 'ride' AND m.to_state = 'MATCHED' AND m.t > c.t) AS next_t FROM state_events c WHERE c.kind = 'chair_notification' AND c.to_state = 'SENT' AND json_extract(c.attrs, '$.status') = 'COMPLETED') WHERE next_t IS NOT NULL"
 isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09:10:47.5+09:00 --span 200ms --related
 ```
 
@@ -294,9 +300,9 @@ isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09
 
 ## 観測の考え方
 
-標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、ALP、SQL（statement digest、またはslow log）、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。5秒ごとに集計する値（HTTP、DB、perf、client）は負荷の始まりから区切るので、負荷の最初のbucketが落ちたりinitializeへ混ざったりしません。briefの`hosts`と`clients`は、initializeの終わりが分かるrunでは負荷区間だけで要約し、どちらで要約したかを`hosts_window`（`load`か`whole`）に出します。
+標準雛形はhost sampler、sysstat、指定systemd unitのcgroup sampler、perf、Flame Graph、off-CPU、access log（`isuscope-node`）、SQL（statement digest、またはslow log）、fingerprintをnodeとphase単位で記録します。依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。時系列は`--window whole|initialize|load`で初期化と負荷走行を分離できます。5秒ごとに集計する値（HTTP、DB、perf、client）は負荷の始まりから区切るので、負荷の最初のbucketが落ちたりinitializeへ混ざったりしません。briefの`hosts`と`clients`は、initializeの終わりが分かるrunでは負荷区間だけで要約し、どちらで要約したかを`hosts_window`（`load`か`whole`）に出します。
 
-ALPはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。標準collectorを最初から全部入れる理由と、その受け入れ基準は[標準observability](docs/standard-observability.md)にあります。
+alp collectorはrouteごとのcount、status、sum/avg、min/max、p50/p95/p99を保存します。標準collectorを最初から全部入れる理由と、その受け入れ基準は[標準observability](docs/standard-observability.md)にあります。
 
 ## License
 

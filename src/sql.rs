@@ -56,8 +56,59 @@ pub fn schema(config: &LoadedConfig) -> Result<String> {
     Ok(statements.join(";\n") + ";\n")
 }
 
-pub fn query(config: &LoadedConfig, sql: &str, limit: usize) -> Result<SqlOutput> {
-    run(&open(config)?, sql, [], limit)
+/// 何も指定しなければ、1つのSQLに許す時間。相関サブクエリで行数の2乗になったSQLは、数万行で
+/// 数分以上かかる（practice-14-seventhでは2分と5分待って手を止めた）。
+pub const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+
+pub fn query(
+    config: &LoadedConfig,
+    sql: &str,
+    limit: usize,
+    timeout_seconds: u64,
+) -> Result<SqlOutput> {
+    run_limited(
+        &open(config)?,
+        sql,
+        [],
+        limit,
+        timeout_seconds,
+        "filter on the indexed columns shown by --schema",
+    )
+}
+
+/// [`run`]を`timeout_seconds`（0なら無制限）で打ち切る。打ち切ったら、`hint`を添えて失敗する。
+pub fn run_limited(
+    connection: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    limit: usize,
+    timeout_seconds: u64,
+    hint: &str,
+) -> Result<SqlOutput> {
+    if timeout_seconds == 0 {
+        return run(connection, sql, params, limit);
+    }
+    let handle = connection.get_interrupt_handle();
+    let (finished, wait) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        let expired = matches!(
+            wait.recv_timeout(std::time::Duration::from_secs(timeout_seconds)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        if expired {
+            handle.interrupt();
+        }
+        expired
+    });
+    let result = run(connection, sql, params, limit);
+    let _ = finished.send(());
+    let expired = watchdog.join().unwrap_or(false);
+    match result {
+        Err(_) if expired => anyhow::bail!(
+            "the query was stopped after {timeout_seconds}s (--timeout-seconds; 0 for no limit); {hint}"
+        ),
+        result => result,
+    }
 }
 
 /// `sql`を`connection`で実行し、`limit`行までを返す（`states`の一時的な索引も同じ形で出す）。
@@ -140,4 +191,25 @@ pub fn write_tsv(output: &SqlOutput, mut writer: impl std::io::Write) -> Result<
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_query_over_the_time_limit_stops_with_the_hint() {
+        let connection = Connection::open_in_memory().unwrap();
+        let endless = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) \
+                       SELECT COUNT(*) AS rows FROM n";
+        let started = std::time::Instant::now();
+        let error = run_limited(&connection, endless, [], 10, 1, "try an index").unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let message = error.to_string();
+        assert!(message.contains("stopped after 1s"), "{message}");
+        assert!(message.contains("try an index"), "{message}");
+        // 止めた後も同じ接続で次のSQLを流せる。
+        let output = run_limited(&connection, "SELECT 1 AS one", [], 10, 1, "").unwrap();
+        assert_eq!(output.rows, [[Value::from(1)]]);
+    }
 }
