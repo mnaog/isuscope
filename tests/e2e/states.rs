@@ -284,6 +284,74 @@ fn a_run_summarizes_the_state_log_and_keeps_the_raw_lines_queryable() {
     assert_eq!(stays["rows"][0]["distance"], 600, "{stays}");
     assert_eq!(stays["rows"][0]["duration_ms"], 600.0, "{stays}");
 
+    // attrsの値は1つずつstate_attrsにも入り、別の対象のIDで索引から引ける。数も文字列で持つ。
+    let attrs = isuscope(
+        project.path(),
+        &[
+            "states",
+            "sql",
+            "latest",
+            "SELECT id, to_state, key, value FROM state_attrs WHERE kind = 'ride' AND key IN ('chair', 'pickup_distance') ORDER BY t, key",
+        ],
+        &path,
+    );
+    let attrs: Value = parsed(&attrs.stdout).unwrap();
+    let attrs = attrs["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {} {}={}",
+                row["id"], row["to_state"], row["key"], row["value"]
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attrs,
+        [
+            r#""r1" "ENROUTE" "chair"="c1""#,
+            r#""r1" "ENROUTE" "pickup_distance"="600""#,
+            r#""r1" "COMPLETED" "chair"="c1""#,
+        ]
+    );
+
+    // 作ったSQLiteはrunごとに残り、次の問い合わせはそれを開く。data directoryのGitには入れない。
+    let caches = walk(project.path())
+        .into_iter()
+        .filter(|path| {
+            path.parent()
+                .is_some_and(|parent| parent.ends_with("cache/states"))
+        })
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        caches.iter().any(|name| name.ends_with(".sqlite3")),
+        "{caches:?}"
+    );
+    assert!(caches.iter().any(|name| name == ".gitignore"), "{caches:?}");
+
+    // 重いSQLは--timeout-secondsで止め、索引を使う書き方を示す。
+    let slow = isuscope(
+        project.path(),
+        &[
+            "states",
+            "sql",
+            "latest",
+            "--timeout-seconds",
+            "1",
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT COUNT(*) AS rows FROM n",
+        ],
+        &path,
+    );
+    assert!(!slow.status.success());
+    let stderr = String::from_utf8_lossy(&slow.stderr);
+    assert!(stderr.contains("stopped after 1s"), "{stderr}");
+    assert!(stderr.contains("state_attrs"), "{stderr}");
+
     // 1つの椅子の前後。ride r1はc1のattrsに、c1はr1のattrsに現れる。関係する対象の行は、
     // 椅子の最初の行の1秒前から最後の行の1秒後まで。
     let timeline = isuscope(
@@ -423,8 +491,28 @@ command = ["sh", "-c", "printf '%s\n' '{\"type\":\"isuscope.result\",\"pass\":tr
     assert_eq!(brief["states"]["rows"], serde_json::json!([]), "{brief}");
 
     let schema = isuscope(project.path(), &["states", "sql", "--schema"], &path);
+    let schema = String::from_utf8_lossy(&schema.stdout);
+    for table in ["state_events", "state_attrs", "state_stays"] {
+        assert!(
+            schema.contains(&format!("CREATE TABLE {table}")),
+            "{schema}"
+        );
+    }
     assert!(
-        String::from_utf8_lossy(&schema.stdout).contains("CREATE VIEW state_stays"),
-        "{schema:?}"
+        schema.contains("CREATE INDEX state_attrs_value"),
+        "{schema}"
     );
+}
+
+fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }

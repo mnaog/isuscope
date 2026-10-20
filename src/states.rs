@@ -528,7 +528,7 @@ pub struct Loaded {
     pub dropped: u64,
 }
 
-/// `states`コマンドが読む表とview。`--schema`でこのまま出す。
+/// `states`コマンドが読む表。`--schema`でこのまま出す（`state_stays`は行を入れた後に作る）。
 macro_rules! state_tables {
     () => {
         "\
@@ -544,11 +544,33 @@ CREATE TABLE state_events (
   to_state TEXT NOT NULL,
   attrs TEXT                   -- JSON object。json_extract(attrs, '$.name')で読む
 );
+-- attrsの値（文字列・数・真偽）を1つずつ。別の対象のIDなど、attrsで行を結ぶときに索引が効く。
+-- 例: 椅子ごとに次のMATCHEDを探す
+--   SELECT MIN(a.t) FROM state_attrs a WHERE a.key = 'chair' AND a.value = :chair
+--     AND a.kind = 'ride' AND a.to_state = 'MATCHED' AND a.t > :t
+CREATE TABLE state_attrs (
+  node TEXT NOT NULL,
+  t INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  id TEXT NOT NULL,
+  to_state TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL           -- 数と真偽も文字列（1、1.5、true）
+);
 -- 集計metricと同じ区間（loadかwhole）。ベンチの時刻が分からないrunでは空。
 CREATE TABLE state_window (name TEXT NOT NULL, start_t INTEGER NOT NULL, end_t INTEGER NOT NULL);
+"
+    };
+}
+
+/// 状態にいた時間。行を入れた後に一度だけ計算して表にする（viewだと参照のたびに全行を並べ直す）。
+macro_rules! state_stays {
+    () => {
+        "\
 -- 状態にいた時間。状態が変わった行から、同じ対象の次に変わった行まで（同じ状態への遷移は区切らない）。
 -- まだ出ていなければleft_tとduration_msはNULL。
-CREATE VIEW state_stays AS
+CREATE TABLE state_stays AS
 SELECT node, kind, id, to_state AS state, t AS entered_t,
   LEAD(t) OVER object AS left_t,
   LEAD(to_state) OVER object AS next_state,
@@ -567,11 +589,22 @@ macro_rules! state_indexes {
         "\
 CREATE INDEX state_events_object ON state_events (kind, id, t, seq);
 CREATE INDEX state_events_time ON state_events (t, seq);
+CREATE INDEX state_events_state ON state_events (kind, to_state, t);
+CREATE INDEX state_attrs_value ON state_attrs (key, value, kind, to_state, t);
+CREATE INDEX state_stays_state ON state_stays (kind, state, entered_t);
+CREATE INDEX state_stays_object ON state_stays (kind, id, entered_t);
 "
     };
 }
 
-pub const SCHEMA: &str = concat!(state_tables!(), state_indexes!());
+pub const SCHEMA: &str = concat!(state_tables!(), state_stays!(), state_indexes!());
+
+/// 重い問い合わせが止まったときに添える、速く書き直す方法。
+pub const SLOW_QUERY_HINT: &str = "rewrite it so each row is found through an index instead of \
+scanning: join on state_attrs (key, value, kind, to_state, t) instead of json_extract in a \
+correlated subquery, filter state_stays by (kind, state, entered_t), and count objects over \
+time with a running sum (SUM(d) OVER (ORDER BY t) over +1 at entered_t and -1 at left_t) \
+instead of counting the stays again for every row";
 
 /// あるrunの状態ログを、読み取り専用のin-memory SQLiteへ載せる。
 pub fn load(
@@ -580,6 +613,190 @@ pub fn load(
     started_at: Option<DateTime<Utc>>,
 ) -> Result<Loaded> {
     let mut connection = Connection::open_in_memory()?;
+    let (events, invalid_lines, dropped) = build(&mut connection, sources, window, started_at)?;
+    connection.pragma_update(None, "query_only", true)?;
+    Ok(Loaded {
+        connection,
+        events,
+        invalid_lines,
+        dropped,
+    })
+}
+
+/// 残すrunの数。1 runのSQLiteは状態ログの数倍（40万行・64 MBのlogで数百MB）になる。
+const CACHE_RUNS: usize = 3;
+
+/// [`load`]と同じSQLiteを`cache_dir`へrunごとに残し、同じrunの次の問い合わせではそれを開く。
+/// 展開・解析・表と索引の構築（40万行で約4秒）を、問い合わせのたびに繰り返さないため。
+/// 元のlog、区間、isuscopeの版と表の形が変われば作り直す。作れなければin-memoryで読む。
+pub fn load_cached(
+    cache_dir: &Path,
+    run_id: &str,
+    sources: &[Source],
+    window: Option<Window>,
+    started_at: Option<DateTime<Utc>>,
+) -> Result<Loaded> {
+    let key = cache_key(sources, window, started_at);
+    let path = cache_dir.join(format!("{run_id}.sqlite3"));
+    if let Some(loaded) = open_cached(&path, &key) {
+        // 残すrunは最近使った順に選ぶ。
+        let _ = std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+        return Ok(loaded);
+    }
+    match build_cache(cache_dir, run_id, &path, &key, sources, window, started_at) {
+        Ok(Some(loaded)) => Ok(loaded),
+        _ => load(sources, window, started_at),
+    }
+}
+
+fn cache_key(
+    sources: &[Source],
+    window: Option<Window>,
+    started_at: Option<DateTime<Utc>>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(env!("CARGO_PKG_VERSION"));
+    hasher.update(SCHEMA);
+    for source in sources {
+        let metadata = std::fs::metadata(&source.path).ok();
+        let modified = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|at| at.as_nanos());
+        hasher.update(format!(
+            "\0{}\0{}\0{:?}\0{:?}",
+            source.node,
+            source.path.display(),
+            metadata.map(|metadata| metadata.len()),
+            modified
+        ));
+    }
+    hasher.update(format!(
+        "\0{:?}\0{:?}",
+        window.map(|window| (window.name, window.start, window.end)),
+        started_at.map(|at| at.timestamp_micros())
+    ));
+    format!("{:x}", hasher.finalize())
+}
+
+fn open_cached(path: &Path, key: &str) -> Option<Loaded> {
+    if !path.is_file() {
+        return None;
+    }
+    let connection =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let (stored, events, invalid_lines, dropped) = connection
+        .query_row(
+            "SELECT key, events, invalid_lines, dropped FROM isuscope_cache",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .ok()?;
+    if stored != key {
+        return None;
+    }
+    connection.pragma_update(None, "query_only", true).ok()?;
+    Some(Loaded {
+        connection,
+        events: events as usize,
+        invalid_lines: invalid_lines as u64,
+        dropped: dropped as u64,
+    })
+}
+
+/// 一時fileに作り切ってから置き換える。同じrunを2つのprocessが同時に作っても、読む側は
+/// 作りかけを開かない（後に置いた方が残るだけ）。
+fn build_cache(
+    cache_dir: &Path,
+    run_id: &str,
+    path: &Path,
+    key: &str,
+    sources: &[Source],
+    window: Option<Window>,
+    started_at: Option<DateTime<Utc>>,
+) -> Result<Option<Loaded>> {
+    std::fs::create_dir_all(cache_dir)?;
+    // data directoryはGitで持つことがあるので、作り直せるcacheは入れない。
+    let ignore = cache_dir.join(".gitignore");
+    if !ignore.exists() {
+        std::fs::write(&ignore, "*\n")?;
+    }
+    let temporary = cache_dir.join(format!(".{run_id}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let built = (|| -> Result<()> {
+        let mut connection = Connection::open(&temporary)?;
+        connection.pragma_update(None, "journal_mode", "OFF")?;
+        connection.pragma_update(None, "synchronous", "OFF")?;
+        let (events, invalid_lines, dropped) = build(&mut connection, sources, window, started_at)?;
+        connection.execute_batch(
+            "CREATE TABLE isuscope_cache (key TEXT NOT NULL, events INTEGER NOT NULL, \
+             invalid_lines INTEGER NOT NULL, dropped INTEGER NOT NULL)",
+        )?;
+        connection.execute(
+            "INSERT INTO isuscope_cache VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![key, events as i64, invalid_lines as i64, dropped as i64],
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = built {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    std::fs::rename(&temporary, path)?;
+    evict(cache_dir, path);
+    Ok(open_cached(path, key))
+}
+
+/// 最近使った[`CACHE_RUNS`]個を残し、残りと、残った一時file（10分より前）を消す。
+fn evict(cache_dir: &Path, current: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut caches = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tmp") {
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age > std::time::Duration::from_secs(600))
+            {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if name.ends_with(".sqlite3") && path != current {
+            caches.push((modified, path));
+        }
+    }
+    caches.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in caches.into_iter().skip(CACHE_RUNS - 1) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 表を作り、logの行を入れ、`state_stays`と索引を作る。行数、読めなかった行、書き手が落とした行を返す。
+fn build(
+    connection: &mut Connection,
+    sources: &[Source],
+    window: Option<Window>,
+    started_at: Option<DateTime<Utc>>,
+) -> Result<(usize, u64, u64)> {
     connection.execute_batch(state_tables!())?;
     let mut events = 0;
     let mut invalid_lines = 0;
@@ -592,6 +809,10 @@ pub fn load(
                 "INSERT INTO state_events (node, t, at, since_start_ms, seq, kind, id, from_state, to_state, attrs)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
+            let mut insert_attr = transaction.prepare(
+                "INSERT INTO state_attrs (node, t, seq, kind, id, to_state, key, value)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
             for source in sources {
                 let input = std::fs::File::open(&source.path)
                     .with_context(|| format!("cannot open {}", source.path.display()))?;
@@ -603,6 +824,24 @@ pub fn load(
                     let at = DateTime::from_timestamp_micros(event.t)
                         .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
                         .unwrap_or_default();
+                    for (key, value) in event.attrs.iter().flatten() {
+                        let value = match value {
+                            Value::String(text) => text.clone(),
+                            Value::Number(number) => number.to_string(),
+                            Value::Bool(flag) => flag.to_string(),
+                            _ => continue,
+                        };
+                        insert_attr.execute(rusqlite::params![
+                            source.node,
+                            event.t,
+                            event.seq,
+                            event.kind,
+                            event.id,
+                            event.to,
+                            key,
+                            value,
+                        ])?;
+                    }
                     insert.execute(rusqlite::params![
                         source.node,
                         event.t,
@@ -631,14 +870,8 @@ pub fn load(
         }
         transaction.commit()?;
     }
-    connection.execute_batch(state_indexes!())?;
-    connection.pragma_update(None, "query_only", true)?;
-    Ok(Loaded {
-        connection,
-        events,
-        invalid_lines,
-        dropped,
-    })
+    connection.execute_batch(concat!(state_stays!(), state_indexes!()))?;
+    Ok((events, invalid_lines, dropped))
 }
 
 /// `--around`の時刻。RFC 3339（時差を付ける）、Unix時刻の秒（小数可）、またはマイクロ秒の整数。
@@ -722,6 +955,68 @@ ORDER BY t, seq, node
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source(directory: &Path, lines: &[String]) -> Source {
+        let path = directory.join("state.zst");
+        std::fs::write(
+            &path,
+            zstd::encode_all((lines.join("\n") + "\n").as_bytes(), 1).unwrap(),
+        )
+        .unwrap();
+        Source {
+            node: "app".into(),
+            path,
+        }
+    }
+
+    #[test]
+    fn the_cache_is_rebuilt_when_the_log_changes_and_keeps_the_latest_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        let one = [event(1, "ride", "r1", None, "MATCHING")];
+        let sources = [source(directory.path(), &one)];
+        let first = load_cached(&cache, "run-a", &sources, None, None).unwrap();
+        assert_eq!(first.events, 1);
+        drop(first);
+        assert!(cache.join("run-a.sqlite3").is_file());
+        assert!(cache.join(".gitignore").is_file());
+        // 同じlogなら開くだけ。読み取り専用。
+        let again = load_cached(&cache, "run-a", &sources, None, None).unwrap();
+        assert_eq!(again.events, 1);
+        assert!(
+            again
+                .connection
+                .execute("DELETE FROM state_events", [])
+                .is_err()
+        );
+        drop(again);
+        // logが変われば作り直す。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let two = [
+            event(1, "ride", "r1", None, "MATCHING"),
+            event(2, "ride", "r1", Some("MATCHING"), "MATCHED"),
+        ];
+        let sources = [source(directory.path(), &two)];
+        assert_eq!(
+            load_cached(&cache, "run-a", &sources, None, None)
+                .unwrap()
+                .events,
+            2
+        );
+        // 残すのは最近使った3 runまで。
+        for run in ["run-b", "run-c", "run-d"] {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            load_cached(&cache, run, &sources, None, None).unwrap();
+        }
+        let mut kept = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".sqlite3"))
+            .collect::<Vec<_>>();
+        kept.sort();
+        assert_eq!(kept, ["run-b.sqlite3", "run-c.sqlite3", "run-d.sqlite3"]);
+    }
 
     fn event(t: i64, kind: &str, id: &str, from: Option<&str>, to: &str) -> String {
         serde_json::json!({"t": t, "seq": t, "kind": kind, "id": id, "from": from, "to": to})

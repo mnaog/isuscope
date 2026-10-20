@@ -129,7 +129,7 @@ isuscope doctor
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる |
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
-| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）を一時的なSQLiteへ載せて読む。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
+| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）をSQLiteへ載せて読む（runごとに残し、次からは開くだけ）。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `rescore` | adapterが判定を保留した（pending）runを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定する |
@@ -284,11 +284,15 @@ isuscope query latest --base BASE_RUN --metric-prefix state.dwell.total_duration
 isuscope series latest --metric state.occupancy --label kind=ride --label state=MATCHING
 ```
 
-生の行は`states sql`で読みます。runの状態ログを一時的なin-memoryのSQLiteへ載せ（`state_events`表、区間の`state_window`表、状態にいた時間の`state_stays` view）、読み取り専用のSQLを当てます。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
+生の行は`states sql`で読みます。runの状態ログをSQLiteへ載せ（`state_events`表、attrsの値を1つずつ持つ`state_attrs`表、区間の`state_window`表、状態にいた時間の`state_stays`表と、それぞれの索引）、読み取り専用のSQLを当てます。作ったSQLiteはdata directoryの`cache/states/`にrunごとに残し（最近使った3 runまで。Gitには入れません）、同じrunの次の問い合わせはそれを開くだけです（40万行・64 MBのlogで、作るのに約4秒、開くのは一瞬）。元のlog・区間・isuscopeの版が変われば作り直します。
+
+1つのSQLは既定で30秒で止め（`--timeout-seconds`、0で無制限。`states timeline`と`isuscope sql`も同じ）、索引を使う書き方を示します。行ごとに相関サブクエリで数え直すSQLは行数の2乗で重くなり、practice-14-seventhでは2分と5分待って手が止まりました。同じ問いは、attrsで結ぶなら`state_attrs`の索引（`key, value, kind, to_state, t`）から引き、ある状態にいる数の推移は`entered_t`で+1・`left_t`で-1した累積和（`SUM(d) OVER (ORDER BY t)`）で数えると、40万行でも0.1〜0.2秒で返ります。1秒ごとの数は`isuscope series latest --metric state.occupancy`にもあります。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
 
 ```console
 isuscope states sql --schema
 isuscope states sql latest "SELECT CASE WHEN json_extract(attrs, '$.pickup_distance') > 500 THEN 'far' ELSE 'near' END AS pickup, COUNT(*) AS stays, SUM(duration_ms) AS total_ms FROM state_stays WHERE kind = 'ride' AND state = 'ENROUTE' GROUP BY 1"
+# 椅子が空いた通知から、その椅子に次のライドが付くまで（state_attrsの索引で引く）
+isuscope states sql latest "SELECT COUNT(*) AS n, AVG(next_t - t) / 1000.0 AS avg_ms FROM (SELECT c.t, (SELECT MIN(m.t) FROM state_attrs m WHERE m.key = 'chair' AND m.value = json_extract(c.attrs, '$.chair') AND m.kind = 'ride' AND m.to_state = 'MATCHED' AND m.t > c.t) AS next_t FROM state_events c WHERE c.kind = 'chair_notification' AND c.to_state = 'SENT' AND json_extract(c.attrs, '$.status') = 'COMPLETED') WHERE next_t IS NOT NULL"
 isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09:10:47.5+09:00 --span 200ms --related
 ```
 
