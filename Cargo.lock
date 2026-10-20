@@ -404,6 +404,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "isuscope-node"
+version = "0.9.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

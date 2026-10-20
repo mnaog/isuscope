@@ -2335,6 +2335,7 @@ fn replace_placeholders(
             route_matching_groups.unwrap_or_default(),
         )
         .replace("{service_units}", &service_units.join(" "))
+        .replace("{isuscope_node_build}", crate::access_summary::BUILD_ID)
 }
 
 fn shell_quote(value: &str) -> String {

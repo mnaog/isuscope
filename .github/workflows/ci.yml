@@ -33,10 +33,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets
 
       - name: Check documentation
         env:
@@ -107,6 +107,41 @@ jobs:
           path: lcov.info
           if-no-files-found: error
           retention-days: 14
+
+  node-binaries:
+    name: isuscope-node for Linux nodes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.99.0
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+
+      - name: Build the static binaries
+        run: ./scripts/build-node.sh dist/node
+
+      - name: Check the amd64 binary against the host build
+        run: |
+          test "$(dist/node/isuscope-node-linux-amd64 --build-id)" = "$(cat dist/node/BUILD_ID)"
+          for log in access-ltsv-windows access-ltsv-edge; do
+            args=(access-summary --input "tests/fixtures/${log}.log" --begin 1789653660.000000 --load-start 1789653662.500000 --end 1789653670.000000 --matching-groups '^/user/[0-9]+/home$')
+            dist/node/isuscope-node-linux-amd64 "${args[@]}" > "dist/${log}.static.out"
+            cargo run --locked --quiet --release -p isuscope-node -- "${args[@]}" > "dist/${log}.host.out"
+            cmp "dist/${log}.static.out" "dist/${log}.host.out"
+          done
+
+      - name: Upload the binaries
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: isuscope-node-linux
+          path: dist/node/
+          if-no-files-found: error
+          retention-days: 30
 
   offline-bundle:
     needs: [rust, shellcheck, security, coverage]

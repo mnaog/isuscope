@@ -734,7 +734,8 @@ read -r offset _ < "$marker" || exit 75
 case "$offset" in ''|*[!0-9]*) exit 75 ;; esac
 # logが回転していたら（今のfileがmarkより小さい）、ここでは追わない。境界の無いrunとして進む。
 test "$(wc -c < "$log" | tr -d ' ')" -ge "$offset" || exit 75
-tail -c +$((offset + 1)) "$log" | awk -F '\t' -v method="$method" -v path="$path" \
+# pathを含む行だけをawkへ渡す（awkで全行を分けると、62万行で数秒かかる）。
+tail -c +$((offset + 1)) "$log" | grep -F -e "$path" | awk -F '\t' -v method="$method" -v path="$path" \
   -v begin='{benchmark_started_at}' -v end='{benchmark_finished_at}' '
   {
     delete field
@@ -768,7 +769,10 @@ max_output_bytes = 1073741824
 unavailable_exit_codes = [75]
 
 # access logの差分を、node上でroute別に集計する。生のlogを運ばないので、1 nodeあたりの
-# 転送は数十KBで済む。alpはAnsibleのobservability roleが入れる前提で、無ければ失敗させる
+# 転送は数十KBで済む。集計はnodeに置いた`isuscope-node`（このisuscopeと同じ集計を1回の読み取りで
+# する静的binary。2コアで62万行を約1.2秒）が、下のawkとalpと同じ出力を作る。`isuscope-node`が無いか、
+# このisuscopeと違うbuildなら、stderrに書いてawkとalpで集計する（同じ62万行で約20秒）。
+# `isuscope doctor`のpreflightは、buildが違えば失敗、無ければ警告にする。alpも無ければ失敗させる
 # （黙ってHTTPの計測が欠けないように）。
 # - route別の集計（回数・status・合計・平均・min/max・p50/p95/p99・bytes）は差分全体をalpで。
 # - route別の5秒ごとの回数・error・p50/p95/p99は、ベンチの区間を5秒ごとのfileに分けてalpで。
@@ -785,13 +789,31 @@ phase = "after"
 transport = "ssh"
 sequence = "nginx-log"
 roles = ["nginx", "edge"]
-preflight = ["sh", "-c", "command -v alp >/dev/null 2>&1 || { echo 'alp is not installed; install it with the Ansible observability role'; exit 1; }; echo alp available"]
+preflight = ["sh", "-c", '''
+expected='{isuscope_node_build}'
+if command -v isuscope-node >/dev/null 2>&1; then
+  actual=$(isuscope-node --build-id 2>/dev/null || true)
+  test "$actual" = "$expected" || { echo "isuscope-node is build ${actual:-unknown}, this isuscope expects $expected; rebuild it and install it with the Ansible observability role"; exit 1; }
+  echo "isuscope-node $actual"
+  exit 0
+fi
+command -v alp >/dev/null 2>&1 || { echo 'neither isuscope-node nor alp is installed; install them with the Ansible observability role'; exit 1; }
+echo 'isuscope-node is not installed; the alp collector falls back to awk and alp (about 15x slower)'
+exit 75
+''']
 command = ["sh", "-c", '''
 set -eu
 input=/tmp/isuscope-{run_id}.nginx.log
+test -r "$input" || exit 75
+if command -v isuscope-node >/dev/null 2>&1 && test "$(isuscope-node --build-id 2>/dev/null || true)" = '{isuscope_node_build}'; then
+  trap 'rm -f "$input"' EXIT
+  isuscope-node access-summary --input "$input" --begin '{benchmark_started_at}' \
+    --load-start '{load_started_at}' --end '{benchmark_finished_at}' --matching-groups '{route_matching_groups}'
+  exit 0
+fi
+echo 'isuscope-node is missing or a different build; aggregating with awk and alp instead' >&2
 work=/tmp/isuscope-{run_id}.alp
 trap 'rm -rf "$input" "$work"' EXIT
-test -r "$input" || exit 75
 command -v alp >/dev/null 2>&1 || { echo 'alp is not installed on this node; install it with the Ansible observability role' >&2; exit 1; }
 mkdir -p "$work"
 awk -F '\t' -v begin='{benchmark_started_at}' -v load_start='{load_started_at}' -v end='{benchmark_finished_at}' -v dir="$work" '

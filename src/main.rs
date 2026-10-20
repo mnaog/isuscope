@@ -266,6 +266,13 @@ enum Commands {
         #[arg(long, hide = true)]
         series_only: bool,
     },
+    /// nodeの`isuscope-node`と同じ集計（`isuscope-node --build-id`と`access-summary`）。手元で差分を
+    /// 集計し直すときと、templateのcollectorを試すときに使います。
+    #[command(name = "__access-summary", hide = true)]
+    InternalAccessSummary {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// survey-run用のHTTP入出力capture proxyです。
     #[command(name = "__discovery-capture", hide = true)]
     InternalDiscoveryCapture {
@@ -549,6 +556,9 @@ async fn real_main(cli: Cli) -> Result<bool> {
         .await?;
         return Ok(true);
     }
+    if let Commands::InternalAccessSummary { args } = &cli.command {
+        std::process::exit(isuscope::access_summary::cli(args));
+    }
     if let Commands::InternalTransition {
         run_dir,
         prefix,
@@ -625,7 +635,9 @@ async fn real_main(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
-        Commands::InternalDiscoveryCapture { .. } | Commands::InternalTransition { .. } => {
+        Commands::InternalDiscoveryCapture { .. }
+        | Commands::InternalTransition { .. }
+        | Commands::InternalAccessSummary { .. } => {
             unreachable!()
         }
         Commands::Run { annotations } => {
