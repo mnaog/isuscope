@@ -310,6 +310,10 @@ pub struct CollectorConfig {
     pub roles: Vec<String>,
     #[serde(default)]
     pub modes: Vec<RunMode>,
+    /// `false` keeps a collector in the file without running it (doctor skips it too), for
+    /// profiles that cost seconds per run and are only wanted while chasing a specific question.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// Collectors on the same node and phase with the same `sequence` run one at a time in
     /// configured order; different sequences run in parallel. Collectors without one share a
     /// single sequence per node.
@@ -333,10 +337,13 @@ pub struct CollectorConfig {
 
 impl CollectorConfig {
     pub fn enabled_for(&self, mode: RunMode) -> bool {
-        self.modes.is_empty() || self.modes.contains(&mode)
+        self.enabled && (self.modes.is_empty() || self.modes.contains(&mode))
     }
 }
 
+fn default_enabled() -> bool {
+    true
+}
 fn default_data_dir() -> PathBuf {
     PathBuf::from(".isuscope")
 }

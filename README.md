@@ -6,7 +6,7 @@ isuscopeは、ISUCONのベンチマークと観測結果を1つのrunとして�
 
 ## 基本の流れ
 
-開始直後の全体調査では、通常の観測に匿名viewer単位の行動遷移（[行動遷移](#行動遷移)）を加える`survey-run`を1回だけ使います。
+開始直後の全体調査には`survey-run`を1回使います。観測は`run`と同じで（匿名viewer単位の[行動遷移](#行動遷移)も毎回取ります）、違うのは、雛形にコメントで用意した調査用のcollector（`score-probe`など）を有効にしたときに、それがsurvey-runでだけ動くことです。
 
 ```console
 isuscope doctor
@@ -123,7 +123,7 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 |---|---|
 | `init` | `.isuscope/`の雛形を生成する。`--print config`で、雛形を作らずにconfig.toml（`data_dir`・`[benchmark]`・全collectorなど）を実環境の値で標準出力へ出す。`--no-scaffold`を付けると`[ssh]`と`[lock]`・`[[nodes]]`の例を省く |
 | `doctor` | ベンチを起動せず、設定・command・SSH・時刻・diskを検査する |
-| `survey-run` | 序盤の全体調査を1回行い、行動遷移も収集する |
+| `survey-run` | 序盤の全体調査を1回行う。観測は`run`と同じで、調査用のcollector（`score-probe`など）を有効にしていればそれも動かす |
 | `run` | 標準collectorでベンチを実行する。同じ構成の再測定には`--repeat "<理由>"`が要る |
 | `rescore` | adapterが判定を保留した（pending）runを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定する |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
@@ -178,7 +178,7 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 - `logs`：ベンチの間にアプリ・nginxのerror log・kernelが出したエラーを、数字を含む語を`<N>`にした型ごとに数えた多い順です。briefには件数と最初の1行だけを出します（型は`query --metric log.error_lines`）。
 - `database_io`：MySQLがfileの読み書きと、fsyncなどそれ以外の操作（`misc_wait_ms`、fsyncだけの時間ではない）で待った時間の長い順です。`database_memory`はbuffer poolとtableの大きさです。どちらもベンチの前後の差なのでinitializeを含みます。
 - `states`：アプリの状態ログから、状態にいた時間の合計が長い順です（[アプリの状態ログ](#アプリの状態ログ)）。
-- `transitions`：`survey-run`の行動遷移です（[行動遷移](#行動遷移)）。
+- `transitions`：行動遷移です（[行動遷移](#行動遷移)）。
 - `score_inputs`：`score-probe`が読んだ得点の源です（[得点が何でできているかを確定する](#得点が何でできているかを確定する)）。
 - `benchmark`・`benchmark_messages`：parserが出したbenchmark metricと、FAILの理由・エラーの実例です。
 - `coverage_issues`・`artifact_issues`：完了しなかったcollectorと、生成できなかったprofileです。
@@ -324,7 +324,7 @@ collectorが失敗したときは、`isuscope sql "SELECT name, node, status, er
 
 ### 行動遷移
 
-`survey-run`は、持ち帰った生のaccess logから匿名viewer（session）単位のroute遷移を作ります。通常runでsessionログを追加収集する必要はありません。
+各runで、持ち帰った生のaccess logから匿名viewer（session）単位のroute遷移を作ります。sessionログを別に集める必要はありません。遷移の間隔（`p50_ms`・`p95_ms`）は前の要求の開始から次の要求の開始までで、前の要求の処理時間を含みます。
 
 遷移はsession内のリクエスト開始順で集計します。nginxログに`msec`と`reqtime`があれば、完了時刻から処理時間を引いて開始時刻を推定します。`transition.ordering_version=2`、`transition.precise_events`、`transition.legacy_events`に加え、遷移のfrom/to別に`transition.overlap_count`（実行区間が重なる隣接要求）と`transition.ambiguous_count`（同一開始時刻・旧ログ）を記録します。旧ログは従来のtimeを使い、順序不確定として残します。`brief`の`transitions`は各遷移にこの`overlap_count`と`ambiguous_count`を付け、旧ログの要求があれば`warnings`で伝えます。これらは観測順であり、因果関係や公式シナリオを保証しません。
 
@@ -384,7 +384,7 @@ slow logを有効にした場合は、`mysql-log-delta`がベンチ中の差分�
 
 practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。
 
-転送量も抑えます。access logとslow logは生のまま運ばず、node上で`isuscope-node`・slpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは`survey-run`でだけ`nginx-log-raw`・`mysql-log-raw`が持ち帰ります（1 runあたりaccess logは1 nodeで数百MB、slow logはDB 1台で数十MBになるため）。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
+転送量も抑えます。access logとslow logは生のまま運ばず、node上で`isuscope-node`・slpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは、行動遷移と後からの掘り直しのために`nginx-log-raw`・`mysql-log-raw`が毎回持ち帰りますが、nodeの`zstd -1 -T0`で約20分の1にしてから送ります。手元は受け取ったzstdをそのまま保存し、圧縮し直しません。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では作りません（`enabled = true`で作る）。
 
 ### disk
 
