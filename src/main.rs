@@ -433,6 +433,8 @@ enum QueryViewArg {
     Metrics,
     Database,
     Http,
+    /// 行動遷移（匿名viewerごとのroute遷移の回数・割合・間隔）。`--label from=...`・`to=...`で絞る。
+    Transitions,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -1306,6 +1308,41 @@ fn show_query(
                 )?;
             } else {
                 write_rows_json(&candidate, &["node", "method"])?;
+            }
+        }
+        QueryViewArg::Transitions => {
+            if !matches!(scope, QueryScopeArg::Run) {
+                bail!("transitions view supports only --scope run");
+            }
+            if !metrics.is_empty() || metric_prefix.is_some() || !group_by.is_empty() {
+                bail!(
+                    "transitions view has no metrics or groups; filter with --label from=/to= or --label-contains"
+                );
+            }
+            if node.is_some() || source.is_some() {
+                bail!(
+                    "transitions are built from every node's access log together; remove --node/--source"
+                );
+            }
+            let options = query::TransitionQueryOptions {
+                labels,
+                label_contains,
+                limit: query_limit,
+            };
+            let candidate =
+                query::transition_query(id.clone(), store.transitions(&id)?, options.clone());
+            if let Some(base_id) = base_id {
+                let base =
+                    query::transition_query(base_id.clone(), store.transitions(&base_id)?, options);
+                write_capped_json(
+                    &columns(
+                        query::transition_query_diff(base, candidate, limit),
+                        all_columns,
+                    ),
+                    &QUERY_CAP,
+                )?;
+            } else {
+                write_rows_json(&candidate, &[])?;
             }
         }
     }

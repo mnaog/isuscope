@@ -194,6 +194,7 @@ isuscope brief latest
 isuscope query latest --metric benchmark.error --group-by error
 isuscope query latest --base BASE_RUN --view database --source mysql-digest --label-contains digest=reservation_slots --group-by sql-shape
 isuscope query latest --base BASE_RUN --view http --label-contains route=reservation
+isuscope query latest --base BASE_RUN --view transitions --label-contains to=evaluation
 ```
 
 `query --base`は同じselectorを両runへ適用し、全件をfull outer joinしてから`--limit`を適用します。片側にしか無い行もadded/removedとして返すため、対象を絞った比較で上位項目の入れ替わりを失いません。metric viewの行は、差の絶対値が大きい順に並べてから切ります（比較しない`query`では、metric名ごとに値の大きい順です）。
@@ -202,6 +203,7 @@ isuscope query latest --base BASE_RUN --view http --label-contains route=reserva
 
 - 主要な値（回数・合計・平均・p95、DBはlockも）は、今回の値と差の割合（`calls`、`calls_delta_percent`）です。
 - HTTPのエラー数とDBの1回あたりの検査行数は、比較元と今回（`errors_base`、`errors`）です。0からの増減や前後の値そのものが判断材料になるためです。
+- 行動遷移（`--view transitions`）は、遷移元→遷移先ごとに回数と全遷移に占める割合（`share_percent`）を比較元と今回で並べ、間隔（`p50_ms`・`p95_ms`）は今回と差の割合です。割合の変化が大きい順に並ぶので、負荷の量が増えただけの遷移より、ベンチ側の動きの組み立てが変わった遷移が先に出ます。`--label from=<route>`・`--label to=<route>`（`--label-contains`も可）で絞ります。
 - 両runに1回以上ある行には、合計時間の差を、回数の増減による分（`total_ms_delta_by_calls`、HTTPは`total_ms_delta_by_count`）と、1回あたりの時間の増減による分（`total_ms_delta_by_avg`）に分けた列も付きます。2つの和が合計時間の差です。合計が増えても1回あたりは速くなった、のような変化を取り違えないためのものです。
 - `--all-columns`を付けると、すべての値の比較元・今回と、主要な値の差（`calls_delta`）も出します。
 
@@ -326,7 +328,7 @@ collectorが失敗したときは、`isuscope sql "SELECT name, node, status, er
 
 各runで、持ち帰った生のaccess logから匿名viewer（session）単位のroute遷移を作ります。sessionログを別に集める必要はありません。遷移の間隔（`p50_ms`・`p95_ms`）は前の要求の開始から次の要求の開始までで、前の要求の処理時間を含みます。
 
-遷移はsession内のリクエスト開始順で集計します。nginxログに`msec`と`reqtime`があれば、完了時刻から処理時間を引いて開始時刻を推定します。`transition.ordering_version=2`、`transition.precise_events`、`transition.legacy_events`に加え、遷移のfrom/to別に`transition.overlap_count`（実行区間が重なる隣接要求）と`transition.ambiguous_count`（同一開始時刻・旧ログ）を記録します。旧ログは従来のtimeを使い、順序不確定として残します。`brief`の`transitions`は各遷移にこの`overlap_count`と`ambiguous_count`を付け、旧ログの要求があれば`warnings`で伝えます。これらは観測順であり、因果関係や公式シナリオを保証しません。
+遷移はsession内のリクエスト開始順で集計します。nginxログに`msec`と`reqtime`があれば、完了時刻から処理時間を引いて開始時刻を推定します。`transition.ordering_version=2`、`transition.precise_events`、`transition.legacy_events`に加え、遷移のfrom/to別に`transition.overlap_count`（実行区間が重なる隣接要求）と`transition.ambiguous_count`（同一開始時刻・旧ログ）を記録します。旧ログは従来のtimeを使い、順序不確定として残します。`brief`の`transitions`は各遷移にこの`overlap_count`と`ambiguous_count`を付け、旧ログの要求があれば`warnings`で伝えます。これらは観測順であり、因果関係や公式シナリオを保証しません。2 runの遷移は`isuscope query RUN_ID --base BASE_RUN --view transitions`で比べます（[queryと2 runの比較](#queryと2-runの比較)）。
 
 ### host
 
