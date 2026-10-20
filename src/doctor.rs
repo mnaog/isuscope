@@ -412,9 +412,14 @@ async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorRepo
     for collector in &config.config.collectors {
         // A configured preflight wins; otherwise built-in profile collectors have their own.
         let (label, argv, unavailable): (&str, Vec<String>, Vec<i32>) = match &collector.preflight {
+            // nodeの`isuscope-node`がこのisuscopeと同じbuildかを、preflightが照合する。
             Some(argv) if !argv.is_empty() => (
                 "collector",
-                argv.clone(),
+                argv.iter()
+                    .map(|part| {
+                        part.replace("{isuscope_node_build}", crate::access_summary::BUILD_ID)
+                    })
+                    .collect(),
                 collector.unavailable_exit_codes.clone(),
             ),
             _ => match profile_preflight_script(&collector.name) {

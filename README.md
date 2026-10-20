@@ -80,6 +80,8 @@ isuscope --version
 
 競技用bundleは`./scripts/build-release-bundle.sh`で作れます。`dist/`に、binary、README、LICENSE、`docs/standard-observability.md`を固めたtar.gzと、そのSHA-256が出ます。
 
+nodeでaccess logを集計する`isuscope-node`は、`./scripts/build-node.sh <出力先>`でLinuxの静的binary（amd64とarm64）として作ります。依存はregexだけで、linkerはRustに付属するrust-lldを使うので、macOSからもDocker無しで作れます。nodeのOSに依存しないので、問題の公開前に作っておけます。nodeの`/usr/local/bin/isuscope-node`に置くと、`alp` collectorがaccess logの差分をnode上で集計します（2コアで62万行を約1.2秒。以前のawkとalpでは約20秒）。無いかbuildが違えばcollectorは失敗します。置いたbinaryが手元のisuscopeと同じsourceからのものかは、`isuscope-node --build-id`と`isuscope __access-summary --build-id`で照合でき、`isuscope doctor`も確かめます（[標準観測](docs/standard-observability.md#node上の集計binaryisuscope-node)）。
+
 ## プロジェクトへ導入する
 
 アプリケーションのGitリポジトリ直下で一度だけ初期化します。
@@ -131,7 +133,7 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる。`--base`で2 runを比べる |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
-| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）を一時的なSQLiteへ載せて読む。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
+| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）をSQLiteへ載せて読む（runごとに残し、次からは開くだけ）。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `routes suggest [run]` | 動的IDの残るHTTP routeから`[[routes]]`候補を作る。`--output`で書き出し先を指定する |
 | `lock -- <command>` | 変更系操作の共通lockを取ってcommandを実行する。取得済みの子processでは再取得せず、実行時間を`operation-timing.tsv`へ追記する |
@@ -249,7 +251,7 @@ isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metri
 `doctor`はベンチを起動せずに次を確かめます。
 
 - initializeの境界：`[benchmark] sample_output`に`initialize_start_marker`・`initialize_finish_marker`の文言が含まれるか。`routes.toml`に`[initialize]`があれば、境界はaccess logから取るのでmarkerは求めません。どちらも無ければ区間分けが失われるので警告します。
-- collectorの`preflight`（例: `preflight = ["sh", "-c", "command -v alp >/dev/null 2>&1 || exit 1"]`）を対象nodeで実行します。失敗ならfailure、終了codeが`unavailable_exit_codes`に入っていれば警告です。例えばSQLでは、slow logもstatement digestも使えないDB nodeで`slp`のpreflightが失敗し、SQLの無いrunを始める前に止めます（slow logが無くてもstatement digestが使えれば通ります）。
+- collectorの`preflight`（例: `preflight = ["sh", "-c", "command -v isuscope-node >/dev/null 2>&1 || exit 1"]`）を対象nodeで実行します。失敗ならfailure、終了codeが`unavailable_exit_codes`に入っていれば警告です。例えばSQLでは、slow logもstatement digestも使えないDB nodeで`slp`のpreflightが失敗し、SQLの無いrunを始める前に止めます（slow logが無くてもstatement digestが使えれば通ります）。
 - `sample_output`に保存した実際のベンチ出力へ全parserを適用します。parserが不正な行を出せば失敗、0件なら警告です。
 - 最新runのHTTP routeに動的IDが残っていれば、`routes suggest`の確認を促します。
 - SSH、時刻、diskの空き（[disk](#disk)）。
@@ -310,9 +312,9 @@ collectorが失敗したときは、`isuscope sql "SELECT name, node, status, er
 
 ## 観測
 
-標準雛形のcollectorは、host sampler・sysstat・指定systemd unitのcgroup sampler・perf・Flame Graph・off-CPU・HTTP（alp）・SQL（statement digest、またはslow log）・MySQLの状態とI/O・上限値・error log・状態ログ・fingerprintをnodeとphase単位で記録します。一覧と受け入れ基準、共通metricの名前は[標準observability](docs/standard-observability.md)にあります。
+標準雛形のcollectorは、host sampler・sysstat・指定systemd unitのcgroup sampler・perf・Flame Graph・off-CPU・HTTP（`isuscope-node`）・SQL（statement digest、またはslow log）・MySQLの状態とI/O・上限値・error log・状態ログ・fingerprintをnodeとphase単位で記録します。一覧と受け入れ基準、共通metricの名前は[標準observability](docs/standard-observability.md)にあります。
 
-依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。ただし`alp`と、slow logを使う場合の`slp`は、無ければ黙ってHTTPやSQLの計測が欠けないよう`failed`にします。
+依存toolや権限がないcollector、または安全に追えないログrotationは、壊れた値を成功扱いせず`unavailable`として残します。ただし`isuscope-node`と、slow logを使う場合の`slp`は、無ければ黙ってHTTPやSQLの計測が欠けないよう`failed`にします。
 
 ### 区間
 
@@ -382,7 +384,7 @@ slow logを有効にした場合は、`mysql-log-delta`がベンチ中の差分�
 
 practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。
 
-転送量も抑えます。access logとslow logは生のまま運ばず、node上でalp・slpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは`survey-run`でだけ`nginx-log-raw`・`mysql-log-raw`が持ち帰ります（1 runあたりaccess logは1 nodeで数百MB、slow logはDB 1台で数十MBになるため）。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
+転送量も抑えます。access logとslow logは生のまま運ばず、node上で`isuscope-node`・slpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは`survey-run`でだけ`nginx-log-raw`・`mysql-log-raw`が持ち帰ります（1 runあたりaccess logは1 nodeで数百MB、slow logはDB 1台で数十MBになるため）。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では`survey-run`のときだけ作ります。
 
 ### disk
 
@@ -431,11 +433,15 @@ isuscope query latest --base BASE_RUN --metric-prefix state.dwell.total_duration
 isuscope series latest --metric state.occupancy --label kind=ride --label state=MATCHING
 ```
 
-生の行は`states sql`で読みます。runの状態ログを一時的なin-memoryのSQLiteへ載せ（`state_events`表、区間の`state_window`表、状態にいた時間の`state_stays` view）、読み取り専用のSQLを当てます。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
+生の行は`states sql`で読みます。runの状態ログをSQLiteへ載せ（`state_events`表、attrsの値を1つずつ持つ`state_attrs`表、区間の`state_window`表、状態にいた時間の`state_stays`表と、それぞれの索引）、読み取り専用のSQLを当てます。作ったSQLiteはdata directoryの`cache/states/`にrunごとに残し（最近使った3 runまで。Gitには入れません）、同じrunの次の問い合わせはそれを開くだけです（40万行・64 MBのlogで、作るのに約4秒、開くのは一瞬）。元のlog・区間・isuscopeの版が変われば作り直します。
+
+1つのSQLは既定で30秒で止め（`--timeout-seconds`、0で無制限。`states timeline`と`isuscope sql`も同じ）、索引を使う書き方を示します。行ごとに相関サブクエリで数え直すSQLは行数の2乗で重くなり、practice-14-seventhでは2分と5分待って手が止まりました。同じ問いは、attrsで結ぶなら`state_attrs`の索引（`key, value, kind, to_state, t`）から引き、ある状態にいる数の推移は`entered_t`で+1・`left_t`で-1した累積和（`SUM(d) OVER (ORDER BY t)`）で数えると、40万行でも0.1〜0.2秒で返ります。1秒ごとの数は`isuscope series latest --metric state.occupancy`にもあります。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
 
 ```console
 isuscope states sql --schema
 isuscope states sql latest "SELECT CASE WHEN json_extract(attrs, '$.pickup_distance') > 500 THEN 'far' ELSE 'near' END AS pickup, COUNT(*) AS stays, SUM(duration_ms) AS total_ms FROM state_stays WHERE kind = 'ride' AND state = 'ENROUTE' GROUP BY 1"
+# 椅子が空いた通知から、その椅子に次のライドが付くまで（state_attrsの索引で引く）
+isuscope states sql latest "SELECT COUNT(*) AS n, AVG(next_t - t) / 1000.0 AS avg_ms FROM (SELECT c.t, (SELECT MIN(m.t) FROM state_attrs m WHERE m.key = 'chair' AND m.value = json_extract(c.attrs, '$.chair') AND m.kind = 'ride' AND m.to_state = 'MATCHED' AND m.t > c.t) AS next_t FROM state_events c WHERE c.kind = 'chair_notification' AND c.to_state = 'SENT' AND json_extract(c.attrs, '$.status') = 'COMPLETED') WHERE next_t IS NOT NULL"
 isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09:10:47.5+09:00 --span 200ms --related
 ```
 

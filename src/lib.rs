@@ -1,3 +1,4 @@
+pub mod access_summary;
 pub mod agent_context;
 pub mod benchmark;
 pub mod brief;

@@ -17,6 +17,9 @@ include = [
     "LICENSE",
 ]
 
+[workspace]
+members = ["node"]
+
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }

@@ -111,6 +111,9 @@ enum Commands {
         /// 出力形式。
         #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
         format: isuscope::sql::SqlFormat,
+        /// この秒数を超えたSQLを止めます（0で無制限）。
+        #[arg(long, default_value_t = isuscope::sql::DEFAULT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
     },
     /// アプリの状態ログ（`state-log` collectorが運んだ生の行）を、runごとに読みます。
     States {
@@ -266,6 +269,13 @@ enum Commands {
         #[arg(long, hide = true)]
         series_only: bool,
     },
+    /// nodeの`isuscope-node`と同じ集計（`isuscope-node --build-id`と`access-summary`）。手元で差分を
+    /// 集計し直すときと、templateのcollectorを試すときに使います。
+    #[command(name = "__access-summary", hide = true)]
+    InternalAccessSummary {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// survey-run用のHTTP入出力capture proxyです。
     #[command(name = "__discovery-capture", hide = true)]
     InternalDiscoveryCapture {
@@ -322,7 +332,7 @@ enum RoutesCommand {
 
 #[derive(Subcommand)]
 enum StatesCommand {
-    /// runの状態ログを一時的なSQLiteへ載せ、読み取り専用のSQLを実行します。表は`--schema`で見ます。
+    /// runの状態ログをSQLiteへ載せ（runごとに残し、次からは開くだけ）、読み取り専用のSQLを実行します。表は`--schema`で見ます。
     #[command(after_help = "例:
   isuscope states sql latest \"SELECT kind, to_state, COUNT(*) AS events FROM state_events GROUP BY 1, 2\"
   isuscope states sql latest \"SELECT state, COUNT(*) AS stays, SUM(duration_ms) AS total_ms FROM state_stays WHERE kind = 'ride' GROUP BY 1 ORDER BY total_ms DESC\"
@@ -343,6 +353,9 @@ enum StatesCommand {
         /// 出力形式。
         #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
         format: isuscope::sql::SqlFormat,
+        /// この秒数を超えたSQLを止め、索引を使う書き方を示します（0で無制限）。
+        #[arg(long, default_value_t = isuscope::sql::DEFAULT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
     },
     /// 1つの対象の状態の変化を時刻順に並べます。`--related`で、attrsでつながる対象の行も混ぜます。
     #[command(after_help = "例:
@@ -373,6 +386,9 @@ enum StatesCommand {
         /// 出力形式。
         #[arg(long, value_enum, default_value_t = isuscope::sql::SqlFormat::Json)]
         format: isuscope::sql::SqlFormat,
+        /// この秒数を超えたら止めます（0で無制限）。
+        #[arg(long, default_value_t = isuscope::sql::DEFAULT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
     },
 }
 
@@ -549,6 +565,9 @@ async fn real_main(cli: Cli) -> Result<bool> {
         .await?;
         return Ok(true);
     }
+    if let Commands::InternalAccessSummary { args } = &cli.command {
+        std::process::exit(isuscope::access_summary::cli(args));
+    }
     if let Commands::InternalTransition {
         run_dir,
         prefix,
@@ -625,7 +644,9 @@ async fn real_main(cli: Cli) -> Result<bool> {
             }
             Ok(true)
         }
-        Commands::InternalDiscoveryCapture { .. } | Commands::InternalTransition { .. } => {
+        Commands::InternalDiscoveryCapture { .. }
+        | Commands::InternalTransition { .. }
+        | Commands::InternalAccessSummary { .. } => {
             unreachable!()
         }
         Commands::Run { annotations } => {
@@ -656,13 +677,14 @@ async fn real_main(cli: Cli) -> Result<bool> {
             schema,
             limit,
             format,
+            timeout_seconds,
         } => {
             if schema {
                 print!("{}", isuscope::sql::schema(&config)?);
                 return Ok(true);
             }
             let query = query.context("a SELECT statement or --schema is required")?;
-            let output = isuscope::sql::query(&config, &query, limit)?;
+            let output = isuscope::sql::query(&config, &query, limit, timeout_seconds)?;
             match format {
                 isuscope::sql::SqlFormat::Json => write_sql_json(&output)?,
                 isuscope::sql::SqlFormat::Tsv => {
@@ -2048,7 +2070,9 @@ fn show_states(config: &LoadedConfig, command: StatesCommand) -> Result<()> {
             )
         });
     }
-    let loaded = states::load(
+    let loaded = states::load_cached(
+        &config.data_dir.join("cache").join("states"),
+        &id,
         &sources,
         states::Window::of(&manifest.benchmark),
         manifest.benchmark.started_at,
@@ -2066,9 +2090,21 @@ fn show_states(config: &LoadedConfig, command: StatesCommand) -> Result<()> {
         ));
     }
     let output = match command {
-        StatesCommand::Sql { query, limit, .. } => {
+        StatesCommand::Sql {
+            query,
+            limit,
+            timeout_seconds,
+            ..
+        } => {
             let query = query.context("a SELECT statement or --schema is required")?;
-            isuscope::sql::run(&loaded.connection, &query, [], limit)?
+            isuscope::sql::run_limited(
+                &loaded.connection,
+                &query,
+                [],
+                limit,
+                timeout_seconds,
+                states::SLOW_QUERY_HINT,
+            )?
         }
         StatesCommand::Timeline {
             kind,
@@ -2077,11 +2113,12 @@ fn show_states(config: &LoadedConfig, command: StatesCommand) -> Result<()> {
             span,
             related,
             limit,
+            timeout_seconds,
             ..
         } => {
             let around = around.as_deref().map(states::parse_time).transpose()?;
             let span = states::parse_span(&span)?;
-            let output = isuscope::sql::run(
+            let output = isuscope::sql::run_limited(
                 &loaded.connection,
                 states::TIMELINE,
                 rusqlite::named_params! {
@@ -2092,6 +2129,8 @@ fn show_states(config: &LoadedConfig, command: StatesCommand) -> Result<()> {
                     ":related": related,
                 },
                 limit,
+                timeout_seconds,
+                "narrow it with --around and a shorter --span",
             )?;
             if output.total_count == 0 && loaded.events > 0 {
                 let mut statement = loaded.connection.prepare(
