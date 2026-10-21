@@ -154,6 +154,7 @@ pub async fn execute(
     let mut fingerprints = Vec::new();
     let mut transitions = Vec::new();
     let mut after_outputs = None;
+    let mut after_cut = false;
 
     let repeat_reason = annotations
         .repeat
@@ -169,6 +170,7 @@ pub async fn execute(
             .iter()
             .map(|reason| ("ISUSCOPE_REPEAT_REASON", reason.clone()))
             .collect(),
+        shutdown: Some(shutdown.clone()),
     };
     let benchmark_config = &config.config.benchmark;
     if let Some(command) = &benchmark_config.identity_command {
@@ -249,13 +251,17 @@ pub async fn execute(
     let refused_as_repeat = manifest.repeat.as_ref().is_some_and(refuses);
 
     if let Some(error) = prepare_error {
-        eprintln!("! {error}");
-        manifest.benchmark = BenchmarkResult {
-            mode: "not-started".into(),
-            passed: Some(false),
-            error: Some(error),
-            ..Default::default()
-        };
+        if shutdown.is_cancelled() {
+            manifest.benchmark = interrupted_benchmark();
+        } else {
+            eprintln!("! {error}");
+            manifest.benchmark = BenchmarkResult {
+                mode: "not-started".into(),
+                passed: Some(false),
+                error: Some(error),
+                ..Default::default()
+            };
+        }
         // before collectorを動かしていないので、後片付けするものも無い。
         after_outputs = Some(Vec::new());
     } else if shutdown.is_cancelled() {
@@ -318,10 +324,17 @@ pub async fn execute(
             );
             if let Some(command) = &benchmark_config.cleanup_command {
                 println!("→ cleanup");
+                // The signal that interrupted the benchmark must not cut its cleanup short; a
+                // second signal exits the process anyway.
+                let cleanup_context = HookContext {
+                    env: hook_context.env.clone(),
+                    shutdown: later_signal(&shutdown),
+                    ..hook_context
+                };
                 let output = timed(
                     "cleanup",
                     &mut manifest.stages,
-                    hooks::run(&hook_context, "cleanup", command),
+                    hooks::run(&cleanup_context, "cleanup", command),
                 )
                 .await;
                 absorb_hook(output, &mut manifest);
@@ -340,7 +353,14 @@ pub async fn execute(
             let boundary = timed(
                 "collectors_boundary",
                 &mut manifest.stages,
-                collector::run_phase(&config, mode, CollectorPhase::Boundary, &id, &staging, None),
+                collector::run_phase(
+                    &config,
+                    mode,
+                    CollectorPhase::Boundary,
+                    &id,
+                    &staging,
+                    later_signal(&shutdown),
+                ),
             )
             .await;
             apply_boundary(&mut manifest, &staging, &boundary);
@@ -371,12 +391,22 @@ pub async fn execute(
                     collector::stop_during(running, &staging),
                 )
                 .await;
+                let watch = later_signal(&shutdown);
+                let interruptible = watch.is_some();
                 let after = timed(
                     "collectors_after",
                     &mut collector_stages,
-                    collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None),
+                    collector::run_phase(
+                        &config,
+                        mode,
+                        CollectorPhase::After,
+                        &id,
+                        &staging,
+                        watch,
+                    ),
                 )
                 .await;
+                after_cut = interruptible && shutdown.is_cancelled();
                 (during, after)
             },
         );
@@ -399,12 +429,16 @@ pub async fn execute(
     let after = match after_outputs {
         Some(after) => after,
         None => {
-            timed(
+            let watch = later_signal(&shutdown);
+            let interruptible = watch.is_some();
+            let after = timed(
                 "collectors_after",
                 &mut manifest.stages,
-                collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None),
+                collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, watch),
             )
-            .await
+            .await;
+            after_cut = interruptible && shutdown.is_cancelled();
+            after
         }
     };
     absorb(
@@ -414,6 +448,11 @@ pub async fn execute(
         &mut fingerprints,
         &mut transitions,
     );
+    // A signal cut the after collectors short: undo what the earlier phases left on the nodes
+    // (profilers, marks), as the recovery of an abandoned run would.
+    if after_cut {
+        collector::cleanup_abandoned(&config, std::slice::from_ref(&id)).await;
+    }
     // nodeへの操作はここまで。保存の間に次のdeployを始められるよう、共通lockを先に手放す。
     crate::lock::release_run_lock();
 
@@ -592,8 +631,18 @@ fn absorb_hook(output: hooks::HookOutput, manifest: &mut RunManifest) {
             result.error.as_deref().unwrap_or("failed")
         );
     }
+    for warning in &result.warnings {
+        eprintln!("! {}: {warning}", result.name);
+    }
     manifest.logs.extend(output.logs);
     manifest.hooks.push(output.result);
+}
+
+/// The shutdown to hand to a stage that also cleans up (the boundary and after collectors,
+/// `cleanup_command`): a signal that already interrupted the run must not cut it short, so it
+/// gets none then, and a second signal exits the process instead.
+fn later_signal(shutdown: &Shutdown) -> Option<Shutdown> {
+    (!shutdown.is_cancelled()).then(|| shutdown.clone())
 }
 
 /// Nothing isuscope can see changed and no `--repeat` reason was given.

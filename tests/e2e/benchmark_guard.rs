@@ -445,3 +445,174 @@ fn template_boundary_collector_reads_the_last_initialize_in_the_benchmark() {
     let output = Command::new("sh").args(["-c", &unset]).output().unwrap();
     assert_eq!(output.status.code(), Some(75));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_hook_whose_background_process_keeps_the_pipe_open_still_succeeds() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "{RESULT}"]
+prepare_command = ["sh", "-c", "sleep 60 & echo restarted"]
+"#
+        ),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let run = isuscope(
+        project.path(),
+        &["run", "--hypothesis", "prepare leaves a child"],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // One shared capture deadline (10s), not one per stream.
+    assert!(started.elapsed().as_secs() < 18, "{:?}", started.elapsed());
+    let manifest = latest_manifest(project.path());
+    let prepare = &manifest["hooks"][0];
+    assert_eq!(prepare["status"], "complete");
+    assert!(
+        prepare["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("stayed open"),
+        "{prepare}"
+    );
+}
+
+#[cfg(unix)]
+fn interrupt(child: &std::process::Child) {
+    // SAFETY: the PID is that of a child this test started and has not waited for yet.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_signal_stops_a_waiting_hook_and_a_second_one_exits_at_once() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    let started_file = project.path().join("prepare-started");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "{RESULT}"]
+prepare_command = ["sh", "-c", "touch {started}; sleep 60"]
+"#,
+            started = started_file.display(),
+        ),
+    )
+    .unwrap();
+    let wait_for = |path: &std::path::Path| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
+    // One signal: prepare stops at once and the run is saved as aborted.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "interrupted in prepare"])
+        .current_dir(project.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&started_file);
+    let interrupted_at = std::time::Instant::now();
+    interrupt(&child);
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    assert!(
+        interrupted_at.elapsed().as_secs() < 8,
+        "{:?}",
+        interrupted_at.elapsed()
+    );
+    let manifest = latest_manifest(project.path());
+    assert_eq!(manifest["state"], "aborted");
+    assert_eq!(manifest["benchmark"]["interrupted"], true);
+
+    // A cleanup after an interrupted benchmark is not cut by that signal, but a second one
+    // exits immediately and stops it.
+    let cleanup_pid = project.path().join("cleanup.pid");
+    let bench_started = project.path().join("bench-started");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "touch {bench}; sleep 60"]
+cleanup_command = ["sh", "-c", "echo $$ > {pid}; exec sleep 60"]
+"#,
+            bench = bench_started.display(),
+            pid = cleanup_pid.display(),
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "interrupted twice"])
+        .current_dir(project.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&bench_started);
+    interrupt(&child);
+    wait_for(&cleanup_pid);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let second_at = std::time::Instant::now();
+    interrupt(&child);
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert!(
+        second_at.elapsed().as_secs() < 3,
+        "{:?}",
+        second_at.elapsed()
+    );
+    let pid: i32 = fs::read_to_string(&cleanup_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Killed: gone, or a zombie waiting for a reaper that is not ours.
+    let alive = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let state = stat
+                .rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .next()?
+                .to_owned();
+            Some(state != "Z" && state != "X")
+        })
+        .unwrap_or(false);
+    assert!(!alive, "the cleanup process survived the exit");
+    // The unsaved run is left for the next `run` to recover as aborted.
+    assert!(
+        fs::read_dir(config_dir.join("runs/.incomplete"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().join("run.json").is_file())
+    );
+}

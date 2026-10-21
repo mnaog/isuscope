@@ -525,6 +525,9 @@ pub struct HookResult {
     pub log_ids: Vec<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
+    /// Problems that did not fail the command, such as output a background process kept open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

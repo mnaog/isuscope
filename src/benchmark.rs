@@ -176,6 +176,7 @@ async fn execute_command(
         Ok(child) => child,
         Err(error) => return Ok(not_started(error)),
     };
+    let _registered = process::register_group(child.id());
     let stdout = child
         .stdout
         .take()
@@ -243,8 +244,10 @@ async fn execute_command(
     let interrupted = stopped_by == Some("interrupted");
     // 中断後にpipeを握ったままの相手が残っていても、取り込みを待ち続けて止まらないようにする。
     let mut abandoned = Vec::new();
-    for (task, stream) in [(stdout_task, "stdout"), (stderr_task, "stderr")] {
-        if finish_capture(task, stream).await? {
+    let captures =
+        process::finish_captures([stdout_task, stderr_task], process::CAPTURE_DEADLINE, None).await;
+    for (capture, stream) in captures.into_iter().zip(["stdout", "stderr"]) {
+        if finished_capture(capture, stream)? {
             abandoned.push(stream);
         }
     }
@@ -350,11 +353,11 @@ async fn execute_command(
     })
 }
 
-/// 取り込みtaskの完了を待つ。pipeの書き手が残って閉じない場合は打ち切り（taskは止めて、
-/// 止まったことまで確かめる）、そこまでに書けたlogで先へ進む。打ち切ったら`true`。
-/// ベンチの側に残ったprocessは落とさない（ベンチが意図して残したものかもしれない）。
-async fn finish_capture(task: tokio::task::JoinHandle<Result<()>>, stream: &str) -> Result<bool> {
-    match process::finish_capture(task, process::CAPTURE_DEADLINE, None).await {
+/// 取り込みtaskの終わり方を読む。pipeの書き手が残って閉じなかった場合は打ち切られて
+/// （taskは止めて、止まったことまで確かめてある）、そこまでに書けたlogで先へ進む。打ち切ったら
+/// `true`。ベンチの側に残ったprocessは落とさない（ベンチが意図して残したものかもしれない）。
+fn finished_capture(capture: process::Capture<Result<()>>, stream: &str) -> Result<bool> {
+    match capture {
         process::Capture::Finished(joined) => {
             joined.with_context(|| format!("{stream} capture task failed"))??;
             Ok(false)

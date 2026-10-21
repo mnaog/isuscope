@@ -38,6 +38,7 @@ pub struct RunningCollector {
     child: Child,
     /// 子のprocess group（子のpid）。子を待った後は`child.id()`が消えるので、起動時に持っておく。
     group: Option<u32>,
+    _registered: process::RegisteredGroup,
     spec: ExecutionSpec,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
@@ -278,6 +279,14 @@ async fn run_once(
     shutdown: Option<Shutdown>,
 ) -> CollectorOutput {
     let timeout_seconds = spec.collector.timeout_seconds;
+    // After a signal the phase is cut short: do not start what would be stopped at once.
+    if shutdown.as_ref().is_some_and(Shutdown::is_cancelled) {
+        return failed(
+            &spec.collector,
+            spec.node.as_ref().map(|node| node.name.clone()),
+            "interrupted by signal".into(),
+        );
+    }
     let mut running = match spawn(spec.clone(), run_dir) {
         Ok(value) => value,
         Err(error) => {
@@ -357,6 +366,7 @@ fn spawn(spec: ExecutionSpec, run_dir: &Path) -> Result<RunningCollector> {
     ));
     Ok(RunningCollector {
         group: child.id(),
+        _registered: process::register_group(child.id()),
         child,
         spec,
         stdout_path,
@@ -389,8 +399,14 @@ async fn finalize(
     let mut compression_errors = Vec::new();
     // 子が終わっても、pipeを握った孫が残ると取り込みが終わらない。締切で打ち切り、その
     // process groupを落として、logが途中までであることをcollectorの結果に残す。
-    for (capture, stream) in [(stdout_capture, "stdout"), (stderr_capture, "stderr")] {
-        match process::finish_capture(capture, process::CAPTURE_DEADLINE, group).await {
+    let captures = process::finish_captures(
+        [stdout_capture, stderr_capture],
+        process::CAPTURE_DEADLINE,
+        group,
+    )
+    .await;
+    for (capture, stream) in captures.into_iter().zip(["stdout", "stderr"]) {
+        match capture {
             process::Capture::Finished(Ok(Ok(true))) => compression_errors.push(format!(
                 "{stream} truncated at {} bytes",
                 spec.collector.max_output_bytes
