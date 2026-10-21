@@ -52,7 +52,9 @@ host = "app1.internal"
     let doctor = isuscope(&["doctor"], "524288");
     let stdout = String::from_utf8_lossy(&doctor.stdout);
     assert!(
-        stdout.contains("disk ubuntu@app1.internal: / has 512 MiB free (below 1024 MiB)"),
+        stdout.contains(
+            "disk ubuntu@app1.internal: / has 512 MiB free (below [disk] node_min_free_mb = 1024)"
+        ),
         "{stdout}"
     );
 

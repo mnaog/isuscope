@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub disk: DiskConfig,
     #[serde(default)]
+    pub doctor: DoctorConfig,
+    #[serde(default)]
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub collectors: Vec<CollectorConfig>,
@@ -44,6 +46,9 @@ pub struct DiskConfig {
     /// Below this, `doctor` fails and `run` refuses to start the benchmark. 0 disables it.
     #[serde(default = "default_node_min_free_mb")]
     pub node_min_free_mb: u64,
+    /// Below this free space on the filesystem of `data_dir` (this machine), `doctor` warns.
+    #[serde(default = "default_local_warn_free_mb")]
+    pub local_warn_free_mb: u64,
 }
 
 impl Default for DiskConfig {
@@ -52,8 +57,34 @@ impl Default for DiskConfig {
             paths: default_disk_paths(),
             node_warn_free_mb: default_node_warn_free_mb(),
             node_min_free_mb: default_node_min_free_mb(),
+            local_warn_free_mb: default_local_warn_free_mb(),
         }
     }
+}
+
+fn default_local_warn_free_mb() -> u64 {
+    1024
+}
+
+/// Checks made only by `doctor`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DoctorConfig {
+    /// Above this difference between a node's clock and this machine's, `doctor` warns.
+    /// Collectors on different nodes are joined by time, so their samples shift by the skew.
+    #[serde(default = "default_max_clock_skew_seconds")]
+    pub max_clock_skew_seconds: u64,
+}
+
+impl Default for DoctorConfig {
+    fn default() -> Self {
+        Self {
+            max_clock_skew_seconds: default_max_clock_skew_seconds(),
+        }
+    }
+}
+
+fn default_max_clock_skew_seconds() -> u64 {
+    2
 }
 
 fn default_disk_paths() -> Vec<String> {

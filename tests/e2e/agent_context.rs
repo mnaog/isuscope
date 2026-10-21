@@ -41,7 +41,7 @@ run this benchmark
     fs::write(history_dir.join("20260827-200000.md"), history).unwrap();
 
     let doctor = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .arg("doctor")
+        .args(["doctor", "--verbose"])
         .env("CODEX_SESSION_ID", "session-a")
         .env("CODEX_THREAD_ID", "session-a")
         .env_remove("CLAUDE_CODE_SESSION_ID")

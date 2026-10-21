@@ -220,8 +220,13 @@ enum Commands {
         /// run ID、一意な短縮ID、または一意なtagを指定します。
         run: String,
     },
-    /// ベンチを起動せず、設定・command・SSH・時刻・diskを検査します。
-    Doctor,
+    /// ベンチを起動せず、設定・command・SSH・時刻・diskを検査します。警告と失敗だけを1行ずつ出し、
+    /// 通った検査は数だけを出します。
+    Doctor {
+        /// 通った検査も1行ずつ出します。
+        #[arg(long)]
+        verbose: bool,
+    },
     /// PASSしたrunへ仮説の判定と結果分析を追記します。
     Analyze {
         /// run ID、一意な短縮ID、または一意なtagを指定します。
@@ -229,7 +234,8 @@ enum Commands {
         /// 仮説の判定。
         #[arg(value_enum)]
         verdict: VerdictArg,
-        /// 比較元run。解決した完全なIDを分析に保存します。
+        /// 比較元run。解決した完全なIDを分析に保存します。省略時は、このrunの直前に始まって
+        /// 終わった（ベンチを始めた）runです（briefの`review.comparison`と同じ）。
         #[arg(long)]
         base: Option<String>,
         /// 結果の分析本文。skippedでは省略する理由として扱います。
@@ -805,14 +811,14 @@ async fn real_main(cli: Cli) -> Result<bool> {
             if manifest.analysis_status == isuscope::model::AnalysisStatus::Pending {
                 println!();
                 println!(
-                    "next      isuscope analyze {} <supported|rejected|inconclusive> --analysis <text>",
-                    runner::short_id(&manifest.id)
+                    "next      {}",
+                    isuscope::model::analyze_template(runner::short_id(&manifest.id))
                 );
             }
             Ok(true)
         }
-        Commands::Doctor => {
-            let report = doctor::run(&config).await?;
+        Commands::Doctor { verbose } => {
+            let report = doctor::run(&config, verbose).await?;
             println!();
             println!("passed    {}", report.passed);
             println!("warnings  {}", report.warnings.len());
@@ -839,9 +845,13 @@ async fn real_main(cli: Cli) -> Result<bool> {
             }
             let mut store = Store::open(&config.data_dir)?;
             let id = store.require_id(&run, "run")?;
-            let base = base
-                .map(|requested| store.require_id(&requested, "base run"))
-                .transpose()?;
+            let (base, base_source) = match base {
+                Some(requested) => (Some(store.require_id(&requested, "base run")?), "--base"),
+                None => (
+                    brief::previous_run(&store, &store.load(&id)?)?.map(|run| run.id),
+                    "previous run",
+                ),
+            };
             // Validate the decision before appending, so a rejected decision leaves no analysis.
             let decision = match (change, decision) {
                 (Some(change), Some(status)) => Some(store.prepare_change_decision(
@@ -860,6 +870,10 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 .last()
                 .context("analysis was not appended")?;
             println!("run       {}", runner::short_id(&manifest.id));
+            match &base {
+                Some(base) => println!("base      {} ({base_source})", runner::short_id(base)),
+                None => println!("base      - (no earlier run with a benchmark)"),
+            }
             println!("verdict   {}", latest.verdict.as_str());
             println!("analysis  {}", manifest.analysis_status.as_str());
             println!("revisions {}", manifest.analyses.len());
@@ -2618,7 +2632,6 @@ fn build_brief(
         &brief.summary.id,
         &[
             "host.tcp_listen_overflows".into(),
-            "host.tcp_established".into(),
             "mysql.threads_connected".into(),
             "client.connection_requests_max".into(),
         ],
@@ -2629,6 +2642,7 @@ fn build_brief(
     let states = store.query_metrics(&brief.summary.id, &[], Some("state."), Some(false))?;
     brief::attach_states(&mut brief, &states, limit);
     brief.review = Some(brief::review(review));
+    brief::attach_previous_comparison(&mut brief, store)?;
     brief::next_steps(&mut brief);
     Ok(brief)
 }
