@@ -60,7 +60,7 @@ isuscope change show user-items-update
 - `provisional`の`--revisit`不足などは分析を書き込む前に検査し、分析だけが残ることはありません。
 
 - `analyze --base`は比較元の完全なrun IDを保存します。`--base`を省くと、このrunの直前に始まって終わった（ベンチを始めた）runを比較元にし、どれを使ったかを`base`行に出します。`brief`は各1走のスコア差を表示し、誤差や性能採否は自動判定しません。分析が無い、または分析に比較元が無いrunでも、`brief`の`review.comparison`は同じ直前のrunと比べます（`base_source`が`previous_run`。分析の比較元なら`analysis`）。
-- スコア差の隣に**比較の前提**を出します。`source`（`state_sha256`。dirtyや変更commitも示す）、`observation`（config.toml、routes.toml、benchmark adapterなどのhashとisuscopeのversion）、`environment`（fingerprintのうち値が変わったもの。例: `nginx.config.sha256@app1`）、`benchmark`の4つを`same`／`changed`／`unknown`で返します。**`unknown`は`same`ではありません。** ベンチ側の条件はサーバーからは観測できないので、練習で自分がベンチを変えたときは`run --tag bench:<条件名>`で印を付けます。両方のrunに`bench:`tagがあるときだけ`same`／`changed`を判定し、無ければ`unknown`のままにします。
+- スコア差の隣に**比較の前提**を出します。`source`（`state_sha256`。dirtyや変更commitも示す）、`observation`（config.toml、routes.toml、benchmark adapterなどのhashとisuscopeのversion）、`environment`（fingerprintのうち値が変わったもの。例: `nginx.config.sha256@app1`）、`benchmark`の4つを`same`／`changed`／`unknown`で返します。**`unknown`は`same`ではありません。** ベンチ側の条件はサーバーからは観測できないので、練習で自分がベンチを変えたときは`run --tag bench:<条件名>`で印を付けます。両方のrunに`bench:`tagがあるときだけ`same`／`changed`を判定し、片方だけなら`unknown`、どちらにも無ければ`benchmark`の項目を出しません。
 - `change decide`の状態は`accepted`（採用）、`provisional`（暫定採用）、`rejected`（不採用）、`deferred`（保留）です。未記録と保留は別です。
 - `provisional`には`--revisit "再評価条件"`が必須です。理由と1件以上の根拠runは全状態で必須です。`--run`は繰り返せます。FAIL runも根拠にできます。
 - 変更とrunは多対多です。複数変更を一度に試した場合も、一部だけ採用できます。根拠runのsource（commit、dirty、state digestなど）を採否記録に保存します。
