@@ -831,17 +831,19 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 .map(|requested| store.require_id(&requested, "base run"))
                 .transpose()?;
             // Validate the decision before appending, so a rejected decision leaves no analysis.
+            let mut evidence = vec![id.clone()];
+            evidence.extend(base.clone());
             let decision = match (change, decision) {
                 (Some(change), Some(status)) => Some(store.prepare_change_decision(
                     &change,
-                    &id,
+                    &evidence,
                     status,
                     description,
                     revisit,
                 )?),
                 _ => None,
             };
-            let manifest =
+            let (manifest, appended) =
                 store.append_analysis_with_base(&id, verdict.into(), body.clone(), base.clone())?;
             let latest = manifest
                 .analyses
@@ -851,12 +853,19 @@ async fn real_main(cli: Cli) -> Result<bool> {
             println!("verdict   {}", latest.verdict.as_str());
             println!("analysis  {}", manifest.analysis_status.as_str());
             println!("revisions {}", manifest.analyses.len());
+            if !appended {
+                println!("unchanged the latest analysis already has this verdict and text");
+            }
             if let Some(prepared) = decision {
-                let mut runs = vec![id.clone()];
-                runs.extend(base);
-                let recorded = store.record_change_decision(prepared, body, runs)?;
+                let (recorded, created) = store.record_change_decision(prepared, body, evidence)?;
                 println!("change    {}", recorded.change_id);
                 println!("decision  {}", recorded.status.as_str());
+                if !created {
+                    println!(
+                        "unchanged decision {} already records this status and reason",
+                        recorded.id
+                    );
+                }
             }
             Ok(true)
         }
@@ -869,9 +878,17 @@ async fn real_main(cli: Cli) -> Result<bool> {
                     runs,
                     reason,
                     revisit,
-                } => write_stdout_json(&isuscope::changes::DecisionView::from(
-                    store.decide_change(&id, status, reason, revisit, runs)?,
-                ))?,
+                } => {
+                    let (decision, created) =
+                        store.decide_change(&id, status, reason, revisit, runs)?;
+                    if !created {
+                        eprintln!(
+                            "unchanged: decision {} already records this status and reason",
+                            decision.id
+                        );
+                    }
+                    write_stdout_json(&isuscope::changes::DecisionView::from(decision))?
+                }
                 ChangeCommand::List { status, limit } => {
                     let mut changes = store
                         .list_changes(status, None, 100_000)?

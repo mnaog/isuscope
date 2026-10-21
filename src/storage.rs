@@ -681,13 +681,16 @@ impl Store {
         Ok(())
     }
 
+    /// Appends an analysis and returns the manifest with `true`. When the latest analysis
+    /// already has the same verdict, body and base (a retried command), nothing is written
+    /// and `false` is returned.
     pub fn append_analysis_with_base(
         &mut self,
         id: &str,
         verdict: AnalysisVerdict,
         body: String,
         base_run_id: Option<String>,
-    ) -> Result<RunManifest> {
+    ) -> Result<(RunManifest, bool)> {
         let final_dir = self.final_dir(id);
         let _lock = AnalysisLock::acquire(&final_dir)?;
         if let Some(base) = &base_run_id {
@@ -705,6 +708,11 @@ impl Store {
         let mut manifest = self.load(id)?;
         if manifest.benchmark.passed != Some(true) {
             bail!("only a passing run can be analyzed: `{id}`");
+        }
+        if manifest.analyses.last().is_some_and(|latest| {
+            latest.verdict == verdict && latest.body == body && latest.base_run_id == base_run_id
+        }) {
+            return Ok((manifest, false));
         }
         if verdict == AnalysisVerdict::Skipped
             && manifest.analysis_status != AnalysisStatus::Pending
@@ -750,7 +758,7 @@ impl Store {
             params![manifest.id, manifest_stamp(&final_dir.join("run.json"))],
         )?;
         transaction.commit()?;
-        Ok(manifest)
+        Ok((manifest, true))
     }
 
     /// 保存済みのrunの読み書きを、analysisやenrichの間で1つずつにする。握っている間に
@@ -1437,7 +1445,7 @@ fn enable_wal(connection: &Connection) -> Result<()> {
     }
 }
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// run.jsonの大きさと更新時刻。indexの確定時に保存し、一致するrunは開くたびに読み直さない。
 fn manifest_stamp(path: &Path) -> Option<String> {
@@ -1569,6 +1577,7 @@ fn migrate(connection: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS change_decisions (id TEXT PRIMARY KEY, change_id TEXT NOT NULL REFERENCES changes(id), created_at TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, revisit TEXT);
         CREATE TABLE IF NOT EXISTS change_decision_runs (decision_id TEXT NOT NULL REFERENCES change_decisions(id), run_id TEXT NOT NULL, PRIMARY KEY(decision_id, run_id));
         CREATE INDEX IF NOT EXISTS change_runs_run ON change_decision_runs(run_id);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     ")?;
     ensure_column(connection, "runs", "note", "TEXT")?;
     ensure_column(connection, "runs", "hypothesis", "TEXT NOT NULL DEFAULT ''")?;

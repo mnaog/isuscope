@@ -466,4 +466,64 @@ fn analyze_records_a_change_decision_with_the_analysis() {
             .len(),
         1
     );
+
+    // A retried command records neither a second analysis nor a second decision.
+    let retried = ok(
+        p,
+        &[
+            "analyze",
+            &candidate,
+            "supported",
+            "--base",
+            &base,
+            "--analysis",
+            "idle connections fell and score rose",
+            "--change",
+            "keepalive",
+            "--decision",
+            "accepted",
+        ],
+    );
+    assert!(retried.contains("revisions 1"), "{retried}");
+    assert!(retried.contains("already records"), "{retried}");
+    assert_eq!(
+        json(p, &["change", "show", "keepalive"])["decisions"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A broken record is skipped with a warning instead of stopping every command.
+    fs::write(
+        p.join(".isuscope/changes/keepalive/decisions/broken.json"),
+        "{",
+    )
+    .unwrap();
+    fs::create_dir_all(p.join(".isuscope/changes/bad")).unwrap();
+    fs::write(
+        p.join(".isuscope/changes/bad/change.json"),
+        r#"{"schema_version":99,"id":"bad","description":"x","created_at":"2026-01-01T00:00:00Z","target":null}"#,
+    )
+    .unwrap();
+    let listed = cli(p, &["list"]);
+    assert!(listed.status.success());
+    let warnings = String::from_utf8_lossy(&listed.stderr);
+    assert!(warnings.contains("broken.json"), "{warnings}");
+    assert!(warnings.contains("changes/bad"), "{warnings}");
+    // Unchanged records are not read again.
+    let again = cli(p, &["list"]);
+    assert!(again.status.success());
+    assert!(
+        again.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(
+        json(p, &["change", "show", "keepalive"])["decisions"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }
