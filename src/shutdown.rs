@@ -6,11 +6,19 @@ pub struct Shutdown {
 }
 
 impl Shutdown {
+    /// The first SIGINT/SIGTERM/SIGHUP cancels; the run then stops waiting and saves what it
+    /// has. A second one exits at once: the process groups of running children are killed and
+    /// the unsaved run is left to be recovered as aborted by the next `run`.
     pub fn listen() -> Self {
         let (sender, receiver) = watch::channel(false);
         tokio::spawn(async move {
             wait_for_signal().await;
             let _ = sender.send(true);
+            wait_for_signal().await;
+            eprintln!("! second signal: exiting now; the run is recovered as aborted next time");
+            crate::process::kill_registered_groups();
+            crate::lock::release_run_lock();
+            std::process::exit(130);
         });
         Self { receiver }
     }

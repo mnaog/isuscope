@@ -10,6 +10,7 @@ use crate::{
     config::LoadedConfig,
     model::{HookResult, LogRef, RunMode},
     process,
+    shutdown::Shutdown,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -37,6 +38,8 @@ pub struct HookContext<'a> {
     pub mode: RunMode,
     /// `ISUSCOPE_*`のほかに渡す環境変数。
     pub env: Vec<(&'static str, String)>,
+    /// signalを受けたら、期限を待たずにhookを止める。
+    pub shutdown: Option<Shutdown>,
 }
 
 pub async fn run(context: &HookContext<'_>, name: &str, command: &[String]) -> HookOutput {
@@ -96,6 +99,7 @@ async fn execute(context: &HookContext<'_>, name: &str, command: &[String]) -> R
         .spawn()
         .with_context(|| format!("cannot start {name}_command `{}`", expanded.join(" ")))?;
     let group = child.id();
+    let _registered = process::register_group(group);
     let stdout = child
         .stdout
         .take()
@@ -107,8 +111,18 @@ async fn execute(context: &HookContext<'_>, name: &str, command: &[String]) -> R
     let stdout_task = tokio::spawn(capture_capped(stdout, stdout_raw.clone(), MAX_OUTPUT_BYTES));
     let stderr_task = tokio::spawn(capture_capped(stderr, stderr_raw.clone(), MAX_OUTPUT_BYTES));
     let limit = Duration::from_secs(context.config.config.benchmark.hook_timeout_seconds);
-    let (exit_code, mut errors) = match tokio::time::timeout(limit, child.wait()).await {
-        Ok(Ok(status)) => (
+    let mut shutdown = context.shutdown.clone();
+    let waited = tokio::select! {
+        waited = tokio::time::timeout(limit, child.wait()) => Some(waited),
+        _ = async {
+            match shutdown.as_mut() {
+                Some(shutdown) => shutdown.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => None,
+    };
+    let (exit_code, mut errors) = match waited {
+        Some(Ok(Ok(status))) => (
             status.code(),
             if status.success() {
                 Vec::new()
@@ -116,8 +130,8 @@ async fn execute(context: &HookContext<'_>, name: &str, command: &[String]) -> R
                 vec![format!("{name}_command exited with {status}")]
             },
         ),
-        Ok(Err(error)) => (None, vec![error.to_string()]),
-        Err(_) => {
+        Some(Ok(Err(error))) => (None, vec![error.to_string()]),
+        Some(Err(_)) => {
             let _ = process::terminate_group(&mut child).await;
             (
                 None,
@@ -127,9 +141,19 @@ async fn execute(context: &HookContext<'_>, name: &str, command: &[String]) -> R
                 )],
             )
         }
+        None => {
+            let _ = process::terminate_group(&mut child).await;
+            (None, vec![format!("{name}_command interrupted by signal")])
+        }
     };
-    for (task, stream) in [(stdout_task, "stdout"), (stderr_task, "stderr")] {
-        match process::finish_capture(task, process::CAPTURE_DEADLINE, group).await {
+    // A background process that keeps the pipes open is not the command failing: when the
+    // command itself succeeded, the cut-off log is only a warning.
+    let mut warnings = Vec::new();
+    let captures =
+        process::finish_captures([stdout_task, stderr_task], process::CAPTURE_DEADLINE, group)
+            .await;
+    for (capture, stream) in captures.into_iter().zip(["stdout", "stderr"]) {
+        match capture {
             process::Capture::Finished(Ok(Ok(_))) => {}
             process::Capture::Finished(Ok(Err(error))) => {
                 errors.push(format!("{stream} capture failed: {error}"))
@@ -137,8 +161,9 @@ async fn execute(context: &HookContext<'_>, name: &str, command: &[String]) -> R
             process::Capture::Finished(Err(error)) => {
                 errors.push(format!("{stream} capture task failed: {error}"))
             }
-            process::Capture::Abandoned => errors.push(format!(
-                "{stream} stayed open after {name}_command exited; the saved log may be incomplete"
+            process::Capture::Abandoned => warnings.push(format!(
+                "{stream} stayed open for {}s after {name}_command exited (a background process held it); the saved log may be incomplete",
+                process::CAPTURE_DEADLINE.as_secs()
             )),
         }
     }
@@ -181,6 +206,7 @@ async fn execute(context: &HookContext<'_>, name: &str, command: &[String]) -> R
             exit_code,
             error: (!errors.is_empty()).then(|| errors.join("; ")),
             log_ids: logs.iter().map(|log| log.id.clone()).collect(),
+            warnings,
             ..Default::default()
         },
         logs,

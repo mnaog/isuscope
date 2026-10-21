@@ -46,6 +46,15 @@ fn untable(value: &mut serde_json::Value) {
     }
 }
 
+/// `list` shows the short ID only; the run directory is named by the full ID.
+fn full_run_id(runs_dir: &std::path::Path, short: &str) -> String {
+    fs::read_dir(runs_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .find(|name| name.ends_with(short) && !name.starts_with('.'))
+        .unwrap_or_else(|| panic!("no run directory ends with {short}"))
+}
+
 #[path = "e2e/access_log.rs"]
 mod access_log;
 #[path = "e2e/adapters.rs"]
@@ -96,6 +105,8 @@ mod output_contract;
 mod parallel;
 #[path = "e2e/prepare_rescore.rs"]
 mod prepare_rescore;
+#[path = "e2e/project_config.rs"]
+mod project_config;
 #[path = "e2e/query.rs"]
 mod query;
 #[path = "e2e/score_inputs.rs"]
@@ -108,3 +119,5 @@ mod sql;
 mod statement_digest;
 #[path = "e2e/states.rs"]
 mod states;
+#[path = "e2e/variance.rs"]
+mod variance;

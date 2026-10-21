@@ -116,14 +116,13 @@ pub fn resolve(config: &LoadedConfig) -> Result<Option<ResolvedAgentContext>> {
         );
     }
 
+    // Only the header decides which file belongs to this session, so other sessions'
+    // histories, possibly mid-write, are never read in full or decoded strictly.
     let mut matches = Vec::new();
-    for (path, bytes) in history_files(&history_dir)? {
-        let text = std::str::from_utf8(&bytes)
-            .with_context(|| format!("agent history is not UTF-8: {}", path.display()))?;
+    for (path, header) in history_headers(&history_dir)? {
         for session in &sessions {
-            if history_belongs_to_session(text, session) {
-                let input_id = latest_user_input_id(text, session);
-                matches.push((path.clone(), bytes.clone(), session.clone(), input_id));
+            if history_belongs_to_session(&header, session) {
+                matches.push((path.clone(), session.clone()));
             }
         }
     }
@@ -144,7 +143,10 @@ pub fn resolve(config: &LoadedConfig) -> Result<Option<ResolvedAgentContext>> {
             history_dir.display(),
         );
     }
-    let (path, bytes, session, input_id) = matches.pop().expect("one history match was checked");
+    let (path, session) = matches.pop().expect("one history match was checked");
+    let bytes =
+        fs::read(&path).with_context(|| format!("cannot read agent history {}", path.display()))?;
+    let input_id = latest_user_input_id(&String::from_utf8_lossy(&bytes), &session);
     let input_id = input_id.with_context(|| {
         format!(
             "agent history {} has no User input marker for current {} session `{}`",
@@ -174,7 +176,13 @@ pub fn resolve(config: &LoadedConfig) -> Result<Option<ResolvedAgentContext>> {
     }))
 }
 
-fn history_files(history_dir: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+/// Bytes read from the start of each history file; the header lines fit well within it.
+const HEADER_BYTES: u64 = 8 * 1024;
+const HEADER_LINES: usize = 16;
+
+/// The header lines of every history file. A file that cannot be read (for example one
+/// being replaced by another session) is skipped; only the directory itself must be readable.
+fn history_headers(history_dir: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(history_dir).with_context(|| {
         format!(
@@ -182,35 +190,45 @@ fn history_files(history_dir: &Path) -> Result<Vec<(std::path::PathBuf, Vec<u8>)
             history_dir.display()
         )
     })? {
-        let entry = entry?;
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if !entry.file_type()?.is_file()
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
             || path.extension().and_then(|value| value.to_str()) != Some("md")
         {
             continue;
         }
-        let bytes = fs::read(&path)
-            .with_context(|| format!("cannot read agent history {}", path.display()))?;
-        files.push((path, bytes));
+        let Ok(header) = read_header(&path) else {
+            continue;
+        };
+        files.push((path, header));
     }
     Ok(files)
 }
 
+fn read_header(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(HEADER_BYTES)
+        .read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(text
+        .lines()
+        .take(HEADER_LINES)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 pub fn valid_history_files(history_dir: &Path) -> Result<usize> {
-    let mut valid = 0;
-    for (path, bytes) in history_files(history_dir)? {
-        let text = String::from_utf8(bytes)
-            .with_context(|| format!("agent history is not UTF-8: {}", path.display()))?;
-        if header_value(&text, "Session").is_some() {
-            valid += 1;
-        }
-    }
-    Ok(valid)
+    Ok(history_headers(history_dir)?
+        .iter()
+        .filter(|(_, header)| header_value(header, "Session").is_some())
+        .count())
 }
 
 fn header_value<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let prefix = format!("- {name}: `");
-    text.lines().take(16).find_map(|line| {
+    text.lines().take(HEADER_LINES).find_map(|line| {
         line.strip_prefix(&prefix)
             .and_then(|value| value.strip_suffix('`'))
             .filter(|value| !value.is_empty())
@@ -279,5 +297,33 @@ mod tests {
         assert!(history_belongs_to_session(text, &claude));
         assert!(!history_belongs_to_session(text, &session(CODEX, "s1")));
         assert_eq!(latest_user_input_id(text, &claude).as_deref(), Some("p2"));
+    }
+
+    #[test]
+    fn reads_only_headers_and_skips_files_other_sessions_are_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut own = String::from("# Agent conversation\n\n- Agent: `claude`\n- Session: `s1`\n");
+        own.push_str(&"filler line\n".repeat(2000));
+        fs::write(dir.path().join("own.md"), &own).unwrap();
+        // Another session's file cut in the middle of a multi-byte character.
+        let mut partial = b"# Agent conversation\n\n- Agent: `codex`\n- Session: `s2`\n".to_vec();
+        partial.extend_from_slice(&"会話".as_bytes()[..4]);
+        fs::write(dir.path().join("other.md"), partial).unwrap();
+        fs::write(dir.path().join("notes.txt"), [0xff, 0xfe]).unwrap();
+
+        let mut headers = history_headers(dir.path()).unwrap();
+        headers.sort();
+        assert_eq!(headers.len(), 2);
+        // Sorted by path: other.md, own.md.
+        assert!(headers[1].1.lines().count() <= HEADER_LINES);
+        assert!(history_belongs_to_session(
+            &headers[1].1,
+            &session(CLAUDE, "s1")
+        ));
+        assert!(history_belongs_to_session(
+            &headers[0].1,
+            &session(CODEX, "s2")
+        ));
+        assert_eq!(valid_history_files(dir.path()).unwrap(), 2);
     }
 }

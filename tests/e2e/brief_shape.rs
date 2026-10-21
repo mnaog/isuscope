@@ -84,7 +84,7 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
     };
     isuscope(&["run", "--hypothesis", "base", "--tag", "bench:v1"]);
     let base: serde_json::Value = parsed(&isuscope(&["list", "--limit", "1"])).unwrap();
-    let base_id = base["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
+    let base_id = base["runs"]["rows"][0]["run"].as_str().unwrap().to_owned();
     isuscope(&[
         "analyze",
         &base_id,
@@ -102,7 +102,7 @@ fn a_comparison_states_what_changed_between_the_two_runs() {
         "compare the same deployment under another bench condition",
     ]);
     let candidate: serde_json::Value = parsed(&isuscope(&["list", "--limit", "1"])).unwrap();
-    let candidate_id = candidate["runs"]["rows"][0]["id"]
+    let candidate_id = candidate["runs"]["rows"][0]["run"]
         .as_str()
         .unwrap()
         .to_owned();

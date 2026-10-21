@@ -290,3 +290,55 @@ command = ["sh", "-c", "sleep 1"]
     );
     assert!(manifest["enrichments"][0]["duration_ms"].as_u64().unwrap() >= 1_000);
 }
+
+#[cfg(unix)]
+#[test]
+fn during_collectors_stop_while_the_boundary_phase_runs() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    // Ignores SIGTERM, so stopping it takes the whole two second grace period.
+    let stubborn = "trap '' TERM; while :; do sleep 0.1; done";
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf '%s\n' '{{\"type\":\"isuscope.result\",\"pass\":true,\"score\":1}}'"]
+
+[disk]
+paths = []
+
+[[collectors]]
+name = "stubborn"
+phase = "during"
+command = ["sh", "-c", "{stubborn}"]
+
+[[collectors]]
+name = "slow-boundary"
+phase = "boundary"
+command = ["sh", "-c", "sleep 2"]
+"#
+        ),
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["run", "--hypothesis", "stop during the boundary"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let manifest = only_manifest(&config_dir);
+    let boundary = stage_span(&manifest, "collectors_boundary");
+    let stopping = stage_span(&manifest, "collectors_during_stop");
+    assert!(
+        stopping.0 <= boundary.0 + 100 && stopping.1 < boundary.1 + 1_500,
+        "stopping {stopping:?} did not overlap the boundary phase {boundary:?}"
+    );
+    assert_eq!(manifest["collectors"][1]["name"], "stubborn");
+}

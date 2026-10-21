@@ -3,7 +3,7 @@
 use crate::{model::SourceSnapshot, storage::Store};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Write, path::Path};
 use uuid::Uuid;
@@ -371,22 +371,24 @@ fn comparison_conditions(
             .find(|tag| tag.starts_with("bench:"))
             .cloned()
     };
+    // Shown only when a run carries a `bench:` tag; without one there is nothing to compare.
     let benchmark = match (bench_tag(base), bench_tag(candidate)) {
         (Some(before), Some(after)) if before == after => {
-            condition("benchmark", ConditionState::Same, vec![before])
+            Some(condition("benchmark", ConditionState::Same, vec![before]))
         }
-        (Some(before), Some(after)) => condition(
+        (Some(before), Some(after)) => Some(condition(
             "benchmark",
             ConditionState::Changed,
             vec![format!("{before} -> {after}")],
-        ),
-        _ => condition(
+        )),
+        (Some(tag), None) | (None, Some(tag)) => Some(condition(
             "benchmark",
             ConditionState::Unknown,
-            vec!["tag the runs with `bench:<condition>` to compare".into()],
-        ),
+            vec![format!("{tag} on one run only")],
+        )),
+        (None, None) => None,
     };
-    conditions.push(benchmark);
+    conditions.extend(benchmark);
     conditions
 }
 
@@ -508,38 +510,76 @@ impl Store {
             &self.data_dir.join("changes").join(id).join("change.json"),
             &change,
         )?;
-        self.restore_changes()?;
+        self.reindex_after_publish();
         Ok(change)
     }
 
+    /// The published record is the source of truth; an index that could not be refreshed now
+    /// is rebuilt the next time the store is opened.
+    fn reindex_after_publish(&mut self) {
+        if let Err(error) = self.restore_changes() {
+            eprintln!(
+                "! the record was saved, but the change index could not be refreshed: {error:#}"
+            );
+        }
+    }
+
     pub fn change_history(&self, id: &str) -> Result<ChangeHistory> {
+        let (history, skipped) = self.read_history(id)?;
+        for problem in skipped {
+            eprintln!("! skipped {problem}");
+        }
+        Ok(history)
+    }
+
+    /// The change record and its valid decisions. Invalid decision records are left out and
+    /// described in the second value, so one broken file does not hide the rest.
+    fn read_history(&self, id: &str) -> Result<(ChangeHistory, Vec<String>)> {
         validate_id(id)?;
         let dir = self.data_dir.join("changes").join(id);
         if !dir.join("change.json").is_file() {
             bail!("change `{id}` was not found; list changes with `isuscope change list`");
         }
-        let change: Change = serde_json::from_slice(&fs::read(dir.join("change.json"))?)?;
+        let path = dir.join("change.json");
+        let change: Change = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid change record {}", path.display()))?;
+        if change.id != id || change.schema_version != 1 {
+            bail!("invalid change record {}", path.display());
+        }
         let mut decisions = Vec::new();
+        let mut skipped = Vec::new();
         let records = dir.join("decisions");
         if records.is_dir() {
             for entry in fs::read_dir(records)? {
                 let path = entry?.path();
-                if path.extension().is_some_and(|e| e == "json") {
-                    let decision: Decision = serde_json::from_slice(&fs::read(path)?)?;
-                    if decision.change_id != id || decision.schema_version != 1 {
-                        bail!("invalid decision record");
+                if path.extension().is_none_or(|e| e != "json") {
+                    continue;
+                }
+                let decision = fs::read(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|raw| Ok(serde_json::from_slice::<Decision>(&raw)?));
+                match decision {
+                    Ok(decision) if decision.change_id == id && decision.schema_version == 1 => {
+                        decisions.push(decision)
                     }
-                    decisions.push(decision);
+                    Ok(_) => skipped.push(format!(
+                        "invalid decision record {} (change ID or schema version)",
+                        path.display()
+                    )),
+                    Err(error) => skipped.push(format!(
+                        "invalid decision record {}: {error:#}",
+                        path.display()
+                    )),
                 }
             }
         }
-        if change.id != id || change.schema_version != 1 {
-            bail!("invalid change record");
-        }
         decisions.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
-        Ok(ChangeHistory { change, decisions })
+        Ok((ChangeHistory { change, decisions }, skipped))
     }
 
+    /// Records a decision and returns it with `true`, or returns the existing decision with
+    /// `false` when the change already has one with the same status, reason, revisit and
+    /// evidence runs (a retried command does not add a second, identical decision).
     pub fn decide_change(
         &mut self,
         id: &str,
@@ -547,8 +587,8 @@ impl Store {
         reason: String,
         revisit: Option<String>,
         runs: Vec<String>,
-    ) -> Result<Decision> {
-        self.change_history(id)?;
+    ) -> Result<(Decision, bool)> {
+        let history = self.change_history(id)?;
         if reason.trim().is_empty() {
             bail!("reason must not be empty");
         }
@@ -572,6 +612,20 @@ impl Store {
             let source = self.load(&run_id)?.source;
             evidence.push(Evidence { run_id, source });
         }
+        let runs_of = |evidence: &[Evidence]| {
+            evidence
+                .iter()
+                .map(|e| e.run_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        if let Some(existing) = history.decisions.iter().rev().find(|decision| {
+            decision.status == status
+                && decision.reason == reason
+                && decision.revisit == revisit
+                && runs_of(&decision.evidence) == runs_of(&evidence)
+        }) {
+            return Ok((existing.clone(), false));
+        }
         let decision = Decision {
             schema_version: 1,
             id: Uuid::now_v7().to_string(),
@@ -591,16 +645,18 @@ impl Store {
                 .join(format!("{}.json", decision.id)),
             &decision,
         )?;
-        self.restore_changes()?;
-        Ok(decision)
+        self.reindex_after_publish();
+        Ok((decision, true))
     }
 
     /// Checks an `analyze --change --decision` request before the analysis is written.
     /// A missing change is created from `description`, or from the run's hypothesis.
+    /// `evidence` is the analyzed run followed by `--base`, as resolved IDs; every one must be
+    /// finalized, so nothing is written for a request that would fail when recording.
     pub fn prepare_change_decision(
         &self,
         change_id: &str,
-        run_id: &str,
+        evidence: &[String],
         status: DecisionStatus,
         description: Option<String>,
         revisit: Option<String>,
@@ -611,8 +667,16 @@ impl Store {
         {
             bail!("provisional decisions require a non-empty --revisit");
         }
-        if !self.final_dir(run_id).is_dir() {
-            bail!("evidence run must be finalized");
+        let run_id = evidence
+            .first()
+            .context("at least one evidence run is required")?;
+        for id in evidence {
+            if !self.final_dir(id).is_dir() {
+                bail!(
+                    "evidence run {} must be finalized",
+                    crate::runner::short_id(id)
+                );
+            }
         }
         let exists = self
             .data_dir
@@ -647,12 +711,13 @@ impl Store {
         })
     }
 
+    /// Like [`Self::decide_change`], `false` means an identical decision already existed.
     pub fn record_change_decision(
         &mut self,
         prepared: PreparedDecision,
         reason: String,
         runs: Vec<String>,
-    ) -> Result<Decision> {
+    ) -> Result<(Decision, bool)> {
         if let Some((description, target)) = prepared.create {
             let path = self
                 .data_dir
@@ -703,17 +768,45 @@ impl Store {
             .collect()
     }
 
+    /// Rebuilds the change index from the records. A record that cannot be read is skipped
+    /// with a warning, so one broken file never stops other commands. Records are re-read
+    /// only when the cheap [`records_signature`] differs from the one stored after the last
+    /// restore.
     pub(crate) fn restore_changes(&mut self) -> Result<()> {
         let root = self.data_dir.join("changes");
         if !root.is_dir() {
             return Ok(());
         }
+        // Taken before reading: a record published meanwhile changes the next signature.
+        let signature = records_signature(&root);
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='changes_signature'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if signature.is_some() && stored == signature {
+            return Ok(());
+        }
         for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() || !entry.path().join("change.json").is_file() {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir())
+                || !entry.path().join("change.json").is_file()
+            {
                 continue;
             }
-            let history = self.change_history(&entry.file_name().to_string_lossy())?;
+            let (history, skipped) = match self.read_history(&entry.file_name().to_string_lossy()) {
+                Ok(read) => read,
+                Err(error) => {
+                    eprintln!("! skipped change {}: {error:#}", entry.path().display());
+                    continue;
+                }
+            };
+            for problem in skipped {
+                eprintln!("! skipped {problem}");
+            }
             let tx = self.connection.transaction()?;
             let c = history.change;
             tx.execute("INSERT OR IGNORE INTO changes(id,description,created_at,target) VALUES (?1,?2,?3,?4)",
@@ -727,8 +820,55 @@ impl Store {
             }
             tx.commit()?;
         }
+        if let Some(signature) = signature {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES ('changes_signature',?1)",
+                [signature],
+            )?;
+        }
         Ok(())
     }
+}
+
+/// Names, sizes and modification times of every change and decision record, hashed. Only
+/// metadata is read, so comparing it on every command costs a directory listing per change.
+/// `None` when the listing itself fails (the records are then always re-read).
+fn records_signature(root: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    fn stamp(path: &Path) -> Option<String> {
+        let metadata = fs::metadata(path).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(format!("{}:{}", metadata.len(), modified.as_nanos()))
+    }
+    let mut lines = Vec::new();
+    for entry in fs::read_dir(root).ok()? {
+        let path = entry.ok()?.path();
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        let change = path.join("change.json");
+        if !change.is_file() {
+            continue;
+        }
+        lines.push(format!("{name}/change.json {}", stamp(&change)?));
+        let decisions = path.join("decisions");
+        if decisions.is_dir() {
+            for record in fs::read_dir(&decisions).ok()? {
+                let record = record.ok()?.path();
+                if record.extension().is_some_and(|e| e == "json") {
+                    lines.push(format!(
+                        "{name}/{} {}",
+                        record.file_name()?.to_string_lossy(),
+                        stamp(&record)?
+                    ));
+                }
+            }
+        }
+    }
+    lines.sort();
+    Some(format!("{:x}", Sha256::digest(lines.join("\n"))))
 }
 
 #[cfg(test)]

@@ -27,9 +27,23 @@ pub struct Config {
     #[serde(default)]
     pub disk: DiskConfig,
     #[serde(default)]
+    pub doctor: DoctorConfig,
+    #[serde(default)]
     pub nodes: Vec<NodeConfig>,
     #[serde(default)]
     pub collectors: Vec<CollectorConfig>,
+    #[serde(default)]
+    pub include: IncludeConfig,
+}
+
+/// Files merged over `config.toml`, so a project keeps its own settings in a tracked file
+/// instead of editing the generated one.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct IncludeConfig {
+    /// Paths relative to the project root, merged in order after `config.toml`: tables merge
+    /// key by key, and any other value (scalars, arrays, arrays of tables) replaces the earlier one.
+    #[serde(default)]
+    pub config: Vec<PathBuf>,
 }
 
 /// Free space checked on every node by `doctor` and before each benchmark.
@@ -44,6 +58,9 @@ pub struct DiskConfig {
     /// Below this, `doctor` fails and `run` refuses to start the benchmark. 0 disables it.
     #[serde(default = "default_node_min_free_mb")]
     pub node_min_free_mb: u64,
+    /// Below this free space on the filesystem of `data_dir` (this machine), `doctor` warns.
+    #[serde(default = "default_local_warn_free_mb")]
+    pub local_warn_free_mb: u64,
 }
 
 impl Default for DiskConfig {
@@ -52,8 +69,34 @@ impl Default for DiskConfig {
             paths: default_disk_paths(),
             node_warn_free_mb: default_node_warn_free_mb(),
             node_min_free_mb: default_node_min_free_mb(),
+            local_warn_free_mb: default_local_warn_free_mb(),
         }
     }
+}
+
+fn default_local_warn_free_mb() -> u64 {
+    1024
+}
+
+/// Checks made only by `doctor`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DoctorConfig {
+    /// Above this difference between a node's clock and this machine's, `doctor` warns.
+    /// Collectors on different nodes are joined by time, so their samples shift by the skew.
+    #[serde(default = "default_max_clock_skew_seconds")]
+    pub max_clock_skew_seconds: u64,
+}
+
+impl Default for DoctorConfig {
+    fn default() -> Self {
+        Self {
+            max_clock_skew_seconds: default_max_clock_skew_seconds(),
+        }
+    }
+}
+
+fn default_max_clock_skew_seconds() -> u64 {
+    2
 }
 
 fn default_disk_paths() -> Vec<String> {
@@ -115,6 +158,8 @@ pub struct LoadedConfig {
     pub config_path: PathBuf,
     pub project_root: PathBuf,
     pub data_dir: PathBuf,
+    /// The `[include] config` files merged over `config_path`, resolved, in merge order.
+    pub include_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -434,22 +479,56 @@ impl LoadedConfig {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let raw =
-            fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-        let config: Config = toml::from_str(&raw)
-            .with_context(|| format!("invalid configuration in {}", path.display()))?;
-        validate(&config)?;
         let config_dir = path.parent().context("config path has no parent")?;
         let project_root = config_dir
             .parent()
             .context(".isuscope must be inside a project directory")?
             .to_path_buf();
+        let mut table = read_table(path)?;
+        let includes = table
+            .get("include")
+            .cloned()
+            .map(|include| include.try_into::<IncludeConfig>())
+            .transpose()
+            .with_context(|| format!("invalid [include] in {}", path.display()))?
+            .unwrap_or_default();
+        let mut include_paths = Vec::new();
+        for relative in &includes.config {
+            let include = resolve(&project_root, relative);
+            let overlay = read_table(&include)?;
+            if overlay.contains_key("include") {
+                bail!(
+                    "{} is included by {}; an included file cannot have its own [include]",
+                    include.display(),
+                    path.display()
+                );
+            }
+            merge_table(&mut table, overlay);
+            include_paths.push(include);
+        }
+        let config: Config = toml::Value::Table(table).try_into().with_context(|| {
+            if include_paths.is_empty() {
+                format!("invalid configuration in {}", path.display())
+            } else {
+                format!(
+                    "invalid configuration in {} merged with {}",
+                    path.display(),
+                    include_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        })?;
+        validate(&config)?;
         let data_dir = resolve(&project_root, &config.data_dir);
         Ok(Self {
             config,
             config_path: path.to_path_buf(),
             project_root,
             data_dir,
+            include_paths,
         })
     }
 
@@ -479,6 +558,27 @@ impl LoadedConfig {
             .context
             .history_dir()
             .map(|history_dir| resolve(&self.source_repo(), history_dir))
+    }
+}
+
+fn read_table(path: &Path) -> Result<toml::Table> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    toml::from_str(&raw).with_context(|| format!("invalid configuration in {}", path.display()))
+}
+
+/// `overlay`を`base`へ重ねる。両方がtableならkeyごとに再帰し、それ以外（scalar、array、
+/// array of tables）は後のものが置き換える。
+fn merge_table(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base)), toml::Value::Table(overlay)) => {
+                merge_table(base, overlay)
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }
 
@@ -596,5 +696,84 @@ pub fn resolve(base: &Path, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         base.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn included_files_merge_tables_and_replace_other_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_dir = directory.path().join(".isuscope");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[include]
+config = [".isuscope/policy.toml", "local.toml"]
+
+[benchmark]
+mode = "command"
+command = ["generated"]
+working_dir = "."
+
+[disk]
+paths = ["/", "/tmp"]
+node_warn_free_mb = 100
+
+[[collectors]]
+name = "generated"
+phase = "after"
+transport = "local"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            config_dir.join("policy.toml"),
+            r#"
+[benchmark]
+command = ["policy"]
+
+[disk]
+paths = ["/var/log"]
+
+[doctor]
+max_clock_skew_seconds = 5
+"#,
+        )
+        .unwrap();
+        // 後のfileが勝つ。
+        fs::write(
+            directory.path().join("local.toml"),
+            "[disk]\nnode_warn_free_mb = 300\n",
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&config_dir.join("config.toml")).unwrap();
+        let config = &loaded.config;
+        assert_eq!(config.benchmark.command, ["policy"]);
+        // 同じtableの別のkeyは残る。
+        assert_eq!(
+            config.benchmark.working_dir.as_deref(),
+            Some(Path::new("."))
+        );
+        assert_eq!(config.disk.paths, ["/var/log"]);
+        assert_eq!(config.disk.node_warn_free_mb, 300);
+        assert_eq!(config.doctor.max_clock_skew_seconds, 5);
+        assert_eq!(config.collectors.len(), 1);
+        assert_eq!(
+            loaded.include_paths,
+            [
+                directory.path().join(".isuscope/policy.toml"),
+                directory.path().join("local.toml")
+            ]
+        );
+
+        // 含めたfileが無ければ、どのfileかを示して止まる。
+        fs::remove_file(directory.path().join("local.toml")).unwrap();
+        let error = LoadedConfig::load(&config_dir.join("config.toml")).unwrap_err();
+        assert!(format!("{error:#}").contains("local.toml"), "{error:#}");
     }
 }

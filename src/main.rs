@@ -19,8 +19,56 @@ use std::{env, path::PathBuf, process::ExitCode};
 #[derive(Parser)]
 #[command(name = "isuscope", version, about = "ISUCONのベンチ実行記録ツール")]
 struct Cli {
+    /// 設定（`.isuscope/config.toml`）を探し始めるdirectory。省略時は今のdirectory。別のdirectory
+    /// （git worktreeなど）から、cdせずにprojectの設定とデータを読むのに使います。ベンチ・分析など
+    /// 書き込むcommandは、今のdirectoryと同じprojectを指すときだけ受け付けます。
+    #[arg(long, global = true, env = "ISUSCOPE_PROJECT", value_name = "DIR")]
+    project: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// 今のdirectoryと別のprojectを`--project`で読んでよいcommand。runのデータと設定を読むだけのもの
+    /// （`states`と`sql`がrunごとに作る読み取り用のcacheを除き、何も書かない）。
+    fn reads_only(&self) -> bool {
+        matches!(
+            self.command,
+            Commands::List { .. }
+                | Commands::Brief { .. }
+                | Commands::Sql { .. }
+                | Commands::States { .. }
+                | Commands::Series { .. }
+                | Commands::Query { .. }
+                | Commands::Doctor { .. }
+                | Commands::Routes { .. }
+                | Commands::Variance { .. }
+                | Commands::Change {
+                    command: ChangeCommand::List { .. } | ChangeCommand::Show { .. }
+                }
+        )
+    }
+
+    /// `--project`（`ISUSCOPE_PROJECT`）か今のdirectoryから設定を探す。書き込むcommandでは、
+    /// 指したprojectが今のdirectoryのprojectと違えば止める。
+    fn load_config(&self) -> Result<LoadedConfig> {
+        let current = env::current_dir().context("cannot determine current directory")?;
+        let Some(project) = &self.project else {
+            return LoadedConfig::discover(&current);
+        };
+        let selected = LoadedConfig::discover(&current.join(project))
+            .with_context(|| format!("--project {}", project.display()))?;
+        if !self.reads_only() {
+            let here = LoadedConfig::discover(&current).ok();
+            if here.map(|config| config.config_path) != Some(selected.config_path.clone()) {
+                bail!(
+                    "--project (ISUSCOPE_PROJECT) {} is only for commands that read; run this command from that project's directory",
+                    selected.project_root.display()
+                );
+            }
+        }
+        Ok(selected)
+    }
 }
 
 #[derive(Subcommand)]
@@ -87,6 +135,15 @@ enum Commands {
         /// 返すrun数の上限。
         #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
         limit: usize,
+    },
+    /// 同じ構成（`config_key`）を測ったrunのscoreの揺れを、runごとに開始時点で分かっていた値で出します。
+    Variance {
+        /// このrunの行と、同じ構成を測ったrunのscoreだけを出します。
+        #[arg(long)]
+        run: Option<String>,
+        /// 機械向けJSONで出力します。
+        #[arg(long)]
+        json: bool,
     },
     /// runの判断材料だけを小さい機械向けJSONで出力します。
     Brief {
@@ -220,8 +277,13 @@ enum Commands {
         /// run ID、一意な短縮ID、または一意なtagを指定します。
         run: String,
     },
-    /// ベンチを起動せず、設定・command・SSH・時刻・diskを検査します。
-    Doctor,
+    /// ベンチを起動せず、設定・command・SSH・時刻・diskを検査します。警告と失敗だけを1行ずつ出し、
+    /// 通った検査は数だけを出します。
+    Doctor {
+        /// 通った検査も1行ずつ出します。
+        #[arg(long)]
+        verbose: bool,
+    },
     /// PASSしたrunへ仮説の判定と結果分析を追記します。
     Analyze {
         /// run ID、一意な短縮ID、または一意なtagを指定します。
@@ -229,7 +291,8 @@ enum Commands {
         /// 仮説の判定。
         #[arg(value_enum)]
         verdict: VerdictArg,
-        /// 比較元run。解決した完全なIDを分析に保存します。
+        /// 比較元run。解決した完全なIDを分析に保存します。省略時は、このrunの直前に始まって
+        /// 終わった（ベンチを始めた）runです（briefの`review.comparison`と同じ）。
         #[arg(long)]
         base: Option<String>,
         /// 結果の分析本文。skippedでは省略する理由として扱います。
@@ -264,10 +327,6 @@ enum Commands {
         method_field: String,
         #[arg(long, default_value = "uri")]
         uri_field: String,
-        /// 旧`nginx-series` collectorの引数。route別の集計と時系列はnode上の`alp`へ移ったので、
-        /// 渡されたら設定の更新を求めて失敗する。
-        #[arg(long, hide = true)]
-        series_only: bool,
     },
     /// nodeの`isuscope-node`と同じ集計（`isuscope-node --build-id`と`access-summary`）。手元で差分を
     /// 集計し直すときと、templateのcollectorを試すときに使います。
@@ -483,7 +542,7 @@ impl From<VerdictArg> for AnalysisVerdict {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Commands::Lock { path, command } = &cli.command {
-        return match run_lock_command(path.as_deref(), command) {
+        return match run_lock_command(&cli, path.as_deref(), command) {
             Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             Err(error) => exit_for_error(error),
         };
@@ -517,15 +576,13 @@ fn exit_for_error(error: anyhow::Error) -> ExitCode {
     }
 }
 
-fn run_lock_command(path: Option<&std::path::Path>, command: &[String]) -> Result<i32> {
+fn run_lock_command(cli: &Cli, path: Option<&std::path::Path>, command: &[String]) -> Result<i32> {
     let path = match path {
         Some(path) => path.to_path_buf(),
-        None => {
-            let current = env::current_dir().context("cannot determine current directory")?;
-            LoadedConfig::discover(&current)?
-                .lock_path()
-                .context("isuscope lock needs --path or [lock] path in the config")?
-        }
+        None => cli
+            .load_config()?
+            .lock_path()
+            .context("isuscope lock needs --path or [lock] path in the config")?,
     };
     isuscope::lock::run_locked(&path, command)
 }
@@ -536,8 +593,7 @@ fn acquire_run_lock(cli: &Cli) -> Result<Option<isuscope::lock::OperationLock>> 
         Commands::SurveyRun { .. } => "isuscope survey-run",
         _ => return Ok(None),
     };
-    let current = env::current_dir().context("cannot determine current directory")?;
-    let Some(path) = LoadedConfig::discover(&current)?.lock_path() else {
+    let Some(path) = cli.load_config()?.lock_path() else {
         return Ok(None);
     };
     let lock = isuscope::lock::OperationLock::acquire(&path, operation)?;
@@ -578,16 +634,8 @@ async fn real_main(cli: Cli) -> Result<bool> {
         session_field,
         method_field,
         uri_field,
-        series_only,
     } = &cli.command
     {
-        if *series_only {
-            anyhow::bail!(
-                "the nginx-series collector was replaced by the node-side `alp` collector; \
-                 remove nginx-series from .isuscope/config.toml and take the alp, nginx-log-raw \
-                 and user-transition collectors from `isuscope init --print`"
-            );
-        }
         isuscope::transition::emit(isuscope::transition::TransitionOptions {
             run_dir,
             prefix,
@@ -630,7 +678,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         }
         return Ok(true);
     }
-    let config = LoadedConfig::discover(&current)?;
+    let config = cli.load_config()?;
     match cli.command {
         Commands::Init { .. } | Commands::Lock { .. } => unreachable!(),
         Commands::Routes {
@@ -672,6 +720,10 @@ async fn real_main(cli: Cli) -> Result<bool> {
         }
         Commands::Brief { run, limit } => {
             show_brief(&config, &run, limit)?;
+            Ok(true)
+        }
+        Commands::Variance { run, json } => {
+            show_variance(&config, run.as_deref(), json)?;
             Ok(true)
         }
         Commands::Sql {
@@ -807,14 +859,14 @@ async fn real_main(cli: Cli) -> Result<bool> {
             if manifest.analysis_status == isuscope::model::AnalysisStatus::Pending {
                 println!();
                 println!(
-                    "next      isuscope analyze {} <supported|rejected|inconclusive> --analysis <text>",
-                    runner::short_id(&manifest.id)
+                    "next      {}",
+                    isuscope::model::analyze_template(runner::short_id(&manifest.id))
                 );
             }
             Ok(true)
         }
-        Commands::Doctor => {
-            let report = doctor::run(&config).await?;
+        Commands::Doctor { verbose } => {
+            let report = doctor::run(&config, verbose).await?;
             println!();
             println!("passed    {}", report.passed);
             println!("warnings  {}", report.warnings.len());
@@ -841,36 +893,53 @@ async fn real_main(cli: Cli) -> Result<bool> {
             }
             let mut store = Store::open(&config.data_dir)?;
             let id = store.require_id(&run, "run")?;
-            let base = base
-                .map(|requested| store.require_id(&requested, "base run"))
-                .transpose()?;
+            let (base, base_source) = match base {
+                Some(requested) => (Some(store.require_id(&requested, "base run")?), "--base"),
+                None => (
+                    brief::previous_run(&store, &store.load(&id)?)?.map(|run| run.id),
+                    "previous run",
+                ),
+            };
             // Validate the decision before appending, so a rejected decision leaves no analysis.
+            let mut evidence = vec![id.clone()];
+            evidence.extend(base.clone());
             let decision = match (change, decision) {
                 (Some(change), Some(status)) => Some(store.prepare_change_decision(
                     &change,
-                    &id,
+                    &evidence,
                     status,
                     description,
                     revisit,
                 )?),
                 _ => None,
             };
-            let manifest =
+            let (manifest, appended) =
                 store.append_analysis_with_base(&id, verdict.into(), body.clone(), base.clone())?;
             let latest = manifest
                 .analyses
                 .last()
                 .context("analysis was not appended")?;
             println!("run       {}", runner::short_id(&manifest.id));
+            match &base {
+                Some(base) => println!("base      {} ({base_source})", runner::short_id(base)),
+                None => println!("base      - (no earlier run with a benchmark)"),
+            }
             println!("verdict   {}", latest.verdict.as_str());
             println!("analysis  {}", manifest.analysis_status.as_str());
             println!("revisions {}", manifest.analyses.len());
+            if !appended {
+                println!("unchanged the latest analysis already has this verdict and text");
+            }
             if let Some(prepared) = decision {
-                let mut runs = vec![id.clone()];
-                runs.extend(base);
-                let recorded = store.record_change_decision(prepared, body, runs)?;
+                let (recorded, created) = store.record_change_decision(prepared, body, evidence)?;
                 println!("change    {}", recorded.change_id);
                 println!("decision  {}", recorded.status.as_str());
+                if !created {
+                    println!(
+                        "unchanged decision {} already records this status and reason",
+                        recorded.id
+                    );
+                }
             }
             Ok(true)
         }
@@ -883,9 +952,17 @@ async fn real_main(cli: Cli) -> Result<bool> {
                     runs,
                     reason,
                     revisit,
-                } => write_stdout_json(&isuscope::changes::DecisionView::from(
-                    store.decide_change(&id, status, reason, revisit, runs)?,
-                ))?,
+                } => {
+                    let (decision, created) =
+                        store.decide_change(&id, status, reason, revisit, runs)?;
+                    if !created {
+                        eprintln!(
+                            "unchanged: decision {} already records this status and reason",
+                            decision.id
+                        );
+                    }
+                    write_stdout_json(&isuscope::changes::DecisionView::from(decision))?
+                }
                 ChangeCommand::List { status, limit } => {
                     let mut changes = store
                         .list_changes(status, None, 100_000)?
@@ -2018,6 +2095,58 @@ impl<T> Listed<T> {
     }
 }
 
+fn show_variance(config: &LoadedConfig, run: Option<&str>, json: bool) -> Result<()> {
+    use isuscope::variance;
+    let store = Store::open(&config.data_dir)?;
+    let rows = variance::rows(&store)?;
+    let Some(requested) = run else {
+        if json {
+            return write_stdout_json(&serde_json::json!({
+                "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
+                "runs": rows,
+            }));
+        }
+        println!("{}", variance::header());
+        for row in &rows {
+            println!("{}", variance::describe(row));
+        }
+        return Ok(());
+    };
+    let id = store.require_id(requested, "run")?;
+    let row = rows
+        .iter()
+        .find(|row| row.id == id)
+        .with_context(|| format!("run {} has no score", runner::short_id(&id)))?;
+    let config_runs = variance::config_runs(&rows, row);
+    if json {
+        return write_stdout_json(&serde_json::json!({
+            "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
+            "run": row,
+            "config_runs": config_runs,
+        }));
+    }
+    println!("{}", variance::header());
+    println!("{}", variance::describe(row));
+    if !config_runs.is_empty() {
+        println!();
+        println!("same config_key");
+        for other in &config_runs {
+            println!(
+                "{}  {:>8}  {}{}",
+                other.run,
+                other.score,
+                match other.passed {
+                    Some(true) => "PASS",
+                    Some(false) => "FAIL",
+                    None => "-",
+                },
+                if other.repeat { "  repeat" } else { "" }
+            );
+        }
+    }
+    Ok(())
+}
+
 fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {
     let store = Store::open(&config.data_dir)?;
     write_capped_json(
@@ -2655,7 +2784,6 @@ fn build_brief(
         &brief.summary.id,
         &[
             "host.tcp_listen_overflows".into(),
-            "host.tcp_established".into(),
             "mysql.threads_connected".into(),
             "client.connection_requests_max".into(),
         ],
@@ -2666,6 +2794,7 @@ fn build_brief(
     let states = store.query_metrics(&brief.summary.id, &[], Some("state."), Some(false))?;
     brief::attach_states(&mut brief, &states, limit);
     brief.review = Some(brief::review(review));
+    brief::attach_previous_comparison(&mut brief, store)?;
     brief::next_steps(&mut brief);
     Ok(brief)
 }

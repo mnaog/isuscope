@@ -90,8 +90,12 @@ pub async fn execute(
             },
         },
     };
-    execution.result.started_at.get_or_insert(started_at);
-    execution.result.finished_at.get_or_insert_with(Utc::now);
+    // A command that could not be started is `not-started` and keeps no benchmark interval,
+    // so it is never taken for a measurement (or as the base of the repeat check).
+    if execution.result.mode != "not-started" {
+        execution.result.started_at.get_or_insert(started_at);
+        execution.result.finished_at.get_or_insert_with(Utc::now);
+    }
     // 区間の境界はマイクロ秒で記録する（collectorへ渡す値、bucketの先頭と同じ精度）。
     let result = &mut execution.result;
     for at in [
@@ -113,10 +117,38 @@ async fn execute_command(
     mode: RunMode,
 ) -> Result<BenchmarkExecution> {
     let benchmark = &config.config.benchmark;
-    let (program, args) = benchmark
-        .command
-        .split_first()
-        .context("benchmark.command must not be empty in command mode")?;
+    let not_started = |error: anyhow::Error| BenchmarkExecution {
+        result: BenchmarkResult {
+            mode: "not-started".into(),
+            command: benchmark.command.clone(),
+            passed: Some(false),
+            error: Some(format!("{error:#}")),
+            ..Default::default()
+        },
+        logs: Vec::new(),
+        metrics: Vec::new(),
+    };
+    let Some((program, args)) = benchmark.command.split_first() else {
+        return Ok(not_started(anyhow::anyhow!(
+            "benchmark.command must not be empty in command mode"
+        )));
+    };
+    let score_pattern = match Regex::new(&benchmark.score_pattern)
+        .context("benchmark.score_pattern is not a valid regular expression")
+    {
+        Ok(pattern) => pattern,
+        Err(error) => return Ok(not_started(error)),
+    };
+    let operator_pattern = match benchmark
+        .operator_line_pattern
+        .as_deref()
+        .map(Regex::new)
+        .transpose()
+        .context("benchmark.operator_line_pattern is not a valid regular expression")
+    {
+        Ok(pattern) => pattern,
+        Err(error) => return Ok(not_started(error)),
+    };
     let mut command = Command::new(program);
     command
         .args(args)
@@ -135,12 +167,16 @@ async fn execute_command(
     }
     process::configure_group(&mut command);
     let spawned = Instant::now();
-    let mut child = command.spawn().with_context(|| {
+    let mut child = match command.spawn().with_context(|| {
         format!(
             "cannot start benchmark command `{}`",
             benchmark.command.join(" ")
         )
-    })?;
+    }) {
+        Ok(child) => child,
+        Err(error) => return Ok(not_started(error)),
+    };
+    let _registered = process::register_group(child.id());
     let stdout = child
         .stdout
         .take()
@@ -149,14 +185,6 @@ async fn execute_command(
         .stderr
         .take()
         .context("benchmark stderr was not captured")?;
-    let score_pattern = Regex::new(&benchmark.score_pattern)
-        .context("benchmark.score_pattern is not a valid regular expression")?;
-    let operator_pattern = benchmark
-        .operator_line_pattern
-        .as_deref()
-        .map(Regex::new)
-        .transpose()
-        .context("benchmark.operator_line_pattern is not a valid regular expression")?;
     let observation = Arc::new(Mutex::new(Observation::default()));
     let stdout_raw = run_dir.join("tmp/benchmark-stdout.log");
     let stderr_raw = run_dir.join("tmp/benchmark-stderr.log");
@@ -216,8 +244,10 @@ async fn execute_command(
     let interrupted = stopped_by == Some("interrupted");
     // 中断後にpipeを握ったままの相手が残っていても、取り込みを待ち続けて止まらないようにする。
     let mut abandoned = Vec::new();
-    for (task, stream) in [(stdout_task, "stdout"), (stderr_task, "stderr")] {
-        if finish_capture(task, stream).await? {
+    let captures =
+        process::finish_captures([stdout_task, stderr_task], process::CAPTURE_DEADLINE, None).await;
+    for (capture, stream) in captures.into_iter().zip(["stdout", "stderr"]) {
+        if finished_capture(capture, stream)? {
             abandoned.push(stream);
         }
     }
@@ -323,11 +353,11 @@ async fn execute_command(
     })
 }
 
-/// 取り込みtaskの完了を待つ。pipeの書き手が残って閉じない場合は打ち切り（taskは止めて、
-/// 止まったことまで確かめる）、そこまでに書けたlogで先へ進む。打ち切ったら`true`。
-/// ベンチの側に残ったprocessは落とさない（ベンチが意図して残したものかもしれない）。
-async fn finish_capture(task: tokio::task::JoinHandle<Result<()>>, stream: &str) -> Result<bool> {
-    match process::finish_capture(task, process::CAPTURE_DEADLINE, None).await {
+/// 取り込みtaskの終わり方を読む。pipeの書き手が残って閉じなかった場合は打ち切られて
+/// （taskは止めて、止まったことまで確かめてある）、そこまでに書けたlogで先へ進む。打ち切ったら
+/// `true`。ベンチの側に残ったprocessは落とさない（ベンチが意図して残したものかもしれない）。
+fn finished_capture(capture: process::Capture<Result<()>>, stream: &str) -> Result<bool> {
+    match capture {
         process::Capture::Finished(joined) => {
             joined.with_context(|| format!("{stream} capture task failed"))??;
             Ok(false)

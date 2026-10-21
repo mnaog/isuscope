@@ -63,9 +63,10 @@ isuscope change show user-items-update
 
 スコアの比較は次のように読みます。
 
-- `analyze --base`は比較元の完全なrun IDを保存します。`brief`は各1走のスコア差を表示し、誤差や性能採否は自動判定しません。
+- `analyze --base`は比較元の完全なrun IDを保存します。`--base`を省くと、このrunの直前に始まって終わった（ベンチを始めた）runを比較元にし、どれを使ったかを`base`行に出します。`brief`は各1走のスコア差を表示し、誤差や性能採否は自動判定しません。
+- 分析が無い、または分析に比較元が無いrunでも、`brief`の`review.comparison`は同じ直前のrunと比べます（`base_source`が`previous_run`。分析の比較元なら`analysis`）。
 - スコア差の隣に**比較の前提**を出します。`source`（`state_sha256`。dirtyや変更commitも示す）、`observation`（config.toml、routes.toml、benchmark adapterなどのhashとisuscopeのversion）、`environment`（fingerprintのうち値が変わったもの。例: `nginx.config.sha256@app1`）、`benchmark`の4つを`same`／`changed`／`unknown`で返します。**`unknown`は`same`ではありません。**
-- ベンチ側の条件はサーバーからは観測できないので、練習で自分がベンチを変えたときは`run --tag bench:<条件名>`で印を付けます。両方のrunに`bench:`tagがあるときだけ`same`／`changed`を判定し、無ければ`unknown`のままにします。
+- ベンチ側の条件はサーバーからは観測できないので、練習で自分がベンチを変えたときは`run --tag bench:<条件名>`で印を付けます。両方のrunに`bench:`tagがあるときだけ`same`／`changed`を判定し、片方だけなら`unknown`、どちらにも無ければ`benchmark`の項目を出しません。
 
 終了前は観測用設定や重いログを環境から外したうえで、同じ`run`を使って採点用構成を確認します。専用の最終計測コマンドはありません。
 
@@ -122,13 +123,14 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 | コマンド | 用途 |
 |---|---|
 | `init` | `.isuscope/`の雛形を生成する。`--print config`で、雛形を作らずにconfig.toml（`data_dir`・`[benchmark]`・全collectorなど）を実環境の値で標準出力へ出す。`--no-scaffold`を付けると`[ssh]`と`[lock]`・`[[nodes]]`の例を省く |
-| `doctor` | ベンチを起動せず、設定・command・SSH・時刻・diskを検査する |
+| `doctor` | ベンチを起動せず、設定・command・SSH・時刻・diskを検査する。警告と失敗だけを1行ずつ出し、通った検査は数で出す（`--verbose`で通った検査も並べる） |
 | `survey-run` | 序盤の全体調査を1回行う。観測は`run`と同じで、調査用のcollector（`score-probe`など）を有効にしていればそれも動かす |
 | `run` | 標準collectorでベンチを実行する。同じ構成の再測定には`--repeat "<理由>"`が要る |
 | `rescore` | adapterが判定を保留した（pending）runを、保存済みのベンチ出力から`[benchmark] rescore_command`で確定する |
 | `analyze` | PASSしたrunへ仮説の判定と分析を記録する |
 | `change decide` / `change list` / `change show` | 変更単位の採否を記録・検索する（deployやmergeは行わない） |
-| `list` | 保存済みrunを新しい順にJSONで一覧表示する |
+| `list` | 保存済みrunを新しい順にJSONで一覧表示する。各行の`config_key`（測った構成の短縮hash）、`repeat_reason`、`identity`で、同じ構成を測ったrunが分かる |
+| `variance` | 同じ`config_key`を測ったPASSのrunから、scoreの揺れ（相対標準偏差をまとめたもの）を、各runの開始時点で分かっていた値で出す。`--run`でそのrunと同じ構成のscore、`--json`で機械向け |
 | `brief` | score、異常、benchmark値、主要性能sectionだけの小さいJSONを出力する |
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる。`--base`で2 runを比べる |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
@@ -148,10 +150,11 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 
 `list`、`brief`、`series`、`query`、`sql`、`states`、`change`は機械処理しやすいJSONを返します（`schema_version`は2。表を`columns`と`rows`で出す形になったときに上げました）。
 
-- runを指す値は、そのrunなら`run`、比較元なら`base`で、値は短縮IDです。完全なIDは`list`の`id`だけに出します。
+- runを指す値は、そのrunなら`run`、比較元なら`base`で、値は短縮IDです。完全なIDはどの出力にも出さず、`sql`の`runs.id`で引きます。
 - 同じ形の行が並ぶ表（各出力の行、`brief`の各欄、`list`の`runs`、`change`の`changes`・`decisions`など）は、列名を`columns`に1回だけ置き、`rows`の各行を値の並びにします。0件でも`columns`と`rows`の形は変わりません。
 - 表は`total_count`（切る前の件数）と`truncated`を必ず持ちます。
 - 全行で同じ値（node・source・window・label、比較では行を識別する値）は、出力の`common`へ1回だけ出します。
+- `list`は空の欄（`note`、`tags`）と既定の`mode`（`run`）を省き、`hypothesis`は冒頭120文字だけを出します。
 - 区間は`window`（`whole`・`initialize`・`load`）という名前で出します。`series`の実際の時刻とbucketは`range`です。
 - 比較は、比較元を`_base`、今回を接尾辞なし、差を`_delta`と`_delta_percent`で書きます。briefのスコアの比較も同じです。
 - キーは「対象_統計_単位」（例: `cpu_busy_max_percent`、`cpu_max_cores`、`p95_ms`）です。単位の無い値（件数・接続数・load）は「対象_統計」（例: `load1_max`、`connections_in_use_avg`）、時間あたりの値は`_per_second`で終えます。統計は`avg`・`max`・`min`・`p95`・`total`、メモリはMiBです。
@@ -168,20 +171,19 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 
 `brief`は`--limit`で各欄の件数を抑えます。それでも全体が約12KBを超えるときは、順位の表をすべて同じ行数まで減らして`warnings`で伝えます（nodeごとの表`hosts`・`clients`・`database_memory`は減らしません）。件数で切った欄には、残りを見るコマンドを`more`に添えます（切っていない欄には付きません）。
 
-- `hosts`：**nodeごとに1行**で、全nodeの状況を最初の1画面で見切るためのものです。CPUの平均とピーク、最も詰まっていたコア、iowait・stealの平均、PSI、load、memory、disk、上位のservice（CPU・RSS・thread数のピークと、ベンチの間の再起動回数）を並べます。`window`は要約した区間で、initializeの終わりが分かるrunは`load`、分からなければ`whole`です。
-- `quiet_hosts`：CPU・コア・iowait・PSI・diskがどれも低かったnodeが2台以上あれば、名前と最大値だけをここへまとめます（負荷を振り分ける余地として読みます）。
+- `hosts`：**nodeごとに1行**で、全nodeの状況を最初の1画面で見切るためのものです。CPUの平均とピーク、最も詰まっていたコア、iowait・stealの平均、PSI、load、memory、disk、上位のservice（CPU・RSS・thread数のピークと、ベンチの間の再起動回数）を並べます。負荷の低いnodeもまとめずに全行を出します。`window`は要約した区間で、initializeの終わりが分かるrunは`load`、分からなければ`whole`です。
 - `clients`：ベンチ側の接続の使い方をnodeごとに1行で出します（[ベンチ側の接続](#ベンチ側の接続)）。`window`は`hosts`と同じです。
 - `http`・`database`：判断に使う主要な列（回数・合計・平均・p95、HTTPはエラー数、DBはlockと1回あたりの検査行数）だけを出し、分位・最大・行数などの残りは`query`で見ます。`database`は負荷区間の行だけで順位を付け、その区間を`window`に出します（initializeの一括投入が上位を占めないように）。
 - `cpu`：perfのsymbol別の割合です。idle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。
 - `upstreams`：接続先ごとの要求数・再試行・p95です（[upstream](#upstream)）。
-- `limits`：当たった（または80%以上まで使った）接続・fdの上限を、上げる設定の名前（`setting`）と根拠（`evidence`）で示します。根拠は、error logの決まった文言（Too many open files、worker_connections are not enough、Too many connections、upstreamの切断など）、listen overflowの数、接続あたりのrequest数が`keepalive_requests`に達したこと、MySQLとnginxの接続数のピークです。上限値はベンチの前に`limits` collectorが読みます（somaxconn、nginxのworker_connections・keepalive_requests・worker数、unitの`LimitNOFILE`、MySQLの`max_connections`）。何も無ければ空です。
+- `limits`：ベンチの前に`limits` collectorが読んだ接続・fdの上限値を、nodeと読んだ設定のkey（`config_key`：`net.core.somaxconn`、nginxの`worker_connections`・`worker_rlimit_nofile`・`keepalive_requests`、unitの`LimitNOFILE`と`service`、MySQLの`max_connections`）ごとに`value`で並べ、同じ上限を数える観測値があればベンチ中のピーク（`peak`と`peak_metric`：接続あたりのrequest数、MySQLの接続数）を隣に置きます。`evidence`は上限に当たったときにだけ出る決まった文言のlog行（Too many open files／EMFILE、worker_connections are not enough、Too many connections、possible SYN flooding）の数と例、listen overflowの数です。上限に近いかどうかの判定はしません。upstreamの切断やconnection refusedのような一般的な接続エラーは上限を示さないので`logs`だけに出ます。`evidence`のある行が先に並びます。上限値も観測も無ければ空です。
 - `logs`：ベンチの間にアプリ・nginxのerror log・kernelが出したエラーを、数字を含む語を`<N>`にした型ごとに数えた多い順です。briefには件数と最初の1行だけを出します（型は`query --metric log.error_lines`）。
 - `database_io`：MySQLがfileの読み書きと、fsyncなどそれ以外の操作（`misc_wait_ms`、fsyncだけの時間ではない）で待った時間の長い順です。`database_memory`はbuffer poolとtableの大きさです。どちらもベンチの前後の差なのでinitializeを含みます。
 - `states`：アプリの状態ログから、状態にいた時間の合計が長い順です（[アプリの状態ログ](#アプリの状態ログ)）。
 - `transitions`：行動遷移です（[行動遷移](#行動遷移)）。
 - `score_inputs`：`score-probe`が読んだ得点の源です（[得点が何でできているかを確定する](#得点が何でできているかを確定する)）。
 - `benchmark`・`benchmark_messages`：parserが出したbenchmark metricと、FAILの理由・エラーの実例です。
-- `coverage_issues`・`artifact_issues`：完了しなかったcollectorと、生成できなかったprofileです。
+- `coverage_issues`・`artifact_issues`：失敗・欠け・一部だけのcollectorを`status`ごとにnodeをまとめて並べ（失敗が先）、生成できなかったprofileも並べます。nodeに道具が無いなどで取れなかった`unavailable`のcollectorは、数（`coverage_notes_hidden`）と、それを並べるSQL（`coverage_notes_more`）だけを出します。
 - `review`：分析・変更の本文を冒頭だけにし、全文を読む命令を`full_text`に添えます。
 - `next`：比較元があるrunで、HTTPとDBの`query --base`を出します。読むだけのコマンドに限り、どの表を見るべきかのような推測は出しません。briefは並行して作業する別の人も読むので、`analyze`は出しません（runを走らせた本人へは`run`の終了時に出ます）。
 
@@ -233,7 +235,7 @@ isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metri
 .isuscope/data/
 ├── isuscope.sqlite3      # 検索用の索引
 ├── changes/              # 変更と採否の記録（Gitへ含める）
-├── latest/               # 直近runのlogを展開したもの
+├── latest/               # 直近に終わったrun: run.json、run-dir（runのdirectory）、logs.json（各logの圧縮fileのpath）、logs/（flame graphのSVGとoff-CPUのfolded stackだけ展開）
 └── runs/
     ├── <run-id>/
     │   ├── run.json
@@ -268,16 +270,20 @@ isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metri
 - `identity_command`：配ったものを識別する値をstdoutへ出します。JSON objectならfieldごとに比べ、`run`の終了時に`identity`行へ並べます。
 - `cleanup_command`：isuscopeがベンチを止めたとき（下の期限、出力の途絶え、signal）に動きます。別nodeのbenchmarkerを止める処理はここにまとめます。
 
-**同じ構成は理由なしに測り直しません。** before collectorの後で、ベンチを実際に始めた直前のrun（prepareで止まったrunや、ここで止めたrunは含めない）と、次を比べます。
+**同じ構成は理由なしに測り直しません。** before collectorの後で、ベンチを実際に始めた直前のrun（prepareで止まったrun、isuscopeが止めたrun、中断したrunは含めない）と、次を比べます。
 
 - 配ったもの（`identity_command`の出力。無ければsourceの状態）
 - nodeのfingerprint
-- 計測の設定（`config.toml`、`routes.toml`、`[tooling] include`のfile、isuscopeの版）
+- 計測の設定（`config.toml`、`routes.toml`、`[include] config`と`[tooling] include`のfile、isuscopeの版）
 - runの種類
 
-違いが1つも無ければベンチを始めずにFAILとして残すので、deployし忘れや編集の失敗に、ベンチ1回分の時間を使いません。ばらつきの確認や観測の追加で同じ構成を測るときは`--repeat "<理由>"`を付けます。比べた結果は`run.json`の`repeat`（比較元、違った項目、理由）に残り、`run`の終了時に`changed`行（違った項目）か`repeat`行（理由）で出ます。片方にしか無いfingerprintは「同じ」とは扱いません。nodeのfingerprintは`/usr/local/lib/isuscope/fingerprint.sh`が出し、比べたいfile・directoryは`/usr/local/lib/isuscope/fingerprint-paths`へ1行ずつ書きます。
+違いが1つも無ければベンチを始めず、runも保存せずに終了コード1で終わるので、deployし忘れや編集の失敗に、ベンチ1回分の時間を使わず、`list`にもFAILが残りません。before collectorが無ければ、`prepare_command`より前に判断します。ばらつきの確認や観測の追加で同じ構成を測るときは`--repeat "<理由>"`を付けます。比べた結果は`run.json`の`repeat`（比較元、違った項目、理由）に残り、`run`の終了時に`changed`行（違った項目）か`repeat`行（理由）で出ます。片方にしか無いfingerprintは「同じ」とは扱いません。nodeのfingerprintは`/usr/local/lib/isuscope/fingerprint.sh`が出し、比べたいfile・directoryは`/usr/local/lib/isuscope/fingerprint-paths`へ1行ずつ書きます。
+
+比べるものをまとめたhashは`runs.config_key`（`list`では先頭12桁）に入り、同じ`config_key`のrunどうしが、`--repeat`なしでは測り直しを止められる組です。比較元と理由は`runs.repeat_base_run_id`・`runs.repeat_reason`、`identity_command`のfieldは`run_identity`表、ベンチを実際に始めたかは`runs.benchmark_started`で`sql`から読めます。同じ構成のscoreの揺れは`variance`で見ます。
 
 **期限。** どちらも既定では無く、書いたときだけ効きます。`timeout_seconds`はベンチ全体の期限で、adapterへ`ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS`として渡します。adapterがその秒数で自分から止めて結果を出せるよう、isuscope自身が止めるのはさらに30秒後です。`idle_timeout_seconds`は、stdoutにもstderrにも何も出ない時間の上限です（initializeやpollの間に黙る時間より長くします）。isuscopeが止めたrunは`benchmark.stopped_by`に`timeout`・`idle`・`interrupted`のどれかが残り、`run`の終了時に`stopped`行で出ます。手元のsshを止めても別nodeのbenchmarkerが止まるとは限らないので、adapterはそのnode側でも止まるようにし（例：`timeout -k 10 "$ISUSCOPE_BENCHMARK_TIMEOUT_SECONDS" ./bench`）、`cleanup_command`でも止めます。
+
+**中断。** Ctrl-C（SIGINT・SIGTERM）を1回受けると、待っているhook・collector・ベンチを止め、後片付け（`cleanup_command`とafter collector）を済ませてrunを`aborted`で保存します。後片付けの途中でもう1回受けると、動いている子processを止めて直ちに終了し（終了コード130）、runは次の`run`が`aborted`として回収します。
 
 **initializeの境界。** まずベンチの出力（`initialize_start_marker`・`initialize_finish_marker`の文言か、`isuscope.event`の行）が届いた時刻から取ります。取れなかったrunでは、ベンチの直後に`phase = "boundary"`のcollectorが動きます。雛形の`initialize-boundary`は、`routes.toml`の`[initialize]`（`method`と、query stringを除いて完全一致する`path`）に一致する要求のうち、ベンチの間で最後に応答を返し終えた時刻（access logの`$msec`）を負荷の始まりにします。どこから取ったかは`benchmark.initialize_source`（`benchmark_output`か`access_log`）に残り、`run`の終了時に`initialize`行で出ます。境界の無いrunは、hosts・clients・databaseがinitializeを含むベンチ全体の要約になるので、`brief`の`warnings`で伝えます。
 
@@ -384,15 +390,17 @@ slow logを有効にした場合は、`mysql-log-delta`がベンチ中の差分�
 - localのcollectorは、nodeから持ち帰った成果物を読むため最後にまとめて実行します。
 - 各段階（`collectors_before`、`benchmark`、`collectors_during_stop`、`collectors_after`、`benchmark_parsers`など）の開始時刻と所要時間は`run.json`の`stages`に、collectorとparserごとの値は各結果の`started_at`・`duration_ms`に残り、`run`の終了時に`timing`の行へまとめて出します。
 
-practice-12ではベンチ後の後処理が中央値106秒（ベンチ本体は92秒）かかっており、その大半はnodeごとのSSHを1本ずつ待っていた時間でした。
-
-転送量も抑えます。access logとslow logは生のまま運ばず、node上で`isuscope-node`・slpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。practice-12ではaccess logの差分が1 runで76万行・272 MBあり、これを毎回転送して手元で解析し直していました。生のlogは、行動遷移と後からの掘り直しのために`nginx-log-raw`・`mysql-log-raw`が毎回持ち帰りますが、nodeの`zstd -1 -T0`で約20分の1にしてから送ります。手元は受け取ったzstdをそのまま保存し、圧縮し直しません。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では作りません（`enabled = true`で作る）。
+転送量も抑えます。access logとslow logは生のまま運ばず、node上で`isuscope-node`・slpが集計した結果（1 nodeあたり数十KB）だけを持ち帰ります。生のlogは、行動遷移と後からの掘り直しのために`nginx-log-raw`・`mysql-log-raw`が毎回持ち帰りますが、nodeの`zstd -1 -T0`で約20分の1にしてから送ります。手元は受け取ったzstdをそのまま保存し、圧縮し直しません。perf.dataは`perf-series`の1回の`perf script`でrun全体と5秒ごとのsymbol別の割合を作ります（perf reportを重ねて走らせません）。perf flame graphはperf.dataを読み直す2つ目のpassになるため、既定では作りません（`enabled = true`で作る）。
 
 ### disk
 
-`[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow log・状態ログの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
+`[disk]`で、全nodeの空き容量を`doctor`と各ベンチの開始前に`df -Pk`で調べます。既定は`paths = ["/", "/var/log", "/tmp"]`、`node_warn_free_mb = 4096`（警告）、`node_min_free_mb = 1024`（`doctor`は失敗、`run`はベンチを開始しない。0で無効）です。手元の`data_dir`のfilesystemは`local_warn_free_mb = 1024`を下回ると`doctor`が警告します。`[doctor] max_clock_skew_seconds = 2`は、nodeの時計と手元の時計の差がこれを超えると`doctor`が警告する値です（nodeごとのsampleは時刻で突き合わせるため）。警告にはどの設定の値かを添えます。ログはベンチごとに増え、node側のdiskが尽きるとdeployやDBが先に壊れるためです。雛形のaccess log・slow log・状態ログの`*-log-mark` collectorは、前回までの差分を回収済みのログが1 GiBを超えていれば、ベンチ開始前に空にします（nginx・mysqldは追記モードで書くため、以後の行は先頭から入ります）。
 
 ## 運用の設定
+
+`[include] config = [".isuscope/policy.toml"]`で、projectの設定を生成した`config.toml`とは別の追跡されるfileに置けます。pathはprojectのrootから、`config.toml`の後に書いた順に重ねます。tableはkeyごとに重なり、値と配列（`[[collectors]]`を含む）は後のfileのものに置き換わります。含めたfileが無ければ設定の読み込みで止まり、含めたfileがさらに`[include]`を持つことはできません。重ねたfileはrunの`tooling/include/`へ写し、`config_sha256`にも入るので、同じ構成の判定と比較の前提（`observation`）に反映されます。
+
+`--project <dir>`（または環境変数`ISUSCOPE_PROJECT`）で、設定を探し始めるdirectoryを今のdirectory以外にできます。git worktreeなど別のdirectoryから、cdせずにprojectのrunを読むためのもので、`list`・`brief`・`query`・`series`・`sql`・`states`・`variance`・`doctor`・`routes`・`change list`・`change show`で使えます。ベンチ・分析・採否など書き込むcommandは、指したprojectが今のdirectoryのprojectと同じときだけ実行し、違えば止まります。
 
 `[lock] path`を指定すると、`run`と`survey-run`はベンチ全体でそのlockを持ちます。after collectorが終わってnodeへの操作が無くなった時点で手放すので、runが手元で保存している間に次のdeployを始められます。deployなど他の変更系操作も`isuscope lock --path <同じpath> -- <command>`で実行すれば、ベンチと重なりません。lockはdirectoryの中の`lock` fileを`flock`で握るもので、kernelが所有processの終了時に外すため、落ちたprocessのlockは残りません。`owner`は誰が握っているかの説明だけで、生きた所有者がいれば終了code 75で止まります。lock fileは消さずに残ります。
 

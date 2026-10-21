@@ -59,8 +59,8 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
 
     let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
     let summary = &list["runs"]["rows"][0];
-    let id = summary["id"].as_str().unwrap();
-    assert_eq!(summary["run"], &id[id.len() - 8..]);
+    assert!(summary.get("id").is_none(), "{summary}");
+    let id = full_run_id(&config_dir.join("runs"), summary["run"].as_str().unwrap());
     assert_eq!(
         summary["failure_reason"],
         "validation: GET /user/0/home expected(403) != actual(401)"
@@ -205,7 +205,10 @@ command = ["true"]
     );
 
     let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
-    let id = list["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
+    let id = full_run_id(
+        &config_dir.join("runs"),
+        list["runs"]["rows"][0]["run"].as_str().unwrap(),
+    );
     let saved = Command::new("zstd")
         .args(["-dc", "--"])
         .arg(

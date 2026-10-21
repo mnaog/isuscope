@@ -18,12 +18,16 @@ pub struct DoctorReport {
     pub passed: usize,
     pub warnings: Vec<String>,
     pub failures: Vec<String>,
+    /// 通った検査も1行ずつ出す。既定では警告と失敗だけを出し、通った数は最後に数で出す。
+    verbose: bool,
 }
 
 impl DoctorReport {
     fn pass(&mut self, message: impl AsRef<str>) {
         self.passed += 1;
-        println!("✓ {}", message.as_ref());
+        if self.verbose {
+            println!("✓ {}", message.as_ref());
+        }
     }
 
     fn warn(&mut self, message: impl Into<String>) {
@@ -43,9 +47,15 @@ impl DoctorReport {
     }
 }
 
-pub async fn run(config: &LoadedConfig) -> Result<DoctorReport> {
-    let mut report = DoctorReport::default();
+pub async fn run(config: &LoadedConfig, verbose: bool) -> Result<DoctorReport> {
+    let mut report = DoctorReport {
+        verbose,
+        ..Default::default()
+    };
     report.pass(format!("config {}", config.config_path.display()));
+    for include in &config.include_paths {
+        report.pass(format!("config include {}", include.display()));
+    }
     check_data_dir(config, &mut report);
     check_agent_context(config, &mut report);
     check_tooling(config, &mut report).await;
@@ -126,10 +136,13 @@ fn check_data_dir(config: &LoadedConfig, report: &mut DoctorReport) {
     }
     #[cfg(unix)]
     match free_bytes(&config.data_dir) {
-        Ok(bytes) if bytes < 1024 * 1024 * 1024 => report.warn(format!(
-            "data filesystem has only {:.1} MiB free",
-            bytes as f64 / 1024.0 / 1024.0
-        )),
+        Ok(bytes) if bytes < config.config.disk.local_warn_free_mb * 1024 * 1024 => {
+            report.warn(format!(
+                "data filesystem has {:.1} MiB free (below [disk] local_warn_free_mb = {})",
+                bytes as f64 / 1024.0 / 1024.0,
+                config.config.disk.local_warn_free_mb
+            ))
+        }
         Ok(bytes) => report.pass(format!(
             "data filesystem free space: {:.1} GiB",
             bytes as f64 / 1024.0 / 1024.0 / 1024.0
@@ -315,9 +328,12 @@ async fn check_nodes(config: &LoadedConfig, report: &mut DoctorReport) {
                     .parse::<i64>();
                 match remote {
                     Ok(remote) => {
-                        let skew = (Utc::now().timestamp() - remote).abs();
-                        if skew > 2 {
-                            report.warn(format!("SSH {target}: clock differs by {skew}s"));
+                        let skew = (Utc::now().timestamp() - remote).unsigned_abs();
+                        let max = config.config.doctor.max_clock_skew_seconds;
+                        if skew > max {
+                            report.warn(format!(
+                                "SSH {target}: clock differs by {skew}s (over [doctor] max_clock_skew_seconds = {max})"
+                            ));
                         } else {
                             report.pass(format!("SSH {target}: connected, clock skew {skew}s"));
                         }
@@ -353,13 +369,13 @@ async fn check_node_disks(config: &LoadedConfig, report: &mut DoctorReport) {
                 node_disk::describe(mount)
             )),
             Some((mount, DiskLevel::Low)) => report.warn(format!(
-                "disk {}: {} (below {} MiB); rotate or truncate logs before it fills",
+                "disk {}: {} (below [disk] node_warn_free_mb = {})",
                 node.target,
                 node_disk::describe(mount),
                 disk.node_warn_free_mb
             )),
             Some((mount, DiskLevel::TooLow)) => report.fail(format!(
-                "disk {}: {} (below {} MiB); `run` will refuse to start",
+                "disk {}: {} (below [disk] node_min_free_mb = {}); `run` refuses to start",
                 node.target,
                 node_disk::describe(mount),
                 disk.node_min_free_mb
@@ -776,12 +792,13 @@ fn check_latest_routes(config: &LoadedConfig, report: &mut DoctorReport) {
     let Ok(Some(id)) = store.resolve_id("latest") else {
         return;
     };
+    let short = crate::runner::short_id(&id);
     match crate::project_tools::suggest_routes(config, &id) {
-        Ok((_, 0)) => report.pass(format!("routes: no dynamic segments left in run {id}")),
+        Ok((_, 0)) => report.pass(format!("routes: no dynamic segments left in run {short}")),
         Ok((_, rules)) => report.warn(format!(
-            "routes: run {id} still has {rules} route pattern(s) with dynamic segments; review `isuscope routes suggest latest`"
+            "routes: run {short} has {rules} route pattern(s) with dynamic segments; candidates: `isuscope routes suggest {short}`"
         )),
-        Err(error) => report.warn(format!("routes: cannot inspect run {id}: {error:#}")),
+        Err(error) => report.warn(format!("routes: cannot inspect run {short}: {error:#}")),
     }
 }
 

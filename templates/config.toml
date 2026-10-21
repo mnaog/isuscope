@@ -3,6 +3,12 @@
 # 実環境に合わせて編集する箇所はSETUP.mdに従ってください。
 data_dir = "@@DATA_DIR@@"
 
+# projectで変える設定は、このfileを書き換えずに別のfileへ置けます。`config`のfileはprojectの
+# rootからのpathで、このfileの後に順に重ねます。tableはkeyごとに重なり、値と配列（`[[collectors]]`を
+# 含む）は後のfileのものに置き換わります。重ねたfileもrunの設定のhashと写しに入ります。
+# [include]
+# config = [".isuscope/policy.toml"]
+
 [source]
 repo = "."
 # 計測データ自身をsource snapshotへ再帰的に含めない。
@@ -33,7 +39,7 @@ stream_output = false
 # initialize_start_marker = "当日のbenchmarkerがinitialize開始時に出す文言"
 # initialize_finish_marker = "当日のbenchmarkerがinitialize完了時に出す文言"
 
-# benchmarkerが運営向けにだけ出す行（ISUCON12は`[ADMIN] ...`）。ここに書いた正規表現に
+# benchmarkerが運営向けにだけ出す行（例: `[ADMIN] ...`で始まる行）。ここに書いた正規表現に
 # 一致する行は保存前に捨てるため、logにもmetricにもparserにも残りません。ルール側の情報を
 # 判断に使わないための設定です。当日のbenchmarkerの出力を見て決めます。
 # operator_line_pattern = "^\\[ADMIN\\]"
@@ -89,10 +95,9 @@ command = ["sh", "-c", "test -x /usr/local/lib/isuscope/fingerprint.sh || exit 7
 timeout_seconds = 15
 unavailable_exit_codes = [75]
 
-# ベンチの前の上限値。briefの`limits`が、当たった証拠（logの型やlisten overflow）と並べて、
-# どの設定を上げればよいかを名前で出すのに使います。読むだけで、何も変えません。
-# practice-14では、fd 1024・listen backlog 511・worker_connections 4096・keepalive_requests 1000に
-# 順に当たり、そのたびにどの上限かを手で探しました。
+# ベンチの前の上限値。briefの`limits`が、読んだ設定のkeyと値を、同じ上限についてベンチ中に
+# 観測した値（接続数のピーク、上限に当たったときのlogの文言、listen overflow）と並べます。
+# 読むだけで、何も変えません。
 [[collectors]]
 name = "limits"
 phase = "before"
@@ -828,7 +833,7 @@ transport = "local"
 command = ["isuscope", "__transition", "--run-dir", "{run_dir}", "--prefix", "nginx-log-raw-", "--rules", ".isuscope/routes.toml"]
 timeout_seconds = 30
 
-# 得点が「リクエスト数×重み」で決まらない問題（ISUCON13のtip合計など）では、得点の源に
+# 得点が「リクエスト数×重み」で決まらない問題（DB上の金額の合計などが得点になる問題）では、得点の源に
 # なっている値を自分のシステムから読みます。ベンチ側には触れません。負荷走行で何が増えるかを
 # 特定するための調査なので、survey-runのときだけ動かします。
 # 値は`score.`で始まるmetricとして出すと、briefの`score_inputs`に並びます。
@@ -844,8 +849,8 @@ timeout_seconds = 30
 # command -v sudo >/dev/null 2>&1 || exit 75
 # # 当日の問題に合わせて、得点の源になりそうな値を数える。複数行を出してよい。
 # sudo -n mysql -N -B isucon -e '
-#   SELECT "score.tip_total", IFNULL(SUM(tip), 0) FROM livecomments;
-#   SELECT "score.completed_rides", COUNT(*) FROM rides WHERE status = "COMPLETED";
+#   SELECT "score.<name>", IFNULL(SUM(<column>), 0) FROM <table>;
+#   SELECT "score.<name>", COUNT(*) FROM <table> WHERE <condition>;
 # ' 2>/dev/null |
 # while read -r name value; do
 #   printf '{"type":"metric","name":"%s","value":%s,"unit":"points"}\n' "$name" "$value"
@@ -1140,12 +1145,12 @@ unavailable_exit_codes = [75]
 
 # performance_schemaのstatement digestで、SQLの回数・時間・lock・検査行数をinitializeと負荷の区間に分けます。
 # slow log（long_query_time=0）は全文を書くのでベンチ中のDBの負荷になり、ベンチの後のslpの集計も
-# 1回で数十秒かかります（practice-14の序盤では後処理37.7秒のうち27秒）。ここでは、ベンチの前にdigest表を
+# 文の数に比例して時間がかかります。ここでは、ベンチの前にdigest表を
 # 空にし、ベンチの間は1秒ごとに累積値をnodeの一時fileへ写し、ベンチの後に区間ごとの差を出します。
 # 出力はslpと同じ形なので、briefとqueryのdatabase viewはそのまま使えます（両方あればこちらを使います）。
 # p95・p99・最大は、ベンチ全体（initializeを含む）の分布です。
 # server側のprepared statement（Rustのsqlxなどがbinary protocolで実行する文）はdigest表に入らない
-# （practice-12-sixthでは、アプリの文がdigest表に1つも無かった）。そこで`prepared_statements_instances`も
+# （アプリの文がすべてそうなら、digest表にアプリの文が1つも無い）。そこで`prepared_statements_instances`も
 # SQL文ごとにまとめて同じように写し、`ps:`で始まる識別子で並べます。分位は無く、最大だけです。
 [[collectors]]
 name = "mysql-digest-start"
@@ -1181,7 +1186,7 @@ trap 'exit 0' HUP INT TERM
 # 累積値だけを写す（digestの数だけの行）。区間への振り分けはベンチの後に行う。
 # stdoutへ書かないので、sshが切れてもSIGPIPEで止まらない（非ttyのsshではHUPも来ない）。
 # 書いた写しが消えたら（after collectorか中断時のcleanupが消した）runは終わっているので止まる
-# （practice-14-forthで、止まらないsamplerが1nodeに20本残り、CPUの約4割を使った）。
+# （止まらないsamplerはrunのたびにnodeへ残り、CPUを使い続ける）。
 # 読む間に消えた写しを書き足して作り直さないよう、書く直前に確かめる。
 written=
 while :; do

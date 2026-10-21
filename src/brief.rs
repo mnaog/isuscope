@@ -23,14 +23,19 @@ pub struct BriefOutput {
     pub summary: BriefRun,
     pub review: Option<BriefReview>,
     pub coverage_issues: BriefSection<CoverageIssueGroup>,
+    /// 取れなかったが失敗ではないcollector（`unavailable`：nodeに道具が無いなど）の数。`coverage_issues`には出さない。
     pub coverage_notes_hidden: usize,
+    /// `coverage_notes_hidden`の行を読むコマンド。0件なら付かない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_notes_more: Option<String>,
     pub benchmark: BriefSection<MetricQueryRow>,
     /// Values read from the system under test to work out what the score is made of.
     /// Collected in `survey-run`, where that question is settled.
     pub score_inputs: BriefSection<MetricQueryRow>,
     /// Parser-kept benchmark output lines: why it failed and what the errors were.
     pub benchmark_messages: BriefBenchmarkMessages,
-    /// 当たった、または近づいた接続・fdの上限を、設定の名前と証拠で示す。何も無ければ空。
+    /// ベンチ前に読んだ接続・fdの上限値（設定のkeyと値）と、同じ上限について観測した値（ピーク、
+    /// 上限に当たったことを示すlogの決まった文言、listen overflow）。上限値も観測も無ければ空。
     pub limits: BriefSection<BriefLimit>,
     /// ベンチの間にアプリ（`service_units`）・nginxのerror log・kernelが出したエラーの型。多い順。
     pub logs: BriefSection<BriefLogPattern>,
@@ -48,12 +53,10 @@ pub struct BriefOutput {
     /// idle taskが待機していた時間（`swapper`の`native_safe_halt`など）は除いて順位を付けます。
     /// `sample_percent`は除く前の全sampleに対する割合のままです。
     pub cpu: BriefSection<CpuSummary>,
-    /// 1 node 1行。詳細は`query --scope series --window load`で掘ります。
-    /// 遊んでいたnodeは`quiet_hosts`へまとめ、ここには出しません。`window`は要約した区間で、
-    /// initializeの終わりが分かるrunは`load`、分からないrunは`whole`（initializeを含む）。
+    /// 1 node 1行で、全nodeを出します。詳細は`query --scope series --window load`で掘ります。
+    /// `window`は要約した区間で、initializeの終わりが分かるrunは`load`、分からないrunは`whole`
+    /// （initializeを含む）。
     pub hosts: BriefSection<BriefHostNode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quiet_hosts: Option<BriefQuietHosts>,
     /// ベンチ側の接続の使い方。access logに`$connection`と`$msec`があるとき、1 node 1行。
     /// `window`は`hosts`と同じ区間。
     pub clients: BriefSection<BriefClientNode>,
@@ -115,20 +118,6 @@ pub struct BriefHostNode {
     /// CPUを多く使っていたserviceの上位。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub top_services: Vec<BriefService>,
-}
-
-/// どの値も閾値を下回っていたnode。負荷を振り分ける余地として、名前とその中の最大値だけ残す。
-#[derive(Debug, Serialize)]
-pub struct BriefQuietHosts {
-    pub nodes: Vec<String>,
-    pub cpu_busy_max_percent: f64,
-    pub busiest_core_max_percent: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub iowait_avg_percent: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pressure_max_percent: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_util_max_percent: Option<f64>,
 }
 
 /// 遷移1件と、その順序がどこまで確かか。順序の値は遷移helperが記録したrunだけに付く。
@@ -199,6 +188,9 @@ pub struct BriefAnalysis {
 pub struct BriefComparison {
     /// 比較元runの短縮ID。
     pub base: String,
+    /// 比較元をどこから取ったか。`analysis`は最新の分析の`--base`、`previous_run`は分析に比較元が
+    /// 無いときの、このrunの直前に始まって終わった（ベンチを始めた）run。
+    pub base_source: &'static str,
     pub score_base: Option<i64>,
     pub score: Option<i64>,
     pub score_delta: Option<i64>,
@@ -253,6 +245,7 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
     });
     let comparison = review.comparison.map(|comparison| BriefComparison {
         base: short(&comparison.base_run_id),
+        base_source: "analysis",
         score_base: comparison.score.base,
         score: comparison.score.candidate,
         score_delta: comparison.score.delta,
@@ -305,6 +298,81 @@ pub fn review(review: crate::changes::RunReview) -> BriefReview {
         comparison,
         changes: section(changes, REVIEW_CHANGES),
     }
+}
+
+/// `run`より前に始まったrunのうち、終わっていてベンチを始めた最も新しいもの。`prepare_command`で
+/// 止まったrunや、同じ構成として断ったrunは比較元にしない。briefと`analyze`の既定の比較元。
+pub fn previous_run(
+    store: &crate::storage::Store,
+    run: &RunManifest,
+) -> anyhow::Result<Option<RunManifest>> {
+    let mut statement = store.connection.prepare(
+        "SELECT id FROM runs WHERE id != ?1 AND state != 'running'
+           AND started_at < (SELECT started_at FROM runs WHERE id = ?1)
+         ORDER BY started_at DESC LIMIT 200",
+    )?;
+    let ids = statement
+        .query_map([&run.id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let Ok(manifest) = store.load(&id) else {
+            continue;
+        };
+        if manifest.benchmark.mode != "not-started" && manifest.benchmark.started_at.is_some() {
+            return Ok(Some(manifest));
+        }
+    }
+    Ok(None)
+}
+
+/// 分析に比較元が無いrunでも、直前のrun（[`previous_run`]）とのscoreの差と比較の前提を出す。
+/// 比較の前提は分析の比較元と同じ方法で求める（比較元だけを差し替えた写しを`run_review`へ渡す）。
+pub fn attach_previous_comparison(
+    brief: &mut BriefOutput,
+    store: &crate::storage::Store,
+) -> anyhow::Result<()> {
+    if brief
+        .review
+        .as_ref()
+        .is_some_and(|review| review.comparison.is_some())
+    {
+        return Ok(());
+    }
+    let run = store.load(&brief.summary.id)?;
+    let Some(base) = previous_run(store, &run)? else {
+        return Ok(());
+    };
+    let mut probe = run;
+    probe.analyses = vec![crate::model::RunAnalysis {
+        id: String::new(),
+        created_at: chrono::Utc::now(),
+        verdict: crate::model::AnalysisVerdict::Skipped,
+        body: String::new(),
+        base_run_id: Some(base.id),
+    }];
+    let Some(comparison) = store.run_review(&probe)?.comparison else {
+        return Ok(());
+    };
+    let comparison = BriefComparison {
+        base: crate::runner::short_id(&comparison.base_run_id).to_owned(),
+        base_source: "previous_run",
+        score_base: comparison.score.base,
+        score: comparison.score.candidate,
+        score_delta: comparison.score.delta,
+        score_delta_percent: comparison.score.delta_percent,
+        conditions: comparison.conditions,
+    };
+    match brief.review.as_mut() {
+        Some(review) => review.comparison = Some(comparison),
+        None => {
+            brief.review = Some(BriefReview {
+                latest_analysis: None,
+                comparison: Some(comparison),
+                changes: section(Vec::new(), REVIEW_CHANGES),
+            })
+        }
+    }
+    Ok(())
 }
 
 fn excerpt(text: &str) -> (String, bool) {
@@ -369,6 +437,9 @@ pub struct BriefRun {
     /// Organizer-only benchmark lines dropped before saving, per `operator_line_pattern`.
     pub operator_lines_dropped: usize,
     pub metric_count: usize,
+    /// ベンチの始まりから終わりまでの秒数。logの行数を時間と並べるのに使い、出力には出さない。
+    #[serde(skip)]
+    pub benchmark_seconds: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -449,176 +520,138 @@ impl<T> BriefSection<T> {
     }
 }
 
-/// 当たった（または80%以上まで使った）上限。`setting`は上げる設定の名前、`evidence`はそう判断した観測。
+/// 接続・fdの上限1つ。`config_key`は値を読んだ設定のkey、`value`はベンチ前に読んだ値、`peak`は
+/// 同じ上限に数えられる観測値（`peak_metric`）のベンチ中の最大、`evidence`は上限に当たったときに
+/// 出る決まった文言のlog行とlisten overflowの数。読めなかった・観測の無い欄は付かない。
 #[derive(Debug, Serialize)]
 pub struct BriefLimit {
     pub node: String,
-    pub setting: String,
-    pub evidence: String,
+    pub config_key: String,
+    /// `LimitNOFILE`を読んだunit、またはfdの上限に当たったlogを出したsource。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_metric: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
-/// error logの文言と、それが示す上限。小文字で照合する。
-const LIMIT_SIGNATURES: &[(&[&str], &str)] = &[
+/// `limits` collectorが読む上限値のmetricと、その設定のkey。
+const LIMIT_KEYS: &[(&str, &str)] = &[
+    ("limit.somaxconn", "net.core.somaxconn"),
+    ("limit.nginx_worker_connections", "nginx worker_connections"),
     (
-        &["too many open files", "emfile"],
-        "file descriptors (LimitNOFILE of the unit, nginx worker_rlimit_nofile)",
+        "limit.nginx_worker_rlimit_nofile",
+        "nginx worker_rlimit_nofile",
     ),
+    ("limit.nginx_keepalive_requests", "nginx keepalive_requests"),
+    ("limit.mysql_max_connections", "MySQL max_connections"),
+    ("limit.service_nofile", "LimitNOFILE"),
+];
+
+/// 上限と同じものを数える観測値（ベンチ中のピークを並べる）。
+const LIMIT_PEAKS: &[(&str, &str)] = &[
+    ("client.connection_requests_max", "nginx keepalive_requests"),
+    ("mysql.threads_connected", "MySQL max_connections"),
+];
+
+/// 上限に当たったときにだけ出る、error logの決まった文言（小文字で照合する）と、その上限のkey。
+/// fdの上限（EMFILE）はlogのsourceで分ける：nginxなら`worker_rlimit_nofile`、ほかはそのunitの`LimitNOFILE`。
+/// 一般的な接続エラー（upstreamの切断、connection refusedなど）は上限を示さないので、ここでは扱わず`logs`に残す。
+const LIMIT_SIGNATURES: &[(&[&str], &str)] = &[
+    (&["too many open files", "emfile"], "LimitNOFILE"),
     (
         &["worker_connections are not enough"],
         "nginx worker_connections",
     ),
     (&["too many connections"], "MySQL max_connections"),
-    (
-        &["possible syn flooding"],
-        "listen backlog (nginx listen backlog=, net.core.somaxconn)",
-    ),
-    (
-        &["cannot assign requested address"],
-        "ephemeral ports (net.ipv4.ip_local_port_range, net.ipv4.tcp_tw_reuse)",
-    ),
-    (
-        &[
-            "upstream prematurely closed",
-            "connection reset by peer) while reading response header from upstream",
-        ],
-        "upstream connections (keepalive to the app, or the app closed them)",
-    ),
-    (
-        &[
-            "no live upstreams",
-            "connection refused) while connecting to upstream",
-        ],
-        "upstream availability (the app was down or refused connections)",
-    ),
+    (&["possible syn flooding"], "net.core.somaxconn"),
 ];
-/// nginxの`keepalive_requests`の既定値（1.19.10から1000、それより前は100）。
-const NGINX_KEEPALIVE_REQUESTS_DEFAULTS: [f64; 2] = [1000.0, 100.0];
 
-/// `limit.`（ベンチ前の上限値）と、logの型・listen overflow・接続数から`limits`欄を作る。
-/// 当たった証拠のあるものと、上限の80%以上まで使ったものだけを出す。
+/// `limit.`（ベンチ前の上限値）と、同じ上限の観測（接続数のピーク、logの決まった文言、listen
+/// overflow）を、nodeと設定のkeyごとに1行へ並べる。上限に近いかどうかの判定はしない。
 pub fn attach_limits(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
-    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
-    let mut found = BTreeMap::<(String, String), String>::new();
-    let mut values = BTreeMap::<(String, String), f64>::new();
-    let mut peaks = BTreeMap::<(String, String), f64>::new();
+    type Key = LimitKey;
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned();
+    let mut rows = BTreeMap::<Key, BriefLimit>::new();
     let mut overflows = BTreeMap::<String, f64>::new();
-    let mut nofile = BTreeMap::<String, Vec<String>>::new();
-    let mut log_hits = BTreeMap::<(String, &str), (u64, String)>::new();
+    let mut log_hits = BTreeMap::<Key, (u64, String)>::new();
     for metric in metrics {
-        let node = label(metric, "node");
-        match metric.name.as_str() {
-            "limit.service_nofile" => nofile.entry(node).or_default().push(format!(
-                "{} {}",
-                label(metric, "service"),
-                metric.value
-            )),
-            name if name.starts_with("limit.") => {
-                values.insert((node, name.to_owned()), metric.value);
-            }
-            "host.tcp_listen_overflows" => *overflows.entry(node).or_default() += metric.value,
-            "host.tcp_established"
-            | "mysql.threads_connected"
-            | "client.connection_requests_max" => {
-                let peak = peaks.entry((node, metric.name.clone())).or_insert(0.0);
-                *peak = peak.max(metric.value);
-            }
-            "log.error_lines" => {
-                let text = format!("{} {}", label(metric, "pattern"), label(metric, "example"))
-                    .to_lowercase();
-                if let Some((_, setting)) = LIMIT_SIGNATURES
-                    .iter()
-                    .find(|(needles, _)| needles.iter().any(|needle| text.contains(needle)))
-                {
-                    let entry = log_hits
-                        .entry((node, setting))
-                        .or_insert((0, label(metric, "example")));
-                    entry.0 += metric.value as u64;
-                }
-            }
-            _ => {}
+        let node = label(metric, "node").unwrap_or_default();
+        if let Some((_, key)) = LIMIT_KEYS.iter().find(|(name, _)| *name == metric.name) {
+            let service = (metric.name == "limit.service_nofile")
+                .then(|| label(metric, "service"))
+                .flatten();
+            limit_row(&mut rows, (node, key, service)).value = Some(metric.value);
+        } else if let Some((name, key)) = LIMIT_PEAKS.iter().find(|(name, _)| *name == metric.name)
+        {
+            let row = limit_row(&mut rows, (node, key, None));
+            row.peak = Some(row.peak.unwrap_or(0.0).max(metric.value));
+            row.peak_metric = Some((*name).into());
+        } else if metric.name == "host.tcp_listen_overflows" {
+            *overflows.entry(node).or_default() += metric.value;
+        } else if metric.name == "log.error_lines" {
+            let example = label(metric, "example").unwrap_or_default();
+            let text = format!("{} {example}", label(metric, "pattern").unwrap_or_default())
+                .to_lowercase();
+            let Some((_, key)) = LIMIT_SIGNATURES
+                .iter()
+                .find(|(needles, _)| needles.iter().any(|needle| text.contains(needle)))
+            else {
+                continue;
+            };
+            let source = label(metric, "source");
+            let key: Key = match (*key, source.as_deref()) {
+                ("LimitNOFILE", Some("nginx-error")) => (node, "nginx worker_rlimit_nofile", None),
+                ("LimitNOFILE", _) => (node, "LimitNOFILE", source),
+                (key, _) => (node, key, None),
+            };
+            log_hits.entry(key).or_insert((0, example)).0 += metric.value as u64;
         }
     }
-    let value = |node: &str, name: &str| values.get(&(node.to_owned(), name.to_owned())).copied();
-    for (node, count) in &overflows {
-        if *count > 0.0 {
-            let somaxconn = value(node, "limit.somaxconn")
-                .map(|v| format!(" (somaxconn {v})"))
-                .unwrap_or_default();
-            found.insert(
-                (
-                    node.clone(),
-                    "listen backlog (nginx listen backlog=, net.core.somaxconn)".into(),
-                ),
-                format!("{count} TCP listen overflows during the run{somaxconn}"),
-            );
+    for (node, count) in overflows {
+        if count > 0.0 {
+            limit_row(&mut rows, (node, "net.core.somaxconn", None)).evidence =
+                Some(format!("{count} TCP listen overflows"));
         }
     }
-    for ((node, setting), (count, example)) in log_hits {
-        let mut evidence = format!(
+    for (key, (count, example)) in log_hits {
+        let row = limit_row(&mut rows, key);
+        let hits = format!(
             "{count} log lines: {}",
             crate::model::excerpt(&example, 120).0
         );
-        if setting.starts_with("file descriptors")
-            && let Some(limits) = nofile.get(&node)
-        {
-            evidence.push_str(&format!(" (LimitNOFILE: {})", limits.join(", ")));
-        }
-        found.entry((node, setting.to_owned())).or_insert(evidence);
+        row.evidence = Some(match row.evidence.take() {
+            Some(before) => format!("{before}; {hits}"),
+            None => hits,
+        });
     }
-    for ((node, name), peak) in &peaks {
-        match name.as_str() {
-            "client.connection_requests_max" => {
-                let configured = value(node, "limit.nginx_keepalive_requests");
-                let hit = match configured {
-                    Some(limit) => *peak >= limit,
-                    None => NGINX_KEEPALIVE_REQUESTS_DEFAULTS.contains(peak),
-                };
-                if hit {
-                    found.insert(
-                        (node.clone(), "nginx keepalive_requests".into()),
-                        format!(
-                            "a client connection served {peak} requests, the keepalive_requests limit{}; nginx then closes it, and a request sent at that moment fails",
-                            configured.map(|_| String::new()).unwrap_or_else(|| " (nginx default)".into())
-                        ),
-                    );
-                }
-            }
-            "mysql.threads_connected" => {
-                if let Some(max) = value(node, "limit.mysql_max_connections")
-                    && *peak >= max * 0.8
-                {
-                    found.insert(
-                        (node.clone(), "MySQL max_connections".into()),
-                        format!("{peak} of {max} connections in use at the peak"),
-                    );
-                }
-            }
-            "host.tcp_established" => {
-                if let (Some(connections), Some(workers)) = (
-                    value(node, "limit.nginx_worker_connections"),
-                    value(node, "limit.nginx_workers"),
-                ) && *peak >= connections * workers * 0.8
-                {
-                    found.insert(
-                        (node.clone(), "nginx worker_connections".into()),
-                        format!(
-                            "{peak} established TCP connections at the peak against {connections} × {workers} worker connections (client and upstream connections both count)"
-                        ),
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    let rows = found
-        .into_iter()
-        .map(|((node, setting), evidence)| BriefLimit {
-            node,
-            setting,
-            evidence,
-        })
-        .collect::<Vec<_>>();
-    brief.limits = section(rows, limit);
+    let mut rows = rows.into_values().collect::<Vec<_>>();
+    // 当たった証拠のある行を先に出す。briefの行数で切っても残るように。
+    rows.sort_by_key(|row| row.evidence.is_none());
+    let short = brief.run.clone();
+    brief.limits = section(rows, limit)
+        .more(|| format!("isuscope query {short} --metric-prefix limit. --limit 50"));
+}
+
+/// limitsの1行の鍵：node、設定のkey、unit。
+type LimitKey = (String, &'static str, Option<String>);
+
+fn limit_row(rows: &mut BTreeMap<LimitKey, BriefLimit>, key: LimitKey) -> &mut BriefLimit {
+    let (node, config_key, service) = key.clone();
+    rows.entry(key).or_insert_with(|| BriefLimit {
+        node,
+        config_key: config_key.into(),
+        service,
+        value: None,
+        peak: None,
+        peak_metric: None,
+        evidence: None,
+    })
 }
 
 /// logの1つの型（数字を含む語を`<N>`へ置き換えた行）。briefには型の最初の1行だけを出す。
@@ -749,7 +782,7 @@ pub struct BriefDatabaseMemory {
     pub tables_mib: f64,
 }
 
-/// journaldの`RateLimitBurst`の既定値。
+/// journaldの`RateLimitBurst`の既定値（`RateLimitIntervalSec`の既定30秒あたり、unitごと）。
 const JOURNAL_RATE_LIMIT_BURST: f64 = 10_000.0;
 
 /// `app-log-delta`と`mysql-io-delta`のmetric（`log.`・`db.file.`・`db.memory.`）から、
@@ -776,6 +809,8 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
             )),
             // journaldは1 unitあたり既定で30秒に10000行までしか残さない。捨てたことを知らせる
             // `Suppressed`の行は区間が明けて次の行が来たときに出るので、runの終わりには数えられない。
+            // 行数はrun全体の合計で30秒ごとには分からないので、比べずに事実だけを並べる。run全体で
+            // 10000行に届かなければ、どの30秒も届いていない。
             // ENAが上限を超えて捨てた・遅らせたpacket。0でなければ、そのnodeはCPU以外の上限に当たっている。
             "net.allowance_exceeded" if metric.value > 0.0 => brief.warnings.push(format!(
                 "network: {} on {node} {} increased by {} during the run (including initialize); the instance network allowance dropped or delayed packets",
@@ -784,8 +819,13 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
                 metric.value
             )),
             "log.lines" if metric.value >= JOURNAL_RATE_LIMIT_BURST && source != "nginx-error" => {
+                let seconds = brief
+                    .summary
+                    .benchmark_seconds
+                    .map(|seconds| format!(" in {seconds:.0}s"))
+                    .unwrap_or_default();
                 brief.warnings.push(format!(
-                    "logs: {source} on {node} wrote {} lines; journald keeps about {JOURNAL_RATE_LIMIT_BURST} lines per 30s per unit by default, so its error counts may be low",
+                    "logs: {source} on {node} wrote {} lines{seconds}; journald's default RateLimitBurst is {JOURNAL_RATE_LIMIT_BURST} lines per 30s per unit",
                     metric.value
                 ))
             }
@@ -853,7 +893,6 @@ pub fn attach_logs_and_database_io(brief: &mut BriefOutput, metrics: &[Metric], 
 
 #[derive(Debug, Serialize)]
 pub struct CoverageIssueGroup {
-    pub severity: &'static str,
     pub section: String,
     pub collector: String,
     pub phase: String,
@@ -890,7 +929,13 @@ pub fn build(
     .map(|micros| micros as f64 / 1_000_000.0)
     .filter(|seconds| *seconds > 0.0);
     let clients = client_nodes(&diagnostics.client, window_seconds);
-    let (hosts, quiet_hosts) = split_quiet_hosts(host_nodes(&diagnostics.host));
+    let benchmark_seconds = run
+        .benchmark
+        .started_at
+        .zip(run.benchmark.finished_at)
+        .map(|(start, end)| (end - start).num_milliseconds() as f64 / 1000.0)
+        .filter(|seconds| *seconds > 0.0);
+    let hosts = host_nodes(&diagnostics.host);
     let benchmark_messages = benchmark_messages(&run);
     let mut warnings = benchmark.warnings;
     if run.benchmark.mode != "not-started"
@@ -935,8 +980,14 @@ pub fn build(
             commit_hash: run.source.commit_hash,
             dirty: run.source.dirty,
             metric_count: run.metric_count,
+            benchmark_seconds,
         },
         coverage_issues: section(coverage_issues, limit).more(|| collector_failures(short)),
+        coverage_notes_more: (coverage_notes_hidden > 0).then(|| {
+            format!(
+                "isuscope sql \"SELECT name, node, phase, error FROM collector_runs WHERE run_id LIKE '%{short}' AND status = 'unavailable'\" --format tsv"
+            )
+        }),
         coverage_notes_hidden,
         benchmark: section(by_metric_then_magnitude(benchmark.rows), limit)
             .more(|| format!("isuscope query {short} --metric-prefix benchmark. --limit 20")),
@@ -966,7 +1017,6 @@ pub fn build(
         )
         .more(|| format!("isuscope query {short} --metric cpu.sample_percent --limit 20")),
         hosts: section(hosts, usize::MAX).window(Some(hosts_window.to_owned())),
-        quiet_hosts,
         clients: section(clients, usize::MAX).window(Some(hosts_window.to_owned())),
         upstreams: section(diagnostics.upstreams, limit)
             .more(|| format!("isuscope query {short} --metric-prefix http.upstream_ --limit 20")),
@@ -994,20 +1044,20 @@ pub fn build(
     }
 }
 
+/// 失敗・欠け・一部だけのcollectorを、同じ状態とmetricの欠けごとにnodeをまとめて返す。
+/// `unavailable`（nodeに道具が無いなど、collectorが自分で取れないと答えたもの）は数だけを返す。
 fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, usize) {
     type Key = (String, String, String, String, Vec<String>);
     let mut groups = BTreeMap::<Key, (Vec<String>, BTreeSet<String>)>::new();
-    let mut info_count = 0;
+    let mut unavailable = 0;
     for item in coverage {
-        let severity = match item.status.as_str() {
-            "failed" => "critical",
-            "missing" | "partial" => "warning",
+        match item.status.as_str() {
+            "failed" | "missing" | "partial" => {}
             _ if item.missing_metrics.is_empty() => continue,
-            _ => "info",
-        };
-        if severity == "info" {
-            info_count += 1;
-            continue;
+            _ => {
+                unavailable += 1;
+                continue;
+            }
         }
         let (nodes, errors) = groups
             .entry((
@@ -1028,11 +1078,6 @@ fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, 
                 nodes.sort();
                 nodes.dedup();
                 CoverageIssueGroup {
-                    severity: if status == "failed" {
-                        "critical"
-                    } else {
-                        "warning"
-                    },
                     section,
                     collector,
                     phase,
@@ -1045,21 +1090,14 @@ fn coverage_issues(coverage: Vec<CoverageSummary>) -> (Vec<CoverageIssueGroup>, 
             },
         )
         .collect::<Vec<_>>();
+    // 失敗したcollectorを先に並べる（errorを持つのはそれだけ）。
     issues.sort_by(|a, b| {
-        severity_rank(a.severity)
-            .cmp(&severity_rank(b.severity))
+        (a.status != "failed")
+            .cmp(&(b.status != "failed"))
             .then_with(|| a.section.cmp(&b.section))
             .then_with(|| a.collector.cmp(&b.collector))
     });
-    (issues, info_count)
-}
-
-fn severity_rank(value: &str) -> u8 {
-    match value {
-        "critical" => 0,
-        "warning" => 1,
-        _ => 2,
-    }
+    (issues, unavailable)
 }
 
 /// DBの行を1つのsource・1つの区間へ絞る。区間ごとに集計されていれば負荷区間だけを使い、
@@ -1287,47 +1325,6 @@ fn is_idle(row: &CpuSummary) -> bool {
     row.process.starts_with("swapper") && IDLE_SYMBOLS.contains(&row.symbol.as_str())
 }
 
-/// どの値も閾値を下回るnodeを1つにまとめる。実データで遊んでいたnodeはCPUのピークが15%未満、
-/// ディスク7%未満、iowait 0.1%未満で、詰まっていたnodeとは桁が違う。CPU全体とコアのピークは必須で、
-/// 欠けたnodeは遊んでいたとは言えないので、まとめずにそのまま出す。iowait・PSI・diskは環境によって
-/// 取れないので、無ければ判定に使わない（collectorの失敗は`coverage_issues`に出る）。
-/// 1台だけならまとめても短くならない。
-fn split_quiet_hosts(nodes: Vec<BriefHostNode>) -> (Vec<BriefHostNode>, Option<BriefQuietHosts>) {
-    let quiet = |node: &BriefHostNode| {
-        node.cpu_busy_max_percent.is_some_and(|value| value < 25.0)
-            && node
-                .busiest_core_max_percent
-                .is_some_and(|value| value < 30.0)
-            && node.iowait_avg_percent.is_none_or(|value| value < 5.0)
-            && node
-                .pressure
-                .as_ref()
-                .is_none_or(|pressure| pressure.max_percent < 10.0)
-            && node.disk_util_max_percent.is_none_or(|value| value < 20.0)
-    };
-    let (quiet, busy): (Vec<_>, Vec<_>) = nodes.into_iter().partition(quiet);
-    if quiet.len() < 2 {
-        let mut nodes = busy;
-        nodes.extend(quiet);
-        nodes.sort_by(|a, b| a.node.cmp(&b.node));
-        return (nodes, None);
-    }
-    let max = |values: &mut dyn Iterator<Item = Option<f64>>| values.flatten().reduce(f64::max);
-    let summary = BriefQuietHosts {
-        cpu_busy_max_percent: max(&mut quiet.iter().map(|node| node.cpu_busy_max_percent))
-            .unwrap_or_default(),
-        busiest_core_max_percent: max(&mut quiet.iter().map(|node| node.busiest_core_max_percent))
-            .unwrap_or_default(),
-        iowait_avg_percent: max(&mut quiet.iter().map(|node| node.iowait_avg_percent)),
-        pressure_max_percent: max(&mut quiet
-            .iter()
-            .map(|node| node.pressure.as_ref().map(|pressure| pressure.max_percent))),
-        disk_util_max_percent: max(&mut quiet.iter().map(|node| node.disk_util_max_percent)),
-        nodes: quiet.into_iter().map(|node| node.node).collect(),
-    };
-    (busy, Some(summary))
-}
-
 /// briefが要約したDBの区間を`query`でも選ぶ。区間を持たない古いrunでは付けない。
 fn window_flag(window: Option<&str>) -> String {
     window
@@ -1394,25 +1391,6 @@ mod tests {
         .unwrap()
     }
 
-    fn host(node: &str, busy: f64, core: f64, disk: f64) -> BriefHostNode {
-        BriefHostNode {
-            node: node.into(),
-            cpu_busy_avg_percent: Some(busy / 2.0),
-            cpu_busy_max_percent: Some(busy),
-            busiest_core_max_percent: Some(core),
-            iowait_avg_percent: Some(0.1),
-            steal_avg_percent: None,
-            pressure: Some(BriefPressure {
-                resource: "io".into(),
-                max_percent: 2.0,
-            }),
-            load1_max: None,
-            memory_used_max_mib: None,
-            disk_util_max_percent: Some(disk),
-            top_services: Vec::new(),
-        }
-    }
-
     #[test]
     fn idle_samples_do_not_take_the_cpu_ranking() {
         let row = |process: &str, symbol: &str| CpuSummary {
@@ -1424,34 +1402,6 @@ mod tests {
         // idle taskの中でも割り込み処理は仕事なので順位に残す。
         assert!(!is_idle(&row("swapper", "__softirqentry_text_start")));
         assert!(!is_idle(&row("mysqld", "native_safe_halt")));
-    }
-
-    #[test]
-    fn quiet_nodes_are_folded_and_nodes_with_missing_values_are_kept() {
-        let mut unknown = host("app5", 3.0, 3.0, 1.0);
-        unknown.busiest_core_max_percent = None;
-        let (hosts, quiet) = split_quiet_hosts(vec![
-            host("app1", 60.0, 72.0, 100.0),
-            host("app2", 5.5, 5.8, 2.8),
-            host("app3", 14.4, 15.7, 6.4),
-            unknown,
-        ]);
-        let names = hosts
-            .iter()
-            .map(|host| host.node.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, ["app1", "app5"]);
-        let quiet = quiet.unwrap();
-        assert_eq!(quiet.nodes, ["app2", "app3"]);
-        assert_eq!(quiet.cpu_busy_max_percent, 14.4);
-        assert_eq!(quiet.disk_util_max_percent, Some(6.4));
-        // 遊んでいたnodeが1台だけなら、まとめずにそのまま出す。
-        let (hosts, quiet) = split_quiet_hosts(vec![
-            host("app2", 5.0, 5.0, 2.0),
-            host("app1", 60.0, 72.0, 100.0),
-        ]);
-        assert!(quiet.is_none());
-        assert_eq!(hosts[0].node, "app1");
     }
 
     fn review_with(reason: &str, body: &str) -> crate::changes::RunReview {
@@ -1659,7 +1609,7 @@ mod tests {
         let long = "受取履歴の旧単発SELECTは995回・合計373401.675ms。".repeat(20);
         brief.review = Some(review(review_with(&long, &long)));
         assert!(brief.cpu.items.iter().all(|row| row.process != "swapper"));
-        assert_eq!(brief.hosts.items.len(), 1);
+        assert_eq!(brief.hosts.items.len(), 5);
         let size = serde_json::to_vec(&brief).unwrap().len();
         assert!(size <= 12_000, "brief is {size} bytes");
     }
@@ -1819,13 +1769,12 @@ mod tests {
             error: Some(error.into()),
         }]);
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].severity, "warning");
         assert_eq!(issues[0].status, "partial");
         assert_eq!(issues[0].errors, [error]);
     }
 
     #[test]
-    fn coverage_issues_group_nodes_and_hide_info_rows() {
+    fn coverage_issues_group_nodes_and_count_unavailable_collectors() {
         let coverage = ["app2", "app3"]
             .into_iter()
             .map(|node| CoverageSummary {
@@ -1847,11 +1796,11 @@ mod tests {
                 error: None,
             }))
             .collect();
-        let (issues, info_count) = coverage_issues(coverage);
+        let (issues, unavailable) = coverage_issues(coverage);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].nodes, ["app2", "app3"]);
         assert_eq!(issues[0].occurrences, 2);
-        assert_eq!(info_count, 1);
+        assert_eq!(unavailable, 1);
     }
 
     #[test]
@@ -1932,8 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn limits_name_the_setting_behind_each_observed_limit() {
-        // practice-14のSSE化で順に当たった上限と、80%まで使った接続数。
+    fn limits_set_each_configured_value_beside_what_was_observed() {
         let diagnostics = crate::report::diagnose(
             test_run(),
             Vec::new(),
@@ -1965,7 +1913,7 @@ mod tests {
                 .map(|(key, value)| ((*key).into(), (*value).into()))
                 .collect(),
         };
-        let mut brief = build(diagnostics, empty(), empty(), 10);
+        let mut brief = build(diagnostics, empty(), empty(), 20);
         attach_limits(
             &mut brief,
             &[
@@ -1988,49 +1936,78 @@ mod tests {
                 metric("app1", "host.tcp_listen_overflows", 211.0, &[]),
                 metric("app1", "limit.somaxconn", 4096.0, &[]),
                 metric("app1", "client.connection_requests_max", 1000.0, &[]),
+                metric("app1", "client.connection_requests_max", 640.0, &[]),
                 metric("app1", "limit.nginx_worker_connections", 4096.0, &[]),
-                metric("app1", "limit.nginx_workers", 2.0, &[]),
-                metric("app1", "host.tcp_established", 7000.0, &[]),
                 metric("app2", "mysql.threads_connected", 140.0, &[]),
                 metric("app2", "limit.mysql_max_connections", 151.0, &[]),
-                // Below 80% and an ordinary error: nothing to report.
-                metric("app2", "host.tcp_established", 100.0, &[]),
-                metric("app2", "limit.nginx_worker_connections", 4096.0, &[]),
-                metric("app2", "limit.nginx_workers", 2.0, &[]),
+                // Generic connection errors do not name a limit; they stay in `logs`.
                 metric(
                     "app2",
                     "log.error_lines",
                     5.0,
-                    &[("example", "invalid ride id")],
+                    &[(
+                        "example",
+                        "upstream prematurely closed connection while reading response header from upstream",
+                    )],
                 ),
-                metric("app2", "client.connection_requests_max", 640.0, &[]),
+                metric(
+                    "app2",
+                    "log.error_lines",
+                    3.0,
+                    &[
+                        ("source", "nginx-error"),
+                        ("example", "accept4() failed (24: Too many open files)"),
+                    ],
+                ),
             ],
-            10,
+            20,
         );
-        let rows = brief
-            .limits
-            .items
-            .iter()
-            .map(|row| {
-                (
-                    row.node.as_str(),
-                    row.setting.as_str(),
-                    row.evidence.as_str(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let find = |node: &str, setting: &str| {
-            rows.iter()
-                .find(|(n, s, _)| *n == node && s.starts_with(setting))
-                .map(|(_, _, evidence)| *evidence)
-                .unwrap_or_else(|| panic!("no {setting} on {node}: {rows:?}"))
+        let rows = serde_json::to_value(&brief.limits.items).unwrap();
+        let find = |node: &str, key: &str| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["node"] == node && row["config_key"] == key)
+                .unwrap_or_else(|| panic!("no {key} on {node}: {rows}"))
+                .clone()
         };
-        assert!(find("app3", "file descriptors").contains("isuride-rust.service 1024"));
-        assert!(find("app1", "listen backlog").starts_with("511 TCP listen overflows"));
-        assert!(find("app1", "nginx keepalive_requests").contains("1000"));
-        assert!(find("app1", "nginx worker_connections").contains("7000"));
-        assert!(find("app2", "MySQL max_connections").contains("140 of 151"));
-        assert_eq!(rows.len(), 5, "{rows:?}");
+        let nofile = find("app3", "LimitNOFILE");
+        assert_eq!(nofile["service"], "isuride-rust.service");
+        assert_eq!(nofile["value"], 1024.0);
+        assert!(
+            nofile["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("37 log lines: accept error")
+        );
+        let backlog = find("app1", "net.core.somaxconn");
+        assert_eq!(backlog["value"], 4096.0);
+        assert_eq!(backlog["evidence"], "511 TCP listen overflows");
+        // nginxで設定されていないkeepalive_requestsは値を付けず、観測のピークだけを並べる。
+        let keepalive = find("app1", "nginx keepalive_requests");
+        assert!(keepalive.get("value").is_none());
+        assert_eq!(keepalive["peak"], 1000.0);
+        assert_eq!(keepalive["peak_metric"], "client.connection_requests_max");
+        // 値だけの上限も並べる。ホスト全体のTCP接続数とは比べない。
+        let connections = find("app1", "nginx worker_connections");
+        assert_eq!(connections["value"], 4096.0);
+        assert!(connections.get("peak").is_none() && connections.get("evidence").is_none());
+        let mysql = find("app2", "MySQL max_connections");
+        assert_eq!(
+            (mysql["value"].clone(), mysql["peak"].clone()),
+            (151.0.into(), 140.0.into())
+        );
+        assert!(mysql.get("evidence").is_none());
+        let nginx_files = find("app2", "nginx worker_rlimit_nofile");
+        assert!(
+            nginx_files["evidence"]
+                .as_str()
+                .unwrap()
+                .starts_with("3 log lines")
+        );
+        assert_eq!(rows.as_array().unwrap().len(), 6, "{rows}");
+        // 当たった証拠のある行が先に並ぶ。
+        assert!(rows[0].get("evidence").is_some() && rows[3].get("evidence").is_none());
     }
 
     #[test]
@@ -2121,6 +2098,9 @@ mod tests {
         assert_eq!(brief.warnings.len(), 2, "{:?}", brief.warnings);
         let warned = |text: &str| brief.warnings.iter().any(|warning| warning.contains(text));
         assert!(warned("isu on app1 wrote 37500 lines"));
+        assert!(warned(
+            "default RateLimitBurst is 10000 lines per 30s per unit"
+        ));
         // 上限に当たったcounterだけを出す。
         assert!(warned(
             "bw_out_allowance_exceeded on app1 ens5 increased by 1234"
