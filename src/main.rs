@@ -19,8 +19,55 @@ use std::{env, path::PathBuf, process::ExitCode};
 #[derive(Parser)]
 #[command(name = "isuscope", version, about = "ISUCONのベンチ実行記録ツール")]
 struct Cli {
+    /// 設定（`.isuscope/config.toml`）を探し始めるdirectory。省略時は今のdirectory。別のdirectory
+    /// （git worktreeなど）から、cdせずにprojectの設定とデータを読むのに使います。ベンチ・分析など
+    /// 書き込むcommandは、今のdirectoryと同じprojectを指すときだけ受け付けます。
+    #[arg(long, global = true, env = "ISUSCOPE_PROJECT", value_name = "DIR")]
+    project: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// 今のdirectoryと別のprojectを`--project`で読んでよいcommand。runのデータと設定を読むだけのもの
+    /// （`states`と`sql`がrunごとに作る読み取り用のcacheを除き、何も書かない）。
+    fn reads_only(&self) -> bool {
+        matches!(
+            self.command,
+            Commands::List { .. }
+                | Commands::Brief { .. }
+                | Commands::Sql { .. }
+                | Commands::States { .. }
+                | Commands::Series { .. }
+                | Commands::Query { .. }
+                | Commands::Doctor { .. }
+                | Commands::Routes { .. }
+                | Commands::Change {
+                    command: ChangeCommand::List { .. } | ChangeCommand::Show { .. }
+                }
+        )
+    }
+
+    /// `--project`（`ISUSCOPE_PROJECT`）か今のdirectoryから設定を探す。書き込むcommandでは、
+    /// 指したprojectが今のdirectoryのprojectと違えば止める。
+    fn load_config(&self) -> Result<LoadedConfig> {
+        let current = env::current_dir().context("cannot determine current directory")?;
+        let Some(project) = &self.project else {
+            return LoadedConfig::discover(&current);
+        };
+        let selected = LoadedConfig::discover(&current.join(project))
+            .with_context(|| format!("--project {}", project.display()))?;
+        if !self.reads_only() {
+            let here = LoadedConfig::discover(&current).ok();
+            if here.map(|config| config.config_path) != Some(selected.config_path.clone()) {
+                bail!(
+                    "--project (ISUSCOPE_PROJECT) {} is only for commands that read; run this command from that project's directory",
+                    selected.project_root.display()
+                );
+            }
+        }
+        Ok(selected)
+    }
 }
 
 #[derive(Subcommand)]
@@ -487,7 +534,7 @@ impl From<VerdictArg> for AnalysisVerdict {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Commands::Lock { path, command } = &cli.command {
-        return match run_lock_command(path.as_deref(), command) {
+        return match run_lock_command(&cli, path.as_deref(), command) {
             Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             Err(error) => exit_for_error(error),
         };
@@ -521,15 +568,13 @@ fn exit_for_error(error: anyhow::Error) -> ExitCode {
     }
 }
 
-fn run_lock_command(path: Option<&std::path::Path>, command: &[String]) -> Result<i32> {
+fn run_lock_command(cli: &Cli, path: Option<&std::path::Path>, command: &[String]) -> Result<i32> {
     let path = match path {
         Some(path) => path.to_path_buf(),
-        None => {
-            let current = env::current_dir().context("cannot determine current directory")?;
-            LoadedConfig::discover(&current)?
-                .lock_path()
-                .context("isuscope lock needs --path or [lock] path in the config")?
-        }
+        None => cli
+            .load_config()?
+            .lock_path()
+            .context("isuscope lock needs --path or [lock] path in the config")?,
     };
     isuscope::lock::run_locked(&path, command)
 }
@@ -540,8 +585,7 @@ fn acquire_run_lock(cli: &Cli) -> Result<Option<isuscope::lock::OperationLock>> 
         Commands::SurveyRun { .. } => "isuscope survey-run",
         _ => return Ok(None),
     };
-    let current = env::current_dir().context("cannot determine current directory")?;
-    let Some(path) = LoadedConfig::discover(&current)?.lock_path() else {
+    let Some(path) = cli.load_config()?.lock_path() else {
         return Ok(None);
     };
     let lock = isuscope::lock::OperationLock::acquire(&path, operation)?;
@@ -634,7 +678,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         }
         return Ok(true);
     }
-    let config = LoadedConfig::discover(&current)?;
+    let config = cli.load_config()?;
     match cli.command {
         Commands::Init { .. } | Commands::Lock { .. } => unreachable!(),
         Commands::Routes {

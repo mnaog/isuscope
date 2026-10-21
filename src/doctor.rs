@@ -53,6 +53,9 @@ pub async fn run(config: &LoadedConfig, verbose: bool) -> Result<DoctorReport> {
         ..Default::default()
     };
     report.pass(format!("config {}", config.config_path.display()));
+    for include in &config.include_paths {
+        report.pass(format!("config include {}", include.display()));
+    }
     check_data_dir(config, &mut report);
     check_agent_context(config, &mut report);
     check_tooling(config, &mut report).await;

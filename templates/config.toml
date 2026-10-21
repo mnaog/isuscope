@@ -3,6 +3,12 @@
 # 実環境に合わせて編集する箇所はSETUP.mdに従ってください。
 data_dir = "@@DATA_DIR@@"
 
+# projectで変える設定は、このfileを書き換えずに別のfileへ置けます。`config`のfileはprojectの
+# rootからのpathで、このfileの後に順に重ねます。tableはkeyごとに重なり、値と配列（`[[collectors]]`を
+# 含む）は後のfileのものに置き換わります。重ねたfileもrunの設定のhashと写しに入ります。
+# [include]
+# config = [".isuscope/policy.toml"]
+
 [source]
 repo = "."
 # 計測データ自身をsource snapshotへ再帰的に含めない。
