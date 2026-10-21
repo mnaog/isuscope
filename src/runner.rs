@@ -38,11 +38,6 @@ pub async fn execute(
     shutdown: Shutdown,
     mut annotations: RunAnnotations,
 ) -> Result<RunOutcome> {
-    if mode == RunMode::ScoreRun {
-        bail!(
-            "score-run is no longer supported; remove observation settings and use `isuscope run`"
-        );
-    }
     if annotations.hypothesis.trim().is_empty() {
         bail!("hypothesis must not be empty");
     }

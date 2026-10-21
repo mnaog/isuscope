@@ -264,10 +264,6 @@ enum Commands {
         method_field: String,
         #[arg(long, default_value = "uri")]
         uri_field: String,
-        /// 旧`nginx-series` collectorの引数。route別の集計と時系列はnode上の`alp`へ移ったので、
-        /// 渡されたら設定の更新を求めて失敗する。
-        #[arg(long, hide = true)]
-        series_only: bool,
     },
     /// nodeの`isuscope-node`と同じ集計（`isuscope-node --build-id`と`access-summary`）。手元で差分を
     /// 集計し直すときと、templateのcollectorを試すときに使います。
@@ -576,16 +572,8 @@ async fn real_main(cli: Cli) -> Result<bool> {
         session_field,
         method_field,
         uri_field,
-        series_only,
     } = &cli.command
     {
-        if *series_only {
-            anyhow::bail!(
-                "the nginx-series collector was replaced by the node-side `alp` collector; \
-                 remove nginx-series from .isuscope/config.toml and take the alp, nginx-log-raw \
-                 and user-transition collectors from `isuscope init --print`"
-            );
-        }
         isuscope::transition::emit(isuscope::transition::TransitionOptions {
             run_dir,
             prefix,
