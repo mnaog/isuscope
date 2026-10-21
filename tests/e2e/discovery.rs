@@ -140,19 +140,20 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         assert!(!output.status.success(), "{removed:?} still exists");
     }
 
+    // latest/ points at the run instead of copying its logs; only profiles are expanded.
     let latest = config_dir.join("latest");
     assert!(latest.join("run.json").is_file());
-    assert!(latest.join("logs.json").is_file());
-    let readable_logs = fs::read_dir(latest.join("logs")).unwrap().count();
-    assert_eq!(readable_logs, 4);
+    let pointer = fs::read_to_string(latest.join("run-dir")).unwrap();
+    assert!(config_dir.join(pointer.trim()).join("run.json").is_file());
+    let logs: serde_json::Value =
+        serde_json::from_slice(&fs::read(latest.join("logs.json")).unwrap()).unwrap();
+    let logs = logs.as_array().unwrap();
+    assert_eq!(logs.len(), 4);
     assert!(
-        fs::read_dir(latest.join("logs")).unwrap().all(|entry| entry
-            .unwrap()
-            .path()
-            .extension()
-            .unwrap()
-            == "log")
+        logs.iter()
+            .all(|log| { config_dir.join(log["path"].as_str().unwrap()).is_file() })
     );
+    assert_eq!(fs::read_dir(latest.join("logs")).unwrap().count(), 0);
 
     let runs = config_dir.join("runs");
     let run_dir = fs::read_dir(&runs)
@@ -266,6 +267,21 @@ command = ["sh", "-c", "grep -q '\"started_at\":' '{run_dir}/run.json'; printf '
         manifest["tooling"]["config_sha256"].as_str().unwrap().len(),
         64
     );
+
+    // Rewriting the run's manifest (here by analyze) refreshes latest/run.json too.
+    let analyzed = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["analyze", "latest", "supported", "--analysis", "recorded"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        analyzed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&analyzed.stderr)
+    );
+    let latest_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(latest.join("run.json")).unwrap()).unwrap();
+    assert_eq!(latest_manifest["analysis_status"], "complete");
 
     drop(database);
     for suffix in ["", "-wal", "-shm"] {

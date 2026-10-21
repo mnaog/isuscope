@@ -1284,6 +1284,11 @@ pub fn fingerprint_key(
     Ok(serde_json::to_string(&(name, labels))?)
 }
 
+/// `latest/` points at the newest finished run without copying its logs: `run.json`, a
+/// `run-dir` file with the run directory relative to the data directory, and `logs.json`
+/// (each log with the `path` of its compressed file). Only the profile outputs (CPU flame graph
+/// SVG and off-CPU folded stacks) are expanded into `latest/logs/`, since they are opened as
+/// files; decompressing every log here held up the end of every run.
 fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) -> Result<()> {
     let temporary = data_dir.join(".latest.tmp");
     if temporary.exists() {
@@ -1292,26 +1297,27 @@ fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) 
     let logs_dir = temporary.join("logs");
     fs::create_dir_all(&logs_dir)?;
     fs::copy(run_dir.join("run.json"), temporary.join("run.json"))?;
+    fs::write(
+        temporary.join(LATEST_POINTER),
+        format!("{}\n", latest_pointer(&manifest.id)),
+    )?;
 
     for log in &manifest.logs {
+        let extension = match log.kind.as_str() {
+            kind if kind.contains("perf-flamegraph") && kind.ends_with(":stdout") => "svg",
+            kind if kind.contains("offcpu") && kind.ends_with(":stdout") => "folded",
+            _ => continue,
+        };
         let source = run_dir.join("logs").join(format!("{}.zst", log.id));
         if !source.is_file() {
             continue;
         }
         let input = fs::File::open(&source)?;
         let mut decoder = zstd::stream::read::Decoder::new(input)?;
-        let extension = match log.kind.as_str() {
-            kind if kind.contains("perf-flamegraph") && kind.ends_with(":stdout") => "svg",
-            kind if kind.contains("offcpu") && kind.ends_with(":stdout") => "folded",
-            _ => "log",
-        };
         let mut output = fs::File::create(logs_dir.join(format!("{}.{}", log.id, extension)))?;
         std::io::copy(&mut decoder, &mut output)?;
     }
-    fs::write(
-        temporary.join("logs.json"),
-        serde_json::to_vec_pretty(&manifest.logs)?,
-    )?;
+    fs::write(temporary.join("logs.json"), latest_logs_json(manifest)?)?;
 
     let latest = data_dir.join("latest");
     if latest.exists() {
@@ -1319,6 +1325,58 @@ fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) 
     }
     fs::rename(&temporary, &latest)?;
     Ok(())
+}
+
+const LATEST_POINTER: &str = "run-dir";
+
+fn latest_pointer(id: &str) -> String {
+    format!("runs/{id}")
+}
+
+fn latest_logs_json(manifest: &RunManifest) -> Result<Vec<u8>> {
+    let logs = manifest
+        .logs
+        .iter()
+        .map(|log| {
+            serde_json::json!({
+                "id": log.id,
+                "kind": log.kind,
+                "node": log.node,
+                "path": format!("{}/logs/{}.zst", latest_pointer(&manifest.id), log.id),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_vec_pretty(&logs)?)
+}
+
+/// After a finalized run's run.json was rewritten (analyze, rescore, enrich), refreshes
+/// `latest/run.json` and `latest/logs.json` when `latest/` points at that run. Best effort:
+/// the run directory stays the source of truth.
+fn refresh_latest_manifest(run_dir: &Path, manifest: &RunManifest) {
+    let Some(data_dir) = run_dir.parent().and_then(Path::parent) else {
+        return;
+    };
+    let latest = data_dir.join("latest");
+    let points_here = fs::read_to_string(latest.join(LATEST_POINTER))
+        .is_ok_and(|pointer| pointer.trim() == latest_pointer(&manifest.id))
+        && run_dir == data_dir.join(latest_pointer(&manifest.id));
+    if !points_here {
+        return;
+    }
+    let result = (|| -> Result<()> {
+        for (name, bytes) in [
+            ("run.json", fs::read(run_dir.join("run.json"))?),
+            ("logs.json", latest_logs_json(manifest)?),
+        ] {
+            let temporary = latest.join(format!("{name}.tmp"));
+            fs::write(&temporary, bytes)?;
+            fs::rename(&temporary, latest.join(name))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("! run was saved, but latest/ could not be refreshed: {error:#}");
+    }
 }
 
 fn write_structured_snapshot(
@@ -1471,6 +1529,7 @@ pub(crate) fn write_manifest(run_dir: &Path, manifest: &RunManifest) -> Result<(
     file.sync_all()?;
     fs::rename(temporary, path)?;
     fs::File::open(run_dir)?.sync_all()?;
+    refresh_latest_manifest(run_dir, manifest);
     Ok(())
 }
 

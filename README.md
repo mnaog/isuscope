@@ -179,6 +179,7 @@ collectorの定義はisuscopeが配る1つのfileが正本です。`isuscope ini
 ```text
 .isuscope/data/
 ├── isuscope.sqlite3
+├── latest/                   # 直近に終わったrun: run.json、run-dir（runのdirectory）、logs.json（各logの圧縮fileのpath）、logs/（flame graphのSVGとoff-CPUのfolded stackだけ展開）
 └── runs/
     ├── <run-id>/
     │   ├── run.json
