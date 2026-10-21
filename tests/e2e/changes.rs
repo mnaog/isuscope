@@ -41,10 +41,12 @@ fn decisions_are_independent_recoverable_and_concurrent() {
     fs::create_dir(p.join(".isuscope")).unwrap();
     config(p, 100);
     ok(p, &["run", "--hypothesis", "baseline"]);
-    let base = json(p, &["list"])["runs"]["rows"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let base = full_run_id(
+        &p.join(".isuscope/runs"),
+        json(p, &["list"])["runs"]["rows"][0]["run"]
+            .as_str()
+            .unwrap(),
+    );
     ok(
         p,
         &[
@@ -64,10 +66,12 @@ fn decisions_are_independent_recoverable_and_concurrent() {
             "remove long queries and improve score",
         ],
     );
-    let candidate = json(p, &["list"])["runs"]["rows"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let candidate = full_run_id(
+        &p.join(".isuscope/runs"),
+        json(p, &["list"])["runs"]["rows"][0]["run"]
+            .as_str()
+            .unwrap(),
+    );
     // A change is created by the analysis that first decides it.
     ok(
         p,
@@ -321,7 +325,7 @@ fn decisions_are_independent_recoverable_and_concurrent() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["id"] == candidate)
+            .find(|r| r["run"] == short(&candidate))
             .unwrap()["latest_analysis_verdict"],
         "inconclusive"
     );

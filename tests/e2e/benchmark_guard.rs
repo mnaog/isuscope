@@ -11,8 +11,9 @@ fn isuscope(project: &std::path::Path, args: &[&str]) -> std::process::Output {
 
 fn latest_manifest(project: &std::path::Path) -> serde_json::Value {
     let list: serde_json::Value = parsed(&isuscope(project, &["list"]).stdout).unwrap();
-    let id = list["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
-    parsed(&fs::read(project.join(".isuscope/runs").join(id).join("run.json")).unwrap()).unwrap()
+    let runs = project.join(".isuscope/runs");
+    let id = full_run_id(&runs, list["runs"]["rows"][0]["run"].as_str().unwrap());
+    parsed(&fs::read(runs.join(id).join("run.json")).unwrap()).unwrap()
 }
 
 /// A passing run must be analyzed before the next benchmark starts.

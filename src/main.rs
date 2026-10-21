@@ -88,6 +88,15 @@ enum Commands {
         #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
         limit: usize,
     },
+    /// 同じ構成（`config_key`）を測ったrunのscoreの揺れを、runごとに開始時点で分かっていた値で出します。
+    Variance {
+        /// このrunの行と、同じ構成を測ったrunのscoreだけを出します。
+        #[arg(long)]
+        run: Option<String>,
+        /// 機械向けJSONで出力します。
+        #[arg(long)]
+        json: bool,
+    },
     /// runの判断材料だけを小さい機械向けJSONで出力します。
     Brief {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
@@ -658,6 +667,10 @@ async fn real_main(cli: Cli) -> Result<bool> {
         }
         Commands::Brief { run, limit } => {
             show_brief(&config, &run, limit)?;
+            Ok(true)
+        }
+        Commands::Variance { run, json } => {
+            show_variance(&config, run.as_deref(), json)?;
             Ok(true)
         }
         Commands::Sql {
@@ -1984,6 +1997,58 @@ impl<T> Listed<T> {
             items,
         }
     }
+}
+
+fn show_variance(config: &LoadedConfig, run: Option<&str>, json: bool) -> Result<()> {
+    use isuscope::variance;
+    let store = Store::open(&config.data_dir)?;
+    let rows = variance::rows(&store)?;
+    let Some(requested) = run else {
+        if json {
+            return write_stdout_json(&serde_json::json!({
+                "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
+                "runs": rows,
+            }));
+        }
+        println!("{}", variance::header());
+        for row in &rows {
+            println!("{}", variance::describe(row));
+        }
+        return Ok(());
+    };
+    let id = store.require_id(requested, "run")?;
+    let row = rows
+        .iter()
+        .find(|row| row.id == id)
+        .with_context(|| format!("run {} has no score", runner::short_id(&id)))?;
+    let config_runs = variance::config_runs(&rows, row);
+    if json {
+        return write_stdout_json(&serde_json::json!({
+            "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
+            "run": row,
+            "config_runs": config_runs,
+        }));
+    }
+    println!("{}", variance::header());
+    println!("{}", variance::describe(row));
+    if !config_runs.is_empty() {
+        println!();
+        println!("same config_key");
+        for other in &config_runs {
+            println!(
+                "{}  {:>8}  {}{}",
+                other.run,
+                other.score,
+                match other.passed {
+                    Some(true) => "PASS",
+                    Some(false) => "FAIL",
+                    None => "-",
+                },
+                if other.repeat { "  repeat" } else { "" }
+            );
+        }
+    }
+    Ok(())
 }
 
 fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {

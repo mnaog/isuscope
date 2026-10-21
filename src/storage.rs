@@ -38,7 +38,8 @@ pub struct RunSummary {
     /// The form printed by `run` and accepted everywhere a run is named, as in every other output.
     #[serde(rename = "run")]
     pub short_id: String,
-    /// 完全なID。出力の中でこれを出すのは`list`だけ。
+    /// 完全なID。出力には出さない（`sql`の`runs.id`で読む）。
+    #[serde(skip)]
     pub id: String,
     /// JSTのミリ秒まで（[`crate::model::display_time`]）。
     pub started_at: String,
@@ -46,12 +47,27 @@ pub struct RunSummary {
     #[serde(serialize_with = "crate::model::serialize_short_commit")]
     pub commit_hash: Option<String>,
     pub dirty: bool,
+    /// Omitted for a plain `run`.
+    #[serde(skip_serializing_if = "is_plain_run")]
     pub mode: String,
     pub state: String,
     pub score: Option<i64>,
     pub passed: Option<bool>,
+    /// What the run measured ([`crate::repeat::config_key`], first 12 hex digits). Runs with
+    /// the same key measured the same configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_key: Option<String>,
+    /// `--repeat`: why the same configuration was measured again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_reason: Option<String>,
+    /// The fields `identity_command` reported.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub identity: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The start of the hypothesis, enough to tell runs apart; `brief` has the full text.
     pub hypothesis: String,
     pub analysis_status: String,
     pub latest_analysis_verdict: Option<String>,
@@ -59,6 +75,15 @@ pub struct RunSummary {
     /// First parser failure message of a run that did not pass.
     #[serde(rename = "failure_reason")]
     pub failure: Option<String>,
+}
+
+fn is_plain_run(mode: &str) -> bool {
+    mode == crate::model::RunMode::Run.as_str()
+}
+
+/// The first 12 hex digits of a config key, as shown by `list` and `variance`.
+pub fn short_config_key(key: &str) -> String {
+    key.chars().take(12).collect()
 }
 
 #[derive(Debug, Default)]
@@ -89,7 +114,7 @@ impl Store {
             // 同時に開いた別processと、schemaの作成・更新が交錯しないよう1つのtransactionにする。
             // IMMEDIATEなので、後から来た側はbusy timeoutの間だけ待つ。
             connection.execute_batch("BEGIN IMMEDIATE")?;
-            match migrate(&connection) {
+            match migrate(&connection, version) {
                 Ok(()) => connection.execute_batch("COMMIT")?,
                 Err(error) => {
                     let _ = connection.execute_batch("ROLLBACK");
@@ -303,6 +328,7 @@ impl Store {
             params![manifest.id, manifest_stamp(&final_dir.join("run.json"))],
         )?;
         persist_agent_context(&transaction, manifest)?;
+        persist_configuration(&transaction, manifest, &fingerprint_map(fingerprints)?)?;
         for log in &manifest.logs {
             transaction.execute(
                 "INSERT INTO logs (id, run_id, kind, node) VALUES (?1, ?2, ?3, ?4)",
@@ -383,7 +409,8 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT r.id, r.started_at, r.commit_hash, r.dirty, r.mode, r.state, r.score, r.passed, r.note, r.hypothesis, r.analysis_status,
                     (SELECT a.verdict FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1),
-                    (SELECT a.body FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1)
+                    (SELECT a.body FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1),
+                    r.config_key, r.repeat_reason
              FROM runs r ORDER BY r.started_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
@@ -398,9 +425,14 @@ impl Store {
                 state: row.get(5)?,
                 score: row.get(6)?,
                 passed: row.get(7)?,
+                config_key: row
+                    .get::<_, Option<String>>(13)?
+                    .map(|key| short_config_key(&key)),
+                repeat_reason: row.get(14)?,
+                identity: Default::default(),
                 note: row.get(8)?,
                 tags: Vec::new(),
-                hypothesis: row.get(9)?,
+                hypothesis: crate::model::excerpt(&row.get::<_, String>(9)?, 120).0,
                 analysis_status: row.get(10)?,
                 latest_analysis_verdict: row.get(11)?,
                 // runを見分けるための冒頭だけ。全文は`brief`の`full_text`から読む。
@@ -413,6 +445,7 @@ impl Store {
         let mut runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         for run in &mut runs {
             run.tags = self.tags(&run.id)?;
+            run.identity = self.identity(&run.id)?;
             // Failed runs need no analysis, so the benchmark's own reason is their only record.
             if run.passed != Some(true) && self.final_dir(&run.id).is_dir() {
                 run.failure = self
@@ -518,7 +551,7 @@ impl Store {
     /// idle) or that was interrupted is never the base.
     pub fn last_started_run(&self, exclude: &str) -> Result<Option<RunManifest>> {
         let mut statement = self.connection.prepare(
-            "SELECT id FROM runs WHERE id != ?1 AND state != 'running' ORDER BY started_at DESC LIMIT 200",
+            "SELECT id FROM runs WHERE id != ?1 AND benchmark_started=1 AND state NOT IN ('running', 'aborted') ORDER BY started_at DESC LIMIT 200",
         )?;
         let ids = statement
             .query_map([exclude], |row| row.get::<_, String>(0))?
@@ -633,6 +666,17 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The fields `identity_command` reported for a run (`run_identity`).
+    pub fn identity(&self, id: &str) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT key, value FROM run_identity WHERE run_id=?1 ORDER BY key")?;
+        statement
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
     }
 
     pub fn tags(&self, id: &str) -> Result<Vec<String>> {
@@ -1034,7 +1078,9 @@ impl Store {
             let stale = recorded.is_some();
             if indexed_state.is_some() && !unfinished && !stale {
                 // A durable manifest may be newer than SQLite after interruption.
+                let fingerprints = self.fingerprint_index(&manifest.id)?.unwrap_or_default();
                 let tx = self.connection.transaction()?;
+                persist_configuration(&tx, &manifest, &fingerprints)?;
                 for a in &manifest.analyses {
                     tx.execute("INSERT OR IGNORE INTO run_analyses (id,run_id,created_at,verdict,body,base_run_id) VALUES (?1,?2,?3,?4,?5,?6)",
                         params![a.id,manifest.id,a.created_at.to_rfc3339(),a.verdict.as_str(),a.body,a.base_run_id])?;
@@ -1178,6 +1224,7 @@ impl Store {
             )?;
         }
         persist_agent_context(&transaction, manifest)?;
+        persist_configuration(&transaction, manifest, &fingerprint_map(fingerprints)?)?;
         transaction.execute(
             "UPDATE runs SET manifest_stamp=?2 WHERE id=?1",
             params![manifest.id, stamp],
@@ -1471,7 +1518,7 @@ fn enable_wal(connection: &Connection) -> Result<()> {
     }
 }
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// run.jsonの大きさと更新時刻。indexの確定時に保存し、一致するrunは開くたびに読み直さない。
 fn manifest_stamp(path: &Path) -> Option<String> {
@@ -1484,7 +1531,7 @@ fn manifest_stamp(path: &Path) -> Option<String> {
     Some(format!("{}:{}", metadata.len(), modified.as_nanos()))
 }
 
-fn migrate(connection: &Connection) -> Result<()> {
+fn migrate(connection: &Connection, previous: u32) -> Result<()> {
     connection.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS runs (
@@ -1617,8 +1664,79 @@ fn migrate(connection: &Connection) -> Result<()> {
     // indexを確定したときのrun.jsonの大きさと更新時刻。行があるだけでは確定済みとは限らない
     // （runの行はbeginで作り、finishの途中で落ちるとrunningのまま残る）。
     ensure_column(connection, "runs", "manifest_stamp", "TEXT")?;
+    // What the run measured (`repeat::config_key`), how it relates to the repeat check, and
+    // whether its benchmark started, so tools need not read run.json for them.
+    ensure_column(connection, "runs", "config_key", "TEXT")?;
+    ensure_column(connection, "runs", "repeat_base_run_id", "TEXT")?;
+    ensure_column(connection, "runs", "repeat_reason", "TEXT")?;
+    ensure_column(
+        connection,
+        "runs",
+        "benchmark_started",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS run_identity (
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (run_id, key)
+        );
+        CREATE INDEX IF NOT EXISTS runs_config_key ON runs(config_key);
+        ",
+    )?;
+    if previous < 10 {
+        // Saved runs predate these columns: forget their stamps so the next open reads each
+        // run.json once and fills them (see `restore_missing_finalized_runs`).
+        connection.execute_batch("UPDATE runs SET manifest_stamp = NULL")?;
+    }
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
+}
+
+/// The `runs` columns and `run_identity` rows that describe what a run measured. Written
+/// whenever a finalized run is indexed; `fingerprints` are keyed like `fingerprint_index`.
+fn persist_configuration(
+    connection: &Connection,
+    manifest: &RunManifest,
+    fingerprints: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let repeat = manifest.repeat.as_ref();
+    connection.execute(
+        "UPDATE runs SET config_key=?2, repeat_base_run_id=?3, repeat_reason=?4, benchmark_started=?5 WHERE id=?1",
+        params![
+            manifest.id,
+            crate::repeat::config_key(manifest, fingerprints),
+            repeat.map(|check| check.base_run_id.as_str()),
+            repeat.and_then(|check| check.reason.as_deref()),
+            benchmark_started(manifest),
+        ],
+    )?;
+    connection.execute("DELETE FROM run_identity WHERE run_id=?1", [&manifest.id])?;
+    if let Some(identity) = &manifest.identity {
+        for (key, value) in &identity.values {
+            connection.execute(
+                "INSERT INTO run_identity (run_id, key, value) VALUES (?1, ?2, ?3)",
+                params![manifest.id, key, value],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn fingerprint_map(
+    fingerprints: &[Fingerprint],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    fingerprints
+        .iter()
+        .map(|fingerprint| {
+            Ok((
+                fingerprint_key(&fingerprint.name, &fingerprint.labels)?,
+                fingerprint.value.clone(),
+            ))
+        })
+        .collect()
 }
 
 fn persist_agent_context(connection: &Connection, manifest: &RunManifest) -> Result<()> {

@@ -109,6 +109,46 @@ pub fn compare(
     }
 }
 
+/// The configuration a run measured, as one SHA-256: exactly what [`compare`] compares (the run
+/// mode, the deployment identity or the source state standing in for it, the observation
+/// settings and the node fingerprints). Two runs with the same key are what `run` refuses as a
+/// repeat. `None` when the run has no comparable configuration ([`compare`] reports such a run
+/// as changed against anything).
+pub fn config_key(
+    manifest: &RunManifest,
+    fingerprints: &BTreeMap<String, String>,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let tooling = &manifest.tooling;
+    if tooling.config_sha256.is_empty() {
+        return None;
+    }
+    // With fields on both sides `compare` reads only the fields; otherwise the whole output.
+    let deployment = match &manifest.identity {
+        Some(identity) if !identity.values.is_empty() => {
+            serde_json::json!({ "identity.values": identity.values })
+        }
+        Some(identity) => serde_json::json!({ "identity.sha256": identity.sha256 }),
+        None if manifest.source.state_sha256.is_empty() => return None,
+        None => serde_json::json!({ "source": manifest.source.state_sha256 }),
+    };
+    let canonical = serde_json::json!({
+        "mode": manifest.mode.as_str(),
+        "deployment": deployment,
+        "observation": {
+            "isuscope_version": tooling.isuscope_version,
+            "config": tooling.config_sha256,
+            "routes": tooling.routes_sha256,
+            "files": tooling.extra_files_sha256,
+        },
+        "fingerprints": fingerprints,
+    });
+    Some(format!(
+        "{:x}",
+        Sha256::digest(canonical.to_string().as_bytes())
+    ))
+}
+
 /// `["name",{"node":"app1"}]`の鍵を`app1.name`と読める形にする。
 fn fingerprint_label(key: &str) -> String {
     match serde_json::from_str::<(String, BTreeMap<String, String>)>(key) {
@@ -203,5 +243,32 @@ mod tests {
         let current = manifest(Some("deploy 2\n"));
         let check = compare(&base, &BTreeMap::new(), &current, &BTreeMap::new(), None);
         assert_eq!(check.changed, ["identity"]);
+    }
+
+    #[test]
+    fn the_config_key_is_equal_exactly_when_nothing_is_reported_changed() {
+        let cases = [
+            (manifest(Some(r#"{"commit":"abc"}"#)), fingerprints("x")),
+            // Same fields, different output bytes.
+            (manifest(Some(r#"{ "commit": "abc" }"#)), fingerprints("x")),
+            (manifest(Some(r#"{"commit":"def"}"#)), fingerprints("x")),
+            (manifest(Some(r#"{"commit":"abc"}"#)), fingerprints("y")),
+            (manifest(Some("deploy 1\n")), fingerprints("x")),
+            (manifest(None), fingerprints("x")),
+            (manifest(None), BTreeMap::new()),
+        ];
+        for (base, base_fingerprints) in &cases {
+            for (current, current_fingerprints) in &cases {
+                let refused = compare(base, base_fingerprints, current, current_fingerprints, None)
+                    .changed
+                    .is_empty();
+                let same_key = config_key(base, base_fingerprints)
+                    == config_key(current, current_fingerprints);
+                assert_eq!(refused, same_key);
+            }
+        }
+        let mut unknown = manifest(None);
+        unknown.source.state_sha256.clear();
+        assert_eq!(config_key(&unknown, &BTreeMap::new()), None);
     }
 }
