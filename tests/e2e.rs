@@ -105,6 +105,8 @@ mod output_contract;
 mod parallel;
 #[path = "e2e/prepare_rescore.rs"]
 mod prepare_rescore;
+#[path = "e2e/project_config.rs"]
+mod project_config;
 #[path = "e2e/query.rs"]
 mod query;
 #[path = "e2e/score_inputs.rs"]

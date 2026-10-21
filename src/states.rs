@@ -591,6 +591,7 @@ CREATE INDEX state_events_object ON state_events (kind, id, t, seq);
 CREATE INDEX state_events_time ON state_events (t, seq);
 CREATE INDEX state_events_state ON state_events (kind, to_state, t);
 CREATE INDEX state_attrs_value ON state_attrs (key, value, kind, to_state, t);
+CREATE INDEX state_attrs_reverse ON state_attrs (value, t);
 CREATE INDEX state_stays_state ON state_stays (kind, state, entered_t);
 CREATE INDEX state_stays_object ON state_stays (kind, id, entered_t);
 "
@@ -920,6 +921,9 @@ pub fn parse_span(value: &str) -> Result<i64> {
 ///
 /// 関係する対象は、対象の行の`attrs`に値として現れるIDを持つ対象と、`attrs`の値に対象のIDを
 /// 持つ行。`around`があればその前後`span`、無ければ対象の最初の行の`span`前から最後の行の`span`後まで。
+/// `attrs`に対象のIDを持つ行は、区間の全行の`attrs`を開かず、`state_attrs (value, t)`の索引から引く
+/// （区間の全行を`json_each`で開くと、行の多いrunでは問い合わせの時間の上限に当たる）。
+/// [`SCHEMA`]が変わるとcacheは作り直されるので、前の版で作ったcacheにも索引が入る。
 pub const TIMELINE: &str = "
 WITH target AS (
   SELECT * FROM state_events WHERE kind = :kind AND id = :id
@@ -934,6 +938,10 @@ related_ids AS (
   FROM target, json_each(target.attrs) AS j
   WHERE target.attrs IS NOT NULL AND j.type IN ('text', 'integer')
 ),
+referring AS (
+  SELECT DISTINCT a.node, a.t, a.seq, a.kind, a.id FROM state_attrs AS a, bounds
+  WHERE :related AND a.value = :id AND a.t BETWEEN bounds.lo AND bounds.hi
+),
 picked AS (
   SELECT 'target' AS relation, target.* FROM target, bounds
   WHERE :around IS NULL OR target.t BETWEEN bounds.lo AND bounds.hi
@@ -942,8 +950,7 @@ picked AS (
   WHERE :related AND NOT (e.kind = :kind AND e.id = :id)
     AND e.t BETWEEN bounds.lo AND bounds.hi
     AND (e.id IN (SELECT id FROM related_ids)
-      OR (e.attrs IS NOT NULL AND EXISTS (
-        SELECT 1 FROM json_each(e.attrs) AS a WHERE CAST(a.value AS TEXT) = :id)))
+      OR (e.node, e.t, e.seq, e.kind, e.id) IN (SELECT node, t, seq, kind, id FROM referring))
 )
 SELECT relation, at, since_start_ms,
   (t - LAG(t) OVER (ORDER BY t, seq, node)) / 1000.0 AS gap_ms,
@@ -1021,6 +1028,83 @@ mod tests {
     fn event(t: i64, kind: &str, id: &str, from: Option<&str>, to: &str) -> String {
         serde_json::json!({"t": t, "seq": t, "kind": kind, "id": id, "from": from, "to": to})
             .to_string()
+    }
+
+    /// `--related`の逆引き（`attrs`に対象のIDを持つ行）は`state_attrs (value, t)`の索引から引き、
+    /// 区間の外の行や、IDを持たない行は混ぜない。
+    #[test]
+    fn related_rows_are_found_through_the_attrs_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let with = |t: i64, kind: &str, id: &str, to: &str, attrs: serde_json::Value| {
+            serde_json::json!({"t": t, "seq": t, "kind": kind, "id": id, "to": to, "attrs": attrs})
+                .to_string()
+        };
+        let lines = [
+            event(1_000, "chair", "c1", None, "IDLE"),
+            with(
+                2_000,
+                "ride",
+                "r1",
+                "MATCHED",
+                serde_json::json!({"chair": "c1"}),
+            ),
+            with(
+                2_500,
+                "ride",
+                "r2",
+                "MATCHED",
+                serde_json::json!({"chair": "c2"}),
+            ),
+            event(3_000, "chair", "c1", Some("IDLE"), "BUSY"),
+            // 対象の最後の行から`span`より後。
+            with(
+                90_000,
+                "ride",
+                "r3",
+                "MATCHED",
+                serde_json::json!({"chair": "c1"}),
+            ),
+        ];
+        let loaded = load(&[source(directory.path(), &lines)], None, None).unwrap();
+        let timeline = |statement: &str| {
+            let mut statement = loaded.connection.prepare(statement).unwrap();
+            statement
+                .query_map(
+                    rusqlite::named_params! {
+                        ":kind": "chair", ":id": "c1", ":around": None::<i64>,
+                        ":span": 10_000, ":related": true,
+                    },
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(6)?)),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let rows = timeline(TIMELINE);
+        assert_eq!(
+            rows,
+            [
+                ("target".to_owned(), "c1".to_owned()),
+                ("related".to_owned(), "r1".to_owned()),
+                ("target".to_owned(), "c1".to_owned()),
+            ]
+        );
+        let plan = loaded
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {TIMELINE}"))
+            .unwrap()
+            .query_map(
+                rusqlite::named_params! {
+                    ":kind": "chair", ":id": "c1", ":around": None::<i64>,
+                    ":span": 10_000, ":related": true,
+                },
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("state_attrs_reverse"), "{plan}");
     }
 
     /// 書き手が前の状態を知らない行（`from`が無い）。

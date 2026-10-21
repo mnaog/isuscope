@@ -67,10 +67,10 @@ pub async fn execute(
     let pending = store.pending_analyses()?;
     if let Some(run) = pending.first() {
         bail!(
-            "run {} is still awaiting analysis for hypothesis `{}`; run `isuscope analyze {}` before starting another benchmark",
+            "run {} (hypothesis `{}`) is still awaiting analysis; record it before starting another benchmark: {}",
             short_id(&run.id),
-            run.hypothesis,
-            short_id(&run.id),
+            crate::model::excerpt(&run.hypothesis, 120).0,
+            crate::model::analyze_template(short_id(&run.id)),
         );
     }
     if let Some(run) = store.pending_results()?.first() {
@@ -544,8 +544,8 @@ pub async fn execute(
     if manifest.analysis_status == AnalysisStatus::Pending {
         println!();
         println!(
-            "next      isuscope analyze {} <supported|rejected|inconclusive> --analysis <text>",
-            short_id(&id)
+            "next      {}",
+            crate::model::analyze_template(short_id(&id))
         );
     }
 

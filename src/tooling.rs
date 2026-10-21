@@ -5,7 +5,24 @@ use std::{collections::BTreeMap, fs, path::Component, path::Path};
 
 pub fn capture(config: &LoadedConfig, destination: &Path) -> Result<ToolingSnapshot> {
     fs::create_dir_all(destination)?;
-    let config_sha256 = copy_and_hash(&config.config_path, &destination.join("config.toml"))?;
+    let mut config_sha256 = copy_and_hash(&config.config_path, &destination.join("config.toml"))?;
+    // `[include] config`のfileも設定の一部なので、写しを残し、`config_sha256`へ含める。
+    // 含めるfileが無いprojectのhashは変わらない。
+    if !config.include_paths.is_empty() {
+        let mut combined = Sha256::new();
+        combined.update(config_sha256.as_bytes());
+        for (index, include) in config.include_paths.iter().enumerate() {
+            let name = include
+                .file_name()
+                .context("included configuration has no file name")?;
+            let target = destination
+                .join("include")
+                .join(format!("{index}-{}", name.to_string_lossy()));
+            fs::create_dir_all(destination.join("include"))?;
+            combined.update(copy_and_hash(include, &target)?.as_bytes());
+        }
+        config_sha256 = format!("{:x}", combined.finalize());
+    }
     let config_dir = config
         .config_path
         .parent()

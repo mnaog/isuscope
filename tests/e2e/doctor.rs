@@ -32,6 +32,16 @@ command = ["sh", "-c", "touch benchmark-ran"]
     let output = String::from_utf8(doctor.stdout).unwrap();
     assert!(output.contains("failures  0"));
     assert!(output.contains("no SSH nodes are configured"));
+    // By default only warnings and failures are listed; passes are counted.
+    assert!(!output.contains('✓'), "{output}");
+    assert!(!output.contains("passed    0"), "{output}");
+    let verbose = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+        .args(["doctor", "--verbose"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let verbose = String::from_utf8(verbose.stdout).unwrap();
+    assert!(verbose.contains("✓ shell syntax:"), "{verbose}");
 }
 
 #[cfg(unix)]
@@ -85,7 +95,7 @@ command = ["/bin/sh", "-c", "exit 75"]
     )
     .unwrap();
     let doctor = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .arg("doctor")
+        .args(["doctor", "--verbose"])
         .env("PATH", &tools)
         .current_dir(project.path())
         .output()
@@ -132,7 +142,7 @@ command = ["/bin/sh", "-c", "exit 75"]
     )
     .unwrap();
     let doctor = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .arg("doctor")
+        .args(["doctor", "--verbose"])
         .env("PATH", &tools)
         .current_dir(project.path())
         .output()
@@ -209,7 +219,7 @@ preflight = ["sh", "-c", "echo permission denied; exit 1"]
         .unwrap();
 
     let doctor = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .arg("doctor")
+        .args(["doctor", "--verbose"])
         .current_dir(project.path())
         .output()
         .unwrap();
@@ -261,7 +271,7 @@ initialize_finish_marker = "初期化処理が成功しました！"
     )
     .unwrap();
     let doctor = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-        .arg("doctor")
+        .args(["doctor", "--verbose"])
         .current_dir(project.path())
         .output()
         .unwrap();
@@ -293,7 +303,7 @@ sample_output = "sample.log"
     fs::write(config_dir.join("config.toml"), config).unwrap();
     let doctor = |project: &std::path::Path| {
         let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
-            .arg("doctor")
+            .args(["doctor", "--verbose"])
             .current_dir(project)
             .output()
             .unwrap();

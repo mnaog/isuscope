@@ -202,3 +202,82 @@ command = ["sh", "-c", "printf 'x' >> benchmark-ran; printf '%s\n' '{\"type\":\"
         3
     );
 }
+
+/// 分析に比較元が無くても、briefは直前のrunとのscoreの差を出し、`analyze`は`--base`を省くと
+/// 同じrunを比較元として記録する。
+#[test]
+fn brief_and_analyze_default_the_base_to_the_previous_run() {
+    let project = tempdir().unwrap();
+    let config_dir = project.path().join(".isuscope");
+    fs::create_dir_all(&config_dir).unwrap();
+    // 1回目は100点、2回目は130点。
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[benchmark]
+mode = "command"
+command = ["sh", "-c", "printf 'x' >> ran; score=$((70 + 30 * $(wc -c < ran))); printf '{\"type\":\"isuscope.result\",\"score\":%s,\"pass\":true}\n' \"$score\""]
+"#,
+    )
+    .unwrap();
+    let isuscope = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_isuscope"))
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    isuscope(&["run", "--hypothesis", "first"]);
+    let first = isuscope(&["analyze", "latest", "supported", "--analysis", "base"]);
+    assert!(
+        first.contains("base      - (no earlier run with a benchmark)"),
+        "{first}"
+    );
+    let list: serde_json::Value = parsed(isuscope(&["list"]).as_bytes()).unwrap();
+    let base_id = list["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
+    let base_short = &base_id[base_id.len() - 8..];
+
+    isuscope(&["run", "--hypothesis", "second", "--repeat", "measure again"]);
+    let brief: serde_json::Value = parsed(isuscope(&["brief", "latest"]).as_bytes()).unwrap();
+    let comparison = &brief["review"]["comparison"];
+    assert_eq!(comparison["base"], base_short, "{brief}");
+    assert_eq!(comparison["base_source"], "previous_run");
+    assert_eq!(
+        (
+            comparison["score_base"].clone(),
+            comparison["score_delta"].clone()
+        ),
+        (100.into(), 30.into())
+    );
+    assert!(
+        brief["next"][0]
+            .as_str()
+            .unwrap()
+            .contains(&format!("--base {base_short}")),
+        "{}",
+        brief["next"]
+    );
+
+    let second = isuscope(&["analyze", "latest", "supported", "--analysis", "+30"]);
+    assert!(
+        second.contains(&format!("base      {base_short} (previous run)")),
+        "{second}"
+    );
+    let recorded = Connection::open(config_dir.join("isuscope.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT base_run_id FROM run_analyses WHERE body = '+30'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, base_id);
+    let brief: serde_json::Value = parsed(isuscope(&["brief", "latest"]).as_bytes()).unwrap();
+    assert_eq!(brief["review"]["comparison"]["base_source"], "analysis");
+}

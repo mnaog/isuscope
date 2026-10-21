@@ -294,6 +294,13 @@ pub fn excerpt(text: &str, chars: usize) -> (String, bool) {
     }
 }
 
+/// PASSしたrunへ分析を記録するコマンドの雛形。そのまま写して`<...>`を埋められる形にする。
+pub fn analyze_template(run: &str) -> String {
+    format!(
+        "isuscope analyze {run} <supported|rejected|inconclusive|skipped> --analysis \"<text>\" [--change <id> --decision <accepted|provisional|rejected|deferred>]"
+    )
+}
+
 /// 時刻をマイクロ秒に切り捨てる。区間の境界はcollectorへマイクロ秒で渡し、collectorはそこから
 /// bucketを区切る。境界がナノ秒を持ったままだと、bucketの先頭（マイクロ秒）が境界より数百ナノ秒
 /// 前になり、そのbucketが丸ごと区間から落ちる。記録・転送・比較をこの精度に揃える。
