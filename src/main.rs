@@ -42,6 +42,7 @@ impl Cli {
                 | Commands::Query { .. }
                 | Commands::Doctor { .. }
                 | Commands::Routes { .. }
+                | Commands::Variance { .. }
                 | Commands::Change {
                     command: ChangeCommand::List { .. } | ChangeCommand::Show { .. }
                 }

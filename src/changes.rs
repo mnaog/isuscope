@@ -371,22 +371,24 @@ fn comparison_conditions(
             .find(|tag| tag.starts_with("bench:"))
             .cloned()
     };
+    // Shown only when a run carries a `bench:` tag; without one there is nothing to compare.
     let benchmark = match (bench_tag(base), bench_tag(candidate)) {
         (Some(before), Some(after)) if before == after => {
-            condition("benchmark", ConditionState::Same, vec![before])
+            Some(condition("benchmark", ConditionState::Same, vec![before]))
         }
-        (Some(before), Some(after)) => condition(
+        (Some(before), Some(after)) => Some(condition(
             "benchmark",
             ConditionState::Changed,
             vec![format!("{before} -> {after}")],
-        ),
-        _ => condition(
+        )),
+        (Some(tag), None) | (None, Some(tag)) => Some(condition(
             "benchmark",
             ConditionState::Unknown,
-            vec!["tag the runs with `bench:<condition>` to compare".into()],
-        ),
+            vec![format!("{tag} on one run only")],
+        )),
+        (None, None) => None,
     };
-    conditions.push(benchmark);
+    conditions.extend(benchmark);
     conditions
 }
 

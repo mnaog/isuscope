@@ -240,8 +240,7 @@ command = ["sh", "-c", "printf 'x' >> ran; score=$((70 + 30 * $(wc -c < ran))); 
         "{first}"
     );
     let list: serde_json::Value = parsed(isuscope(&["list"]).as_bytes()).unwrap();
-    let base_id = list["runs"]["rows"][0]["id"].as_str().unwrap().to_owned();
-    let base_short = &base_id[base_id.len() - 8..];
+    let base_short = list["runs"]["rows"][0]["run"].as_str().unwrap().to_owned();
 
     isuscope(&["run", "--hypothesis", "second", "--repeat", "measure again"]);
     let brief: serde_json::Value = parsed(isuscope(&["brief", "latest"]).as_bytes()).unwrap();
@@ -277,7 +276,7 @@ command = ["sh", "-c", "printf 'x' >> ran; score=$((70 + 30 * $(wc -c < ran))); 
             |row| row.get::<_, String>(0),
         )
         .unwrap();
-    assert_eq!(recorded, base_id);
+    assert!(recorded.ends_with(&base_short), "{recorded}");
     let brief: serde_json::Value = parsed(isuscope(&["brief", "latest"]).as_bytes()).unwrap();
     assert_eq!(brief["review"]["comparison"]["base_source"], "analysis");
 }
