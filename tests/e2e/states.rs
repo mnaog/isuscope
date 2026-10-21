@@ -78,6 +78,17 @@ fn sh(script: &str, path: &str) -> std::process::Output {
         .unwrap()
 }
 
+/// nodeにzstdがあればdeltaは縮めて送る（手元はそのまま保存する）。
+#[cfg(unix)]
+fn decoded(output: &std::process::Output) -> String {
+    let stdout = if output.stdout.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        zstd::decode_all(&output.stdout[..]).unwrap()
+    } else {
+        output.stdout.clone()
+    };
+    String::from_utf8(stdout).unwrap()
+}
+
 /// markとdeltaは、ベンチの前後で増えた分だけを運ぶ。作り直されたfileは先頭から、まだ無かった
 /// fileはベンチの間に作られた分を読む。上限を超えた分は捨てて、その大きさを残す。
 #[cfg(unix)]
@@ -91,7 +102,7 @@ fn state_log_collectors_carry_only_the_lines_written_during_the_run() {
     let mark = script(&collectors, "state-log-mark", &prefix);
     let delta = script(&collectors, "state-log-delta", &prefix);
     let lines = |output: &std::process::Output| {
-        String::from_utf8_lossy(&output.stdout)
+        decoded(output)
             .lines()
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
@@ -150,7 +161,7 @@ fn state_log_collectors_carry_only_the_lines_written_during_the_run() {
     )
     .unwrap();
     let small = delta.replace("limit=268435456", "limit=4");
-    let fourth = String::from_utf8(sh(&small, &path).stdout).unwrap();
+    let fourth = decoded(&sh(&small, &path));
     assert!(fourth.starts_with("0123\n"), "{fourth}");
     assert!(
         fourth.contains("\"state.truncated_bytes\",\"value\":7"),

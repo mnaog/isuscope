@@ -12,7 +12,6 @@ include = [
     "tests/**",
     "templates/**",
     "scripts/**",
-    "examples/**",
     "docs/standard-observability.md",
     "README.md",
     "LICENSE",

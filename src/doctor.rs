@@ -204,7 +204,12 @@ fn check_commands(config: &LoadedConfig, report: &mut DoctorReport) {
             report,
         );
     }
-    for collector in &config.config.collectors {
+    for collector in config
+        .config
+        .collectors
+        .iter()
+        .filter(|collector| collector.enabled)
+    {
         // `isuscope`はPATHではなく実行中のbinaryで動かすので、探す必要がない。
         if matches!(collector.transport, Transport::Local) && collector.command[0] == "isuscope" {
             report.pass(format!(
@@ -366,7 +371,8 @@ async fn check_node_disks(config: &LoadedConfig, report: &mut DoctorReport) {
 
 fn node_requires_sudo(config: &LoadedConfig, node: &crate::config::NodeConfig) -> bool {
     config.config.collectors.iter().any(|collector| {
-        matches!(collector.transport, Transport::Ssh)
+        collector.enabled
+            && matches!(collector.transport, Transport::Ssh)
             && (collector.roles.is_empty()
                 || collector.roles.iter().any(|role| node.roles.contains(role)))
             && collector.command.iter().any(|argument| {
@@ -409,7 +415,12 @@ fn ssh_args(config: &LoadedConfig) -> Vec<String> {
 }
 
 async fn check_profile_collectors(config: &LoadedConfig, report: &mut DoctorReport) {
-    for collector in &config.config.collectors {
+    for collector in config
+        .config
+        .collectors
+        .iter()
+        .filter(|collector| collector.enabled)
+    {
         // A configured preflight wins; otherwise built-in profile collectors have their own.
         let (label, argv, unavailable): (&str, Vec<String>, Vec<i32>) = match &collector.preflight {
             // nodeの`isuscope-node`がこのisuscopeと同じbuildかを、preflightが照合する。

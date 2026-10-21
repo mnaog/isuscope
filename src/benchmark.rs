@@ -555,7 +555,20 @@ async fn prompt<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
 pub fn compress_log(source: &Path, destination: &Path) -> Result<()> {
+    // 大きいログ（生のaccess log、状態ログ）はcollectorがnode上でzstdにしてから送るので、
+    // 既にzstdならそのまま置く。
+    let mut magic = [0u8; 4];
+    let is_zstd = {
+        use std::io::Read;
+        fs::File::open(source)?.read(&mut magic)? == 4 && magic == ZSTD_MAGIC
+    };
+    if is_zstd {
+        fs::rename(source, destination)?;
+        return Ok(());
+    }
     let mut input = fs::File::open(source)?;
     let output = fs::File::create(destination)?;
     zstd::stream::copy_encode(&mut input, output, 3)?;
@@ -587,6 +600,22 @@ mod tests {
             idle_timeout_seconds: None,
             hook_timeout_seconds: 120,
             rescore_command: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compress_log_keeps_output_that_is_already_zstd() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.log");
+        let packed = dir.path().join("packed.log");
+        fs::write(&plain, "a\nb\n").unwrap();
+        fs::write(&packed, zstd::encode_all(&b"c\n"[..], 1).unwrap()).unwrap();
+        for (source, expected) in [(&plain, "a\nb\n"), (&packed, "c\n")] {
+            let destination = source.with_extension("zst");
+            compress_log(source, &destination).unwrap();
+            assert!(!source.exists());
+            let decoded = zstd::decode_all(fs::File::open(&destination).unwrap()).unwrap();
+            assert_eq!(String::from_utf8(decoded).unwrap(), expected);
         }
     }
 

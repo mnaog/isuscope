@@ -1,6 +1,6 @@
 use crate::{
     metric_semantics::{self, MetricAggregation},
-    model::Metric,
+    model::{Metric, Transition},
     report,
 };
 use serde::Serialize;
@@ -1021,6 +1021,182 @@ pub fn http_query_diff(
     )
 }
 
+/// 行動遷移の1行。`share_percent`は全遷移に占める割合で、負荷の量が変わっても、ベンチ側の
+/// 動きの組み立て（どの遷移が増えた・減ったか）を比べられるようにする。
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitionRow {
+    pub from_route: String,
+    pub to_route: String,
+    pub count: i64,
+    pub share_percent: Option<f64>,
+    /// 前の要求の開始から次の要求の開始まで（前の要求の処理時間を含む）。
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransitionQueryOptions {
+    pub labels: Vec<(String, String)>,
+    pub label_contains: Vec<(String, String)>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransitionQueryOutput {
+    pub schema_version: u32,
+    #[serde(rename = "run", serialize_with = "crate::model::serialize_short_run")]
+    pub run_id: String,
+    pub view: &'static str,
+    pub total_count: usize,
+    pub truncated: bool,
+    pub rows: Vec<TransitionRow>,
+    pub warnings: Vec<String>,
+}
+
+/// `--label`・`--label-contains`の`from`・`to`で遷移元・遷移先のrouteを絞る。割合は絞る前の全遷移に対して出す。
+pub fn transition_query(
+    run_id: String,
+    transitions: Vec<Transition>,
+    options: TransitionQueryOptions,
+) -> TransitionQueryOutput {
+    let total = transitions.iter().map(|edge| edge.count).sum::<i64>();
+    let field = |edge: &Transition, key: &str| match key {
+        "from" => Some(edge.from_route.clone()),
+        "to" => Some(edge.to_route.clone()),
+        _ => None,
+    };
+    let mut rows = transitions
+        .into_iter()
+        .filter(|edge| {
+            options
+                .labels
+                .iter()
+                .all(|(key, value)| field(edge, key).as_ref() == Some(value))
+                && options.label_contains.iter().all(|(key, needle)| {
+                    field(edge, key).is_some_and(|value| value.contains(needle))
+                })
+        })
+        .map(|edge| TransitionRow {
+            share_percent: divide(edge.count as f64 * 100.0, total as f64)
+                .map(|value| round_to(value, 2)),
+            from_route: edge.from_route,
+            to_route: edge.to_route,
+            count: edge.count,
+            p50_ms: edge.p50_ms.map(|value| round_to(value, 1)),
+            p95_ms: edge.p95_ms.map(|value| round_to(value, 1)),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| (&a.from_route, &a.to_route).cmp(&(&b.from_route, &b.to_route)))
+    });
+    let total_count = rows.len();
+    rows.truncate(options.limit);
+    TransitionQueryOutput {
+        schema_version: crate::model::OUTPUT_SCHEMA_VERSION,
+        run_id,
+        view: "transitions",
+        total_count,
+        truncated: total_count > options.limit,
+        rows,
+        warnings: if total == 0 {
+            vec![
+                "no behavior transitions in this run (no raw access log with a session field)"
+                    .into(),
+            ]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// 遷移ごとの回数・割合・間隔の差。割合の変化が大きい順に並べ、負荷の量ではなく動きの変化を先に出す。
+pub fn transition_query_diff(
+    base: TransitionQueryOutput,
+    candidate: TransitionQueryOutput,
+    limit: usize,
+) -> QueryDiffOutput<TransitionRow> {
+    type Key = (String, String);
+    let key = |row: &TransitionRow| (row.from_route.clone(), row.to_route.clone());
+    let warnings = combined_warnings(base.warnings, candidate.warnings);
+    let mut base_rows = base
+        .rows
+        .into_iter()
+        .map(|row| (key(&row), row))
+        .collect::<BTreeMap<Key, _>>();
+    let mut candidate_rows = candidate
+        .rows
+        .into_iter()
+        .map(|row| (key(&row), row))
+        .collect::<BTreeMap<Key, _>>();
+    let keys = base_rows
+        .keys()
+        .chain(candidate_rows.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut rows = keys
+        .into_iter()
+        .map(|(from, to)| {
+            let lookup = (from.clone(), to.clone());
+            let base = base_rows.remove(&lookup);
+            let candidate = candidate_rows.remove(&lookup);
+            let changes = transition_changes(base.as_ref(), candidate.as_ref());
+            QueryDiffRow {
+                key: BTreeMap::from([("from_route".into(), from), ("to_route".into(), to)]),
+                key_labels: None,
+                shared: BTreeSet::new(),
+                columns: DiffColumns::All,
+                presence: presence(&base, &candidate),
+                base,
+                candidate,
+                changes,
+            }
+        })
+        .collect::<Vec<_>>();
+    sort_diff_rows(&mut rows, "share_percent");
+    finish_diff(
+        "transitions",
+        base.run_id,
+        candidate.run_id,
+        None,
+        rows,
+        limit,
+        warnings,
+    )
+}
+
+fn transition_changes(
+    base: Option<&TransitionRow>,
+    candidate: Option<&TransitionRow>,
+) -> BTreeMap<String, NumericDiff> {
+    [
+        (
+            "count",
+            base.map(|row| row.count as f64),
+            candidate.map(|row| row.count as f64),
+        ),
+        (
+            "share_percent",
+            base.and_then(|row| row.share_percent),
+            candidate.and_then(|row| row.share_percent),
+        ),
+        (
+            "p50_ms",
+            base.and_then(|row| row.p50_ms),
+            candidate.and_then(|row| row.p50_ms),
+        ),
+        (
+            "p95_ms",
+            base.and_then(|row| row.p95_ms),
+            candidate.and_then(|row| row.p95_ms),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, base, candidate)| (name.into(), numeric_diff(base, candidate)))
+    .collect()
+}
+
 fn database_changes(
     base: Option<&DatabaseQueryRow>,
     candidate: Option<&DatabaseQueryRow>,
@@ -1199,6 +1375,8 @@ fn finish_diff<T>(
     let pairs: &'static [&'static str] = match view {
         "http" => &["errors"],
         "database" => &["rows_examined_per_call"],
+        // 消えた・現れた遷移も読めるよう、回数と割合は比較元と今回を並べる。
+        "transitions" => &["count", "share_percent"],
         _ => &[],
     };
     for row in &mut rows {
@@ -2049,5 +2227,60 @@ mod tests {
                 .map(String::as_str),
             Some("c")
         );
+    }
+
+    #[test]
+    fn transition_diff_reads_the_mix_and_keeps_vanished_edges() {
+        let edge = |from: &str, to: &str, count: i64| Transition {
+            from_route: from.into(),
+            to_route: to.into(),
+            count,
+            p50_ms: Some(10.0),
+            p95_ms: Some(20.0),
+        };
+        let options = TransitionQueryOptions {
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            limit: usize::MAX,
+        };
+        let base = transition_query(
+            "base".into(),
+            vec![edge("A", "A", 75), edge("A", "B", 25)],
+            options.clone(),
+        );
+        assert_eq!(base.rows[0].share_percent, Some(75.0));
+        // 負荷が10倍になっても割合が同じ遷移は動きの変化として先に出ない。
+        let candidate = transition_query(
+            "candidate".into(),
+            vec![edge("A", "B", 250), edge("B", "C", 750)],
+            options.clone(),
+        );
+        let diff = transition_query_diff(base, candidate, 10);
+        let order = diff
+            .rows
+            .iter()
+            .map(|row| (row.key["from_route"].as_str(), row.presence))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                ("A", QueryPresence::Removed),
+                ("B", QueryPresence::Added),
+                ("A", QueryPresence::Both)
+            ]
+        );
+        let value = serde_json::to_value(&diff.rows[0]).unwrap();
+        assert_eq!(value["count_base"], 75.0);
+        assert_eq!(value["share_percent_base"], 75.0);
+        let filtered = transition_query(
+            "candidate".into(),
+            vec![edge("A", "B", 250), edge("B", "C", 750)],
+            TransitionQueryOptions {
+                labels: vec![("to".into(), "C".into())],
+                ..options
+            },
+        );
+        assert_eq!(filtered.total_count, 1);
+        assert_eq!(filtered.rows[0].share_percent, Some(75.0));
     }
 }
