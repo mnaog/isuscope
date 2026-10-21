@@ -80,7 +80,6 @@ pub async fn execute(
             short_id(run),
         );
     }
-    check_node_disks(&config).await?;
     let agent_context = agent_context::resolve(&config)?;
     let id = Uuid::now_v7().to_string();
     // run.jsonを書く前に印を握る。握る前に書くと、別processの回収処理に中断runと誤認される。
@@ -94,28 +93,44 @@ pub async fn execute(
         context.write_snapshot(&staging)?;
     }
 
-    let mut source_excludes = config.config.source.exclude.clone();
-    if let Some(history_dir) = config.config.context.history_dir() {
-        source_excludes.push(history_dir.to_path_buf());
-    }
-    let source = git_snapshot::capture(
-        &config.source_repo(),
-        &staging.join("source"),
-        &source_excludes,
-    )
-    .unwrap_or_else(|error| SourceSnapshot {
-        repository: config.source_repo().display().to_string(),
-        dirty: true,
-        error: Some(format!("{error:#}")),
-        ..Default::default()
-    });
-    let tooling = tooling::capture(&config, &staging.join("tooling")).unwrap_or_else(|error| {
-        ToolingSnapshot {
-            isuscope_version: env!("CARGO_PKG_VERSION").into(),
-            error: Some(format!("{error:#}")),
-            ..Default::default()
+    let repeat_reason = annotations
+        .repeat
+        .take()
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty());
+    let hook_context = HookContext {
+        config: &config,
+        run_id: &id,
+        run_dir: &staging,
+        mode,
+        env: repeat_reason
+            .iter()
+            .map(|reason| ("ISUSCOPE_REPEAT_REASON", reason.clone()))
+            .collect(),
+        shutdown: Some(shutdown.clone()),
+    };
+    let benchmark_config = &config.config.benchmark;
+
+    // The disk check waits on SSH, the snapshots on the local disk and the identity hook on
+    // whatever it asks; none needs another's result, so they run at the same time.
+    let snapshots = {
+        let config = config.clone();
+        let staging = staging.clone();
+        tokio::task::spawn_blocking(move || capture_snapshots(&config, &staging))
+    };
+    let identity = async {
+        match &benchmark_config.identity_command {
+            Some(command) => Some(hooks::run(&hook_context, "identity", command).await),
+            None => None,
         }
-    });
+    };
+    let (disks, snapshots, identity) = tokio::join!(check_node_disks(&config), snapshots, identity);
+    if let Err(error) = disks {
+        // Nothing of the run was recorded yet; leave no directory behind.
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let (source, tooling) = snapshots.context("source and tooling snapshot task failed")?;
     let started_at = Utc::now();
     annotations.tags.sort();
     annotations.tags.dedup();
@@ -156,26 +171,8 @@ pub async fn execute(
     let mut after_outputs = None;
     let mut after_cut = false;
 
-    let repeat_reason = annotations
-        .repeat
-        .take()
-        .map(|reason| reason.trim().to_owned())
-        .filter(|reason| !reason.is_empty());
-    let hook_context = HookContext {
-        config: &config,
-        run_id: &id,
-        run_dir: &staging,
-        mode,
-        env: repeat_reason
-            .iter()
-            .map(|reason| ("ISUSCOPE_REPEAT_REASON", reason.clone()))
-            .collect(),
-        shutdown: Some(shutdown.clone()),
-    };
-    let benchmark_config = &config.config.benchmark;
-    if let Some(command) = &benchmark_config.identity_command {
+    if let Some(output) = identity {
         println!("→ identity");
-        let output = hooks::run(&hook_context, "identity", command).await;
         if output.result.status == "complete" {
             manifest.identity = Some(repeat::identity(&output.stdout));
         }
@@ -340,6 +337,11 @@ pub async fn execute(
                 absorb_hook(output, &mut manifest);
             }
         }
+        // during collectorを止めるのは境界に依らない（境界で決まるのは出力の解析だけ）ので、
+        // 境界を探す間に並行して止め始める。
+        let stop_started_at = Utc::now();
+        let stop_started = std::time::Instant::now();
+        let terminating = tokio::spawn(collector::terminate_during(running));
         // ベンチの出力に境界が無ければ、collector（access logの最後のinitialize要求など）から取る。
         // during collectorの解析とafter collectorの区間はこの境界で決まるので、その前に済ませる。
         if manifest.benchmark.started_at.is_some()
@@ -385,12 +387,19 @@ pub async fn execute(
                 enrichment::run_all(&config, &id, &staging, &id),
             ),
             async {
-                let during = timed(
-                    "collectors_during_stop",
-                    &mut collector_stages,
-                    collector::stop_during(running, &staging),
-                )
-                .await;
+                // Recorded from when the collectors were told to stop, as before the overlap.
+                let during = match terminating.await {
+                    Ok(stopped) => collector::finalize_during(stopped, &staging).await,
+                    Err(error) => {
+                        eprintln!("! stopping the during collectors failed: {error}");
+                        Vec::new()
+                    }
+                };
+                collector_stages.push(StageTiming {
+                    name: "collectors_during_stop".into(),
+                    started_at: stop_started_at,
+                    duration_ms: stop_started.elapsed().as_millis() as u64,
+                });
                 let watch = later_signal(&shutdown);
                 let interruptible = watch.is_some();
                 let after = timed(
@@ -543,6 +552,37 @@ pub async fn execute(
     Ok(RunOutcome {
         passed: manifest.benchmark.passed == Some(true),
     })
+}
+
+/// The source (Git) and tooling snapshots of a new run, written into its staging directory.
+/// A snapshot that fails is recorded with its error instead of stopping the run.
+fn capture_snapshots(
+    config: &LoadedConfig,
+    staging: &std::path::Path,
+) -> (SourceSnapshot, ToolingSnapshot) {
+    let mut source_excludes = config.config.source.exclude.clone();
+    if let Some(history_dir) = config.config.context.history_dir() {
+        source_excludes.push(history_dir.to_path_buf());
+    }
+    let source = git_snapshot::capture(
+        &config.source_repo(),
+        &staging.join("source"),
+        &source_excludes,
+    )
+    .unwrap_or_else(|error| SourceSnapshot {
+        repository: config.source_repo().display().to_string(),
+        dirty: true,
+        error: Some(format!("{error:#}")),
+        ..Default::default()
+    });
+    let tooling = tooling::capture(config, &staging.join("tooling")).unwrap_or_else(|error| {
+        ToolingSnapshot {
+            isuscope_version: env!("CARGO_PKG_VERSION").into(),
+            error: Some(format!("{error:#}")),
+            ..Default::default()
+        }
+    });
+    (source, tooling)
 }
 
 /// Runs one stage of the run and records when it started and how long it took.

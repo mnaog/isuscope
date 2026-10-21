@@ -241,13 +241,21 @@ pub async fn start_during(
     (running, failed_outputs)
 }
 
-/// Stops every during collector at once. One at a time, the SIGTERM grace period and the log
-/// compression and parsing add up over every collector on every node. Outputs keep the order
-/// the collectors were started in.
-pub async fn stop_during(running: Vec<RunningCollector>, run_dir: &Path) -> Vec<CollectorOutput> {
+/// A during collector that was stopped (or had already exited) and whose output is not yet
+/// saved and parsed.
+pub struct StoppedCollector {
+    collector: RunningCollector,
+    exit_code: Option<i32>,
+    intentionally_stopped: bool,
+}
+
+/// Stops every during collector at once. One at a time, the SIGTERM grace period adds up over
+/// every collector on every node. Only the processes are stopped here; saving and parsing the
+/// output ([`finalize_during`]) needs the initialize boundary, so this can run while the
+/// boundary phase looks for it. Outputs keep the order the collectors were started in.
+pub async fn terminate_during(running: Vec<RunningCollector>) -> Vec<StoppedCollector> {
     let mut stopping = tokio::task::JoinSet::new();
     for (order, mut collector) in running.into_iter().enumerate() {
-        let run_dir = run_dir.to_path_buf();
         stopping.spawn(async move {
             let already_finished = collector.child.try_wait().ok().flatten();
             let (status, intentionally_stopped) = match already_finished {
@@ -257,18 +265,42 @@ pub async fn stop_during(running: Vec<RunningCollector>, run_dir: &Path) -> Vec<
                     true,
                 ),
             };
+            (
+                order,
+                StoppedCollector {
+                    collector,
+                    exit_code: status.and_then(|value| value.code()),
+                    intentionally_stopped,
+                },
+            )
+        });
+    }
+    let mut stopped = stopping.join_all().await;
+    stopped.sort_by_key(|(order, _)| *order);
+    stopped.into_iter().map(|(_, stopped)| stopped).collect()
+}
+
+/// Saves and parses the output of stopped during collectors, all at once, in their order.
+pub async fn finalize_during(
+    stopped: Vec<StoppedCollector>,
+    run_dir: &Path,
+) -> Vec<CollectorOutput> {
+    let mut finishing = tokio::task::JoinSet::new();
+    for (order, stopped) in stopped.into_iter().enumerate() {
+        let run_dir = run_dir.to_path_buf();
+        finishing.spawn(async move {
             let output = finalize(
-                collector,
-                status.and_then(|value| value.code()),
+                stopped.collector,
+                stopped.exit_code,
                 None,
-                intentionally_stopped,
+                stopped.intentionally_stopped,
                 &run_dir,
             )
             .await;
             (order, output)
         });
     }
-    let mut outputs = stopping.join_all().await;
+    let mut outputs = finishing.join_all().await;
     outputs.sort_by_key(|(order, _)| *order);
     outputs.into_iter().map(|(_, output)| output).collect()
 }
