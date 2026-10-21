@@ -179,6 +179,17 @@ pub async fn execute(
         }
         absorb_hook(output, &mut manifest);
     }
+    // Without before collectors no fingerprint can appear later, and prepare_command does not
+    // change what was already compared, so a repeat is known now: refuse it before
+    // prepare_command restarts anything.
+    if collector::selected(&config, mode, CollectorPhase::Before)
+        .next()
+        .is_none()
+        && let Some(check) = check_repeat(&store, &manifest, &[], repeat_reason.clone())?
+        && refuses(&check)
+    {
+        return refuse_repeat(&config, &store, &id, &check, false).await;
+    }
     let mut prepare_error = None;
     if let Some(command) = &benchmark_config.prepare_command {
         println!("→ prepare");
@@ -235,10 +246,7 @@ pub async fn execute(
     if prepare_error.is_none() {
         manifest.repeat = check_repeat(&store, &manifest, &fingerprints, repeat_reason.clone())?;
     }
-    let refused_as_repeat = manifest
-        .repeat
-        .as_ref()
-        .is_some_and(|check| check.changed.is_empty() && check.reason.is_none());
+    let refused_as_repeat = manifest.repeat.as_ref().is_some_and(refuses);
 
     if let Some(error) = prepare_error {
         eprintln!("! {error}");
@@ -272,21 +280,11 @@ pub async fn execute(
             ..Default::default()
         };
     } else if refused_as_repeat {
-        let base = manifest
+        let check = manifest
             .repeat
-            .as_ref()
-            .map(|check| short_id(&check.base_run_id).to_owned())
-            .unwrap_or_default();
-        let error = format!(
-            "nothing isuscope can see changed since run {base} (deployment, node fingerprints, observation settings); deploy the change, or pass --repeat \"<reason>\" to measure the same configuration again"
-        );
-        eprintln!("! {error}");
-        manifest.benchmark = BenchmarkResult {
-            mode: "not-started".into(),
-            passed: Some(false),
-            error: Some(error),
-            ..Default::default()
-        };
+            .take()
+            .context("repeat check was recorded")?;
+        return refuse_repeat(&config, &store, &id, &check, true).await;
     } else {
         println!("→ collectors: during");
         let (running, startup_failures) = timed(
@@ -596,6 +594,35 @@ fn absorb_hook(output: hooks::HookOutput, manifest: &mut RunManifest) {
     }
     manifest.logs.extend(output.logs);
     manifest.hooks.push(output.result);
+}
+
+/// Nothing isuscope can see changed and no `--repeat` reason was given.
+fn refuses(check: &crate::model::RepeatCheck) -> bool {
+    check.changed.is_empty() && check.reason.is_none()
+}
+
+/// Stops a run refused as a repeat without saving it: a refusal is not a result, so it must
+/// not show up as a FAIL in `list`, `sql` or the analysis gate. Only what the before
+/// collectors left on the nodes is cleaned up; the after collectors are not run.
+async fn refuse_repeat(
+    config: &LoadedConfig,
+    store: &Store,
+    id: &str,
+    check: &crate::model::RepeatCheck,
+    ran_before_collectors: bool,
+) -> Result<RunOutcome> {
+    let base = short_id(&check.base_run_id);
+    eprintln!(
+        "! nothing isuscope can see changed since run {base} (deployment, node fingerprints, observation settings); deploy the change, or pass --repeat \"<reason>\" to measure the same configuration again"
+    );
+    if ran_before_collectors {
+        collector::cleanup_abandoned(config, &[id.to_owned()]).await;
+    }
+    crate::lock::release_run_lock();
+    store.discard(id)?;
+    println!();
+    println!("run       not saved (refused: same as {base})");
+    Ok(RunOutcome { passed: false })
 }
 
 /// Compares this run with the last one whose benchmark started. `None` when there is none.

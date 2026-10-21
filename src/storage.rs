@@ -239,6 +239,19 @@ impl Store {
         Ok(staging)
     }
 
+    /// Removes a run that is not kept (refused as a repeat): its index row and its staging
+    /// directory. Only for a run this process began and still holds the marker of.
+    pub fn discard(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM runs WHERE id=?1", [id])?;
+        let staging = self.staging_dir(id);
+        if staging.exists() {
+            fs::remove_dir_all(&staging)
+                .with_context(|| format!("cannot remove {}", staging.display()))?;
+        }
+        Ok(())
+    }
+
     /// Persist in-progress metadata needed by after collectors.
     pub fn checkpoint(&self, manifest: &RunManifest) -> Result<()> {
         write_manifest(&self.staging_dir(&manifest.id), manifest)
@@ -500,8 +513,9 @@ impl Store {
         Ok((!index.is_empty()).then_some(index))
     }
 
-    /// The newest run, other than `exclude`, whose benchmark actually started. A run that
-    /// stopped in `prepare_command` or was refused as a repeat is never the base.
+    /// The newest run, other than `exclude`, whose benchmark actually started and ran to its
+    /// end. A run that stopped in `prepare_command`, whose benchmark isuscope stopped (timeout,
+    /// idle) or that was interrupted is never the base.
     pub fn last_started_run(&self, exclude: &str) -> Result<Option<RunManifest>> {
         let mut statement = self.connection.prepare(
             "SELECT id FROM runs WHERE id != ?1 AND state != 'running' ORDER BY started_at DESC LIMIT 200",
@@ -513,7 +527,7 @@ impl Store {
             let Ok(manifest) = self.load(&id) else {
                 continue;
             };
-            if manifest.benchmark.mode != "not-started" && manifest.benchmark.started_at.is_some() {
+            if benchmark_started(&manifest) && !benchmark_stopped(&manifest) {
                 return Ok(Some(manifest));
             }
         }
@@ -1171,6 +1185,18 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+}
+
+/// The benchmark itself ran: it was started (not refused, not stopped before it began).
+pub fn benchmark_started(manifest: &RunManifest) -> bool {
+    manifest.benchmark.mode != "not-started" && manifest.benchmark.started_at.is_some()
+}
+
+/// The benchmark did not run to its own end: isuscope stopped it or a signal interrupted it.
+fn benchmark_stopped(manifest: &RunManifest) -> bool {
+    manifest.benchmark.interrupted
+        || manifest.benchmark.stopped_by.is_some()
+        || manifest.state == RunState::Aborted
 }
 
 fn escape_like(value: &str) -> String {
