@@ -38,7 +38,8 @@ pub struct RunSummary {
     /// The form printed by `run` and accepted everywhere a run is named, as in every other output.
     #[serde(rename = "run")]
     pub short_id: String,
-    /// 完全なID。出力の中でこれを出すのは`list`だけ。
+    /// 完全なID。出力には出さない（`sql`の`runs.id`で読む）。
+    #[serde(skip)]
     pub id: String,
     /// JSTのミリ秒まで（[`crate::model::display_time`]）。
     pub started_at: String,
@@ -46,12 +47,27 @@ pub struct RunSummary {
     #[serde(serialize_with = "crate::model::serialize_short_commit")]
     pub commit_hash: Option<String>,
     pub dirty: bool,
+    /// Omitted for a plain `run`.
+    #[serde(skip_serializing_if = "is_plain_run")]
     pub mode: String,
     pub state: String,
     pub score: Option<i64>,
     pub passed: Option<bool>,
+    /// What the run measured ([`crate::repeat::config_key`], first 12 hex digits). Runs with
+    /// the same key measured the same configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_key: Option<String>,
+    /// `--repeat`: why the same configuration was measured again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat_reason: Option<String>,
+    /// The fields `identity_command` reported.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub identity: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The start of the hypothesis, enough to tell runs apart; `brief` has the full text.
     pub hypothesis: String,
     pub analysis_status: String,
     pub latest_analysis_verdict: Option<String>,
@@ -59,6 +75,15 @@ pub struct RunSummary {
     /// First parser failure message of a run that did not pass.
     #[serde(rename = "failure_reason")]
     pub failure: Option<String>,
+}
+
+fn is_plain_run(mode: &str) -> bool {
+    mode == crate::model::RunMode::Run.as_str()
+}
+
+/// The first 12 hex digits of a config key, as shown by `list` and `variance`.
+pub fn short_config_key(key: &str) -> String {
+    key.chars().take(12).collect()
 }
 
 #[derive(Debug, Default)]
@@ -89,7 +114,7 @@ impl Store {
             // 同時に開いた別processと、schemaの作成・更新が交錯しないよう1つのtransactionにする。
             // IMMEDIATEなので、後から来た側はbusy timeoutの間だけ待つ。
             connection.execute_batch("BEGIN IMMEDIATE")?;
-            match migrate(&connection) {
+            match migrate(&connection, version) {
                 Ok(()) => connection.execute_batch("COMMIT")?,
                 Err(error) => {
                     let _ = connection.execute_batch("ROLLBACK");
@@ -239,6 +264,19 @@ impl Store {
         Ok(staging)
     }
 
+    /// Removes a run that is not kept (refused as a repeat): its index row and its staging
+    /// directory. Only for a run this process began and still holds the marker of.
+    pub fn discard(&self, id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM runs WHERE id=?1", [id])?;
+        let staging = self.staging_dir(id);
+        if staging.exists() {
+            fs::remove_dir_all(&staging)
+                .with_context(|| format!("cannot remove {}", staging.display()))?;
+        }
+        Ok(())
+    }
+
     /// Persist in-progress metadata needed by after collectors.
     pub fn checkpoint(&self, manifest: &RunManifest) -> Result<()> {
         write_manifest(&self.staging_dir(&manifest.id), manifest)
@@ -290,6 +328,7 @@ impl Store {
             params![manifest.id, manifest_stamp(&final_dir.join("run.json"))],
         )?;
         persist_agent_context(&transaction, manifest)?;
+        persist_configuration(&transaction, manifest, &fingerprint_map(fingerprints)?)?;
         for log in &manifest.logs {
             transaction.execute(
                 "INSERT INTO logs (id, run_id, kind, node) VALUES (?1, ?2, ?3, ?4)",
@@ -370,7 +409,8 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT r.id, r.started_at, r.commit_hash, r.dirty, r.mode, r.state, r.score, r.passed, r.note, r.hypothesis, r.analysis_status,
                     (SELECT a.verdict FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1),
-                    (SELECT a.body FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1)
+                    (SELECT a.body FROM run_analyses a WHERE a.run_id=r.id ORDER BY a.created_at DESC, a.id DESC LIMIT 1),
+                    r.config_key, r.repeat_reason
              FROM runs r ORDER BY r.started_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit as i64], |row| {
@@ -385,9 +425,14 @@ impl Store {
                 state: row.get(5)?,
                 score: row.get(6)?,
                 passed: row.get(7)?,
+                config_key: row
+                    .get::<_, Option<String>>(13)?
+                    .map(|key| short_config_key(&key)),
+                repeat_reason: row.get(14)?,
+                identity: Default::default(),
                 note: row.get(8)?,
                 tags: Vec::new(),
-                hypothesis: row.get(9)?,
+                hypothesis: crate::model::excerpt(&row.get::<_, String>(9)?, 120).0,
                 analysis_status: row.get(10)?,
                 latest_analysis_verdict: row.get(11)?,
                 // runを見分けるための冒頭だけ。全文は`brief`の`full_text`から読む。
@@ -400,6 +445,7 @@ impl Store {
         let mut runs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         for run in &mut runs {
             run.tags = self.tags(&run.id)?;
+            run.identity = self.identity(&run.id)?;
             // Failed runs need no analysis, so the benchmark's own reason is their only record.
             if run.passed != Some(true) && self.final_dir(&run.id).is_dir() {
                 run.failure = self
@@ -500,11 +546,12 @@ impl Store {
         Ok((!index.is_empty()).then_some(index))
     }
 
-    /// The newest run, other than `exclude`, whose benchmark actually started. A run that
-    /// stopped in `prepare_command` or was refused as a repeat is never the base.
+    /// The newest run, other than `exclude`, whose benchmark actually started and ran to its
+    /// end. A run that stopped in `prepare_command`, whose benchmark isuscope stopped (timeout,
+    /// idle) or that was interrupted is never the base.
     pub fn last_started_run(&self, exclude: &str) -> Result<Option<RunManifest>> {
         let mut statement = self.connection.prepare(
-            "SELECT id FROM runs WHERE id != ?1 AND state != 'running' ORDER BY started_at DESC LIMIT 200",
+            "SELECT id FROM runs WHERE id != ?1 AND benchmark_started=1 AND state NOT IN ('running', 'aborted') ORDER BY started_at DESC LIMIT 200",
         )?;
         let ids = statement
             .query_map([exclude], |row| row.get::<_, String>(0))?
@@ -513,7 +560,7 @@ impl Store {
             let Ok(manifest) = self.load(&id) else {
                 continue;
             };
-            if manifest.benchmark.mode != "not-started" && manifest.benchmark.started_at.is_some() {
+            if benchmark_started(&manifest) && !benchmark_stopped(&manifest) {
                 return Ok(Some(manifest));
             }
         }
@@ -621,6 +668,17 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The fields `identity_command` reported for a run (`run_identity`).
+    pub fn identity(&self, id: &str) -> Result<std::collections::BTreeMap<String, String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT key, value FROM run_identity WHERE run_id=?1 ORDER BY key")?;
+        statement
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
+    }
+
     pub fn tags(&self, id: &str) -> Result<Vec<String>> {
         let mut statement = self
             .connection
@@ -681,13 +739,16 @@ impl Store {
         Ok(())
     }
 
+    /// Appends an analysis and returns the manifest with `true`. When the latest analysis
+    /// already has the same verdict, body and base (a retried command), nothing is written
+    /// and `false` is returned.
     pub fn append_analysis_with_base(
         &mut self,
         id: &str,
         verdict: AnalysisVerdict,
         body: String,
         base_run_id: Option<String>,
-    ) -> Result<RunManifest> {
+    ) -> Result<(RunManifest, bool)> {
         let final_dir = self.final_dir(id);
         let _lock = AnalysisLock::acquire(&final_dir)?;
         if let Some(base) = &base_run_id {
@@ -705,6 +766,11 @@ impl Store {
         let mut manifest = self.load(id)?;
         if manifest.benchmark.passed != Some(true) {
             bail!("only a passing run can be analyzed: `{id}`");
+        }
+        if manifest.analyses.last().is_some_and(|latest| {
+            latest.verdict == verdict && latest.body == body && latest.base_run_id == base_run_id
+        }) {
+            return Ok((manifest, false));
         }
         if verdict == AnalysisVerdict::Skipped
             && manifest.analysis_status != AnalysisStatus::Pending
@@ -750,7 +816,7 @@ impl Store {
             params![manifest.id, manifest_stamp(&final_dir.join("run.json"))],
         )?;
         transaction.commit()?;
-        Ok(manifest)
+        Ok((manifest, true))
     }
 
     /// 保存済みのrunの読み書きを、analysisやenrichの間で1つずつにする。握っている間に
@@ -1012,7 +1078,9 @@ impl Store {
             let stale = recorded.is_some();
             if indexed_state.is_some() && !unfinished && !stale {
                 // A durable manifest may be newer than SQLite after interruption.
+                let fingerprints = self.fingerprint_index(&manifest.id)?.unwrap_or_default();
                 let tx = self.connection.transaction()?;
+                persist_configuration(&tx, &manifest, &fingerprints)?;
                 for a in &manifest.analyses {
                     tx.execute("INSERT OR IGNORE INTO run_analyses (id,run_id,created_at,verdict,body,base_run_id) VALUES (?1,?2,?3,?4,?5,?6)",
                         params![a.id,manifest.id,a.created_at.to_rfc3339(),a.verdict.as_str(),a.body,a.base_run_id])?;
@@ -1156,6 +1224,7 @@ impl Store {
             )?;
         }
         persist_agent_context(&transaction, manifest)?;
+        persist_configuration(&transaction, manifest, &fingerprint_map(fingerprints)?)?;
         transaction.execute(
             "UPDATE runs SET manifest_stamp=?2 WHERE id=?1",
             params![manifest.id, stamp],
@@ -1163,6 +1232,18 @@ impl Store {
         transaction.commit()?;
         Ok(())
     }
+}
+
+/// The benchmark itself ran: it was started (not refused, not stopped before it began).
+pub fn benchmark_started(manifest: &RunManifest) -> bool {
+    manifest.benchmark.mode != "not-started" && manifest.benchmark.started_at.is_some()
+}
+
+/// The benchmark did not run to its own end: isuscope stopped it or a signal interrupted it.
+fn benchmark_stopped(manifest: &RunManifest) -> bool {
+    manifest.benchmark.interrupted
+        || manifest.benchmark.stopped_by.is_some()
+        || manifest.state == RunState::Aborted
 }
 
 fn escape_like(value: &str) -> String {
@@ -1203,6 +1284,11 @@ pub fn fingerprint_key(
     Ok(serde_json::to_string(&(name, labels))?)
 }
 
+/// `latest/` points at the newest finished run without copying its logs: `run.json`, a
+/// `run-dir` file with the run directory relative to the data directory, and `logs.json`
+/// (each log with the `path` of its compressed file). Only the profile outputs (CPU flame graph
+/// SVG and off-CPU folded stacks) are expanded into `latest/logs/`, since they are opened as
+/// files; decompressing every log here held up the end of every run.
 fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) -> Result<()> {
     let temporary = data_dir.join(".latest.tmp");
     if temporary.exists() {
@@ -1211,26 +1297,27 @@ fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) 
     let logs_dir = temporary.join("logs");
     fs::create_dir_all(&logs_dir)?;
     fs::copy(run_dir.join("run.json"), temporary.join("run.json"))?;
+    fs::write(
+        temporary.join(LATEST_POINTER),
+        format!("{}\n", latest_pointer(&manifest.id)),
+    )?;
 
     for log in &manifest.logs {
+        let extension = match log.kind.as_str() {
+            kind if kind.contains("perf-flamegraph") && kind.ends_with(":stdout") => "svg",
+            kind if kind.contains("offcpu") && kind.ends_with(":stdout") => "folded",
+            _ => continue,
+        };
         let source = run_dir.join("logs").join(format!("{}.zst", log.id));
         if !source.is_file() {
             continue;
         }
         let input = fs::File::open(&source)?;
         let mut decoder = zstd::stream::read::Decoder::new(input)?;
-        let extension = match log.kind.as_str() {
-            kind if kind.contains("perf-flamegraph") && kind.ends_with(":stdout") => "svg",
-            kind if kind.contains("offcpu") && kind.ends_with(":stdout") => "folded",
-            _ => "log",
-        };
         let mut output = fs::File::create(logs_dir.join(format!("{}.{}", log.id, extension)))?;
         std::io::copy(&mut decoder, &mut output)?;
     }
-    fs::write(
-        temporary.join("logs.json"),
-        serde_json::to_vec_pretty(&manifest.logs)?,
-    )?;
+    fs::write(temporary.join("logs.json"), latest_logs_json(manifest)?)?;
 
     let latest = data_dir.join("latest");
     if latest.exists() {
@@ -1238,6 +1325,58 @@ fn refresh_latest_view(data_dir: &Path, run_dir: &Path, manifest: &RunManifest) 
     }
     fs::rename(&temporary, &latest)?;
     Ok(())
+}
+
+const LATEST_POINTER: &str = "run-dir";
+
+fn latest_pointer(id: &str) -> String {
+    format!("runs/{id}")
+}
+
+fn latest_logs_json(manifest: &RunManifest) -> Result<Vec<u8>> {
+    let logs = manifest
+        .logs
+        .iter()
+        .map(|log| {
+            serde_json::json!({
+                "id": log.id,
+                "kind": log.kind,
+                "node": log.node,
+                "path": format!("{}/logs/{}.zst", latest_pointer(&manifest.id), log.id),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_vec_pretty(&logs)?)
+}
+
+/// After a finalized run's run.json was rewritten (analyze, rescore, enrich), refreshes
+/// `latest/run.json` and `latest/logs.json` when `latest/` points at that run. Best effort:
+/// the run directory stays the source of truth.
+fn refresh_latest_manifest(run_dir: &Path, manifest: &RunManifest) {
+    let Some(data_dir) = run_dir.parent().and_then(Path::parent) else {
+        return;
+    };
+    let latest = data_dir.join("latest");
+    let points_here = fs::read_to_string(latest.join(LATEST_POINTER))
+        .is_ok_and(|pointer| pointer.trim() == latest_pointer(&manifest.id))
+        && run_dir == data_dir.join(latest_pointer(&manifest.id));
+    if !points_here {
+        return;
+    }
+    let result = (|| -> Result<()> {
+        for (name, bytes) in [
+            ("run.json", fs::read(run_dir.join("run.json"))?),
+            ("logs.json", latest_logs_json(manifest)?),
+        ] {
+            let temporary = latest.join(format!("{name}.tmp"));
+            fs::write(&temporary, bytes)?;
+            fs::rename(&temporary, latest.join(name))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("! run was saved, but latest/ could not be refreshed: {error:#}");
+    }
 }
 
 fn write_structured_snapshot(
@@ -1390,6 +1529,7 @@ pub(crate) fn write_manifest(run_dir: &Path, manifest: &RunManifest) -> Result<(
     file.sync_all()?;
     fs::rename(temporary, path)?;
     fs::File::open(run_dir)?.sync_all()?;
+    refresh_latest_manifest(run_dir, manifest);
     Ok(())
 }
 
@@ -1437,7 +1577,7 @@ fn enable_wal(connection: &Connection) -> Result<()> {
     }
 }
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 10;
 
 /// run.jsonの大きさと更新時刻。indexの確定時に保存し、一致するrunは開くたびに読み直さない。
 fn manifest_stamp(path: &Path) -> Option<String> {
@@ -1450,7 +1590,7 @@ fn manifest_stamp(path: &Path) -> Option<String> {
     Some(format!("{}:{}", metadata.len(), modified.as_nanos()))
 }
 
-fn migrate(connection: &Connection) -> Result<()> {
+fn migrate(connection: &Connection, previous: u32) -> Result<()> {
     connection.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS runs (
@@ -1569,6 +1709,7 @@ fn migrate(connection: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS change_decisions (id TEXT PRIMARY KEY, change_id TEXT NOT NULL REFERENCES changes(id), created_at TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL, revisit TEXT);
         CREATE TABLE IF NOT EXISTS change_decision_runs (decision_id TEXT NOT NULL REFERENCES change_decisions(id), run_id TEXT NOT NULL, PRIMARY KEY(decision_id, run_id));
         CREATE INDEX IF NOT EXISTS change_runs_run ON change_decision_runs(run_id);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     ")?;
     ensure_column(connection, "runs", "note", "TEXT")?;
     ensure_column(connection, "runs", "hypothesis", "TEXT NOT NULL DEFAULT ''")?;
@@ -1582,8 +1723,79 @@ fn migrate(connection: &Connection) -> Result<()> {
     // indexを確定したときのrun.jsonの大きさと更新時刻。行があるだけでは確定済みとは限らない
     // （runの行はbeginで作り、finishの途中で落ちるとrunningのまま残る）。
     ensure_column(connection, "runs", "manifest_stamp", "TEXT")?;
+    // What the run measured (`repeat::config_key`), how it relates to the repeat check, and
+    // whether its benchmark started, so tools need not read run.json for them.
+    ensure_column(connection, "runs", "config_key", "TEXT")?;
+    ensure_column(connection, "runs", "repeat_base_run_id", "TEXT")?;
+    ensure_column(connection, "runs", "repeat_reason", "TEXT")?;
+    ensure_column(
+        connection,
+        "runs",
+        "benchmark_started",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS run_identity (
+            run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (run_id, key)
+        );
+        CREATE INDEX IF NOT EXISTS runs_config_key ON runs(config_key);
+        ",
+    )?;
+    if previous < 10 {
+        // Saved runs predate these columns: forget their stamps so the next open reads each
+        // run.json once and fills them (see `restore_missing_finalized_runs`).
+        connection.execute_batch("UPDATE runs SET manifest_stamp = NULL")?;
+    }
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
+}
+
+/// The `runs` columns and `run_identity` rows that describe what a run measured. Written
+/// whenever a finalized run is indexed; `fingerprints` are keyed like `fingerprint_index`.
+fn persist_configuration(
+    connection: &Connection,
+    manifest: &RunManifest,
+    fingerprints: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let repeat = manifest.repeat.as_ref();
+    connection.execute(
+        "UPDATE runs SET config_key=?2, repeat_base_run_id=?3, repeat_reason=?4, benchmark_started=?5 WHERE id=?1",
+        params![
+            manifest.id,
+            crate::repeat::config_key(manifest, fingerprints),
+            repeat.map(|check| check.base_run_id.as_str()),
+            repeat.and_then(|check| check.reason.as_deref()),
+            benchmark_started(manifest),
+        ],
+    )?;
+    connection.execute("DELETE FROM run_identity WHERE run_id=?1", [&manifest.id])?;
+    if let Some(identity) = &manifest.identity {
+        for (key, value) in &identity.values {
+            connection.execute(
+                "INSERT INTO run_identity (run_id, key, value) VALUES (?1, ?2, ?3)",
+                params![manifest.id, key, value],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn fingerprint_map(
+    fingerprints: &[Fingerprint],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    fingerprints
+        .iter()
+        .map(|fingerprint| {
+            Ok((
+                fingerprint_key(&fingerprint.name, &fingerprint.labels)?,
+                fingerprint.value.clone(),
+            ))
+        })
+        .collect()
 }
 
 fn persist_agent_context(connection: &Connection, manifest: &RunManifest) -> Result<()> {

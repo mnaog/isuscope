@@ -90,9 +90,8 @@ async fn run_command(
             Some(format!("{label} timed out after {}s", timeout.as_secs()))
         }
     };
-    for task in [stdout_task, stderr_task] {
-        let _ = process::finish_capture(task, process::CAPTURE_DEADLINE, group).await;
-    }
+    let _ = process::finish_captures([stdout_task, stderr_task], process::CAPTURE_DEADLINE, group)
+        .await;
     if let Some(message) = &mut error {
         let tail = std::fs::read_to_string(&stderr).unwrap_or_default();
         if let Some(line) = tail.lines().rev().find(|line| !line.trim().is_empty()) {

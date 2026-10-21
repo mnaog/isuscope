@@ -88,6 +88,15 @@ enum Commands {
         #[arg(long, default_value_t = 20, value_parser = parse_list_limit)]
         limit: usize,
     },
+    /// 同じ構成（`config_key`）を測ったrunのscoreの揺れを、runごとに開始時点で分かっていた値で出します。
+    Variance {
+        /// このrunの行と、同じ構成を測ったrunのscoreだけを出します。
+        #[arg(long)]
+        run: Option<String>,
+        /// 機械向けJSONで出力します。
+        #[arg(long)]
+        json: bool,
+    },
     /// runの判断材料だけを小さい機械向けJSONで出力します。
     Brief {
         /// `latest`、run ID、一意な短縮ID、または一意なtagを指定します。
@@ -264,10 +273,6 @@ enum Commands {
         method_field: String,
         #[arg(long, default_value = "uri")]
         uri_field: String,
-        /// 旧`nginx-series` collectorの引数。route別の集計と時系列はnode上の`alp`へ移ったので、
-        /// 渡されたら設定の更新を求めて失敗する。
-        #[arg(long, hide = true)]
-        series_only: bool,
     },
     /// nodeの`isuscope-node`と同じ集計（`isuscope-node --build-id`と`access-summary`）。手元で差分を
     /// 集計し直すときと、templateのcollectorを試すときに使います。
@@ -576,16 +581,8 @@ async fn real_main(cli: Cli) -> Result<bool> {
         session_field,
         method_field,
         uri_field,
-        series_only,
     } = &cli.command
     {
-        if *series_only {
-            anyhow::bail!(
-                "the nginx-series collector was replaced by the node-side `alp` collector; \
-                 remove nginx-series from .isuscope/config.toml and take the alp, nginx-log-raw \
-                 and user-transition collectors from `isuscope init --print`"
-            );
-        }
         isuscope::transition::emit(isuscope::transition::TransitionOptions {
             run_dir,
             prefix,
@@ -670,6 +667,10 @@ async fn real_main(cli: Cli) -> Result<bool> {
         }
         Commands::Brief { run, limit } => {
             show_brief(&config, &run, limit)?;
+            Ok(true)
+        }
+        Commands::Variance { run, json } => {
+            show_variance(&config, run.as_deref(), json)?;
             Ok(true)
         }
         Commands::Sql {
@@ -843,17 +844,19 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 .map(|requested| store.require_id(&requested, "base run"))
                 .transpose()?;
             // Validate the decision before appending, so a rejected decision leaves no analysis.
+            let mut evidence = vec![id.clone()];
+            evidence.extend(base.clone());
             let decision = match (change, decision) {
                 (Some(change), Some(status)) => Some(store.prepare_change_decision(
                     &change,
-                    &id,
+                    &evidence,
                     status,
                     description,
                     revisit,
                 )?),
                 _ => None,
             };
-            let manifest =
+            let (manifest, appended) =
                 store.append_analysis_with_base(&id, verdict.into(), body.clone(), base.clone())?;
             let latest = manifest
                 .analyses
@@ -863,12 +866,19 @@ async fn real_main(cli: Cli) -> Result<bool> {
             println!("verdict   {}", latest.verdict.as_str());
             println!("analysis  {}", manifest.analysis_status.as_str());
             println!("revisions {}", manifest.analyses.len());
+            if !appended {
+                println!("unchanged the latest analysis already has this verdict and text");
+            }
             if let Some(prepared) = decision {
-                let mut runs = vec![id.clone()];
-                runs.extend(base);
-                let recorded = store.record_change_decision(prepared, body, runs)?;
+                let (recorded, created) = store.record_change_decision(prepared, body, evidence)?;
                 println!("change    {}", recorded.change_id);
                 println!("decision  {}", recorded.status.as_str());
+                if !created {
+                    println!(
+                        "unchanged decision {} already records this status and reason",
+                        recorded.id
+                    );
+                }
             }
             Ok(true)
         }
@@ -881,9 +891,17 @@ async fn real_main(cli: Cli) -> Result<bool> {
                     runs,
                     reason,
                     revisit,
-                } => write_stdout_json(&isuscope::changes::DecisionView::from(
-                    store.decide_change(&id, status, reason, revisit, runs)?,
-                ))?,
+                } => {
+                    let (decision, created) =
+                        store.decide_change(&id, status, reason, revisit, runs)?;
+                    if !created {
+                        eprintln!(
+                            "unchanged: decision {} already records this status and reason",
+                            decision.id
+                        );
+                    }
+                    write_stdout_json(&isuscope::changes::DecisionView::from(decision))?
+                }
                 ChangeCommand::List { status, limit } => {
                     let mut changes = store
                         .list_changes(status, None, 100_000)?
@@ -1979,6 +1997,58 @@ impl<T> Listed<T> {
             items,
         }
     }
+}
+
+fn show_variance(config: &LoadedConfig, run: Option<&str>, json: bool) -> Result<()> {
+    use isuscope::variance;
+    let store = Store::open(&config.data_dir)?;
+    let rows = variance::rows(&store)?;
+    let Some(requested) = run else {
+        if json {
+            return write_stdout_json(&serde_json::json!({
+                "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
+                "runs": rows,
+            }));
+        }
+        println!("{}", variance::header());
+        for row in &rows {
+            println!("{}", variance::describe(row));
+        }
+        return Ok(());
+    };
+    let id = store.require_id(requested, "run")?;
+    let row = rows
+        .iter()
+        .find(|row| row.id == id)
+        .with_context(|| format!("run {} has no score", runner::short_id(&id)))?;
+    let config_runs = variance::config_runs(&rows, row);
+    if json {
+        return write_stdout_json(&serde_json::json!({
+            "schema_version": isuscope::model::OUTPUT_SCHEMA_VERSION,
+            "run": row,
+            "config_runs": config_runs,
+        }));
+    }
+    println!("{}", variance::header());
+    println!("{}", variance::describe(row));
+    if !config_runs.is_empty() {
+        println!();
+        println!("same config_key");
+        for other in &config_runs {
+            println!(
+                "{}  {:>8}  {}{}",
+                other.run,
+                other.score,
+                match other.passed {
+                    Some(true) => "PASS",
+                    Some(false) => "FAIL",
+                    None => "-",
+                },
+                if other.repeat { "  repeat" } else { "" }
+            );
+        }
+    }
+    Ok(())
 }
 
 fn list_runs(config: &LoadedConfig, limit: usize) -> Result<()> {

@@ -206,8 +206,11 @@ async fn execute(
         }
     };
     // collectorと同じく、pipeを握った孫が残っても取り込みを締切で打ち切る。
-    for (task, stream) in [(stdout_task, "stdout"), (stderr_task, "stderr")] {
-        match process::finish_capture(task, process::CAPTURE_DEADLINE, group).await {
+    let captures =
+        process::finish_captures([stdout_task, stderr_task], process::CAPTURE_DEADLINE, group)
+            .await;
+    for (capture, stream) in captures.into_iter().zip(["stdout", "stderr"]) {
+        match capture {
             process::Capture::Finished(Ok(Ok(true))) => errors.push(format!(
                 "{stream} truncated at {} bytes",
                 parser.max_output_bytes

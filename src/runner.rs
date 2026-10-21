@@ -38,11 +38,6 @@ pub async fn execute(
     shutdown: Shutdown,
     mut annotations: RunAnnotations,
 ) -> Result<RunOutcome> {
-    if mode == RunMode::ScoreRun {
-        bail!(
-            "score-run is no longer supported; remove observation settings and use `isuscope run`"
-        );
-    }
     if annotations.hypothesis.trim().is_empty() {
         bail!("hypothesis must not be empty");
     }
@@ -85,7 +80,6 @@ pub async fn execute(
             short_id(run),
         );
     }
-    check_node_disks(&config).await?;
     let agent_context = agent_context::resolve(&config)?;
     let id = Uuid::now_v7().to_string();
     // run.jsonを書く前に印を握る。握る前に書くと、別processの回収処理に中断runと誤認される。
@@ -99,28 +93,44 @@ pub async fn execute(
         context.write_snapshot(&staging)?;
     }
 
-    let mut source_excludes = config.config.source.exclude.clone();
-    if let Some(history_dir) = config.config.context.history_dir() {
-        source_excludes.push(history_dir.to_path_buf());
-    }
-    let source = git_snapshot::capture(
-        &config.source_repo(),
-        &staging.join("source"),
-        &source_excludes,
-    )
-    .unwrap_or_else(|error| SourceSnapshot {
-        repository: config.source_repo().display().to_string(),
-        dirty: true,
-        error: Some(format!("{error:#}")),
-        ..Default::default()
-    });
-    let tooling = tooling::capture(&config, &staging.join("tooling")).unwrap_or_else(|error| {
-        ToolingSnapshot {
-            isuscope_version: env!("CARGO_PKG_VERSION").into(),
-            error: Some(format!("{error:#}")),
-            ..Default::default()
+    let repeat_reason = annotations
+        .repeat
+        .take()
+        .map(|reason| reason.trim().to_owned())
+        .filter(|reason| !reason.is_empty());
+    let hook_context = HookContext {
+        config: &config,
+        run_id: &id,
+        run_dir: &staging,
+        mode,
+        env: repeat_reason
+            .iter()
+            .map(|reason| ("ISUSCOPE_REPEAT_REASON", reason.clone()))
+            .collect(),
+        shutdown: Some(shutdown.clone()),
+    };
+    let benchmark_config = &config.config.benchmark;
+
+    // The disk check waits on SSH, the snapshots on the local disk and the identity hook on
+    // whatever it asks; none needs another's result, so they run at the same time.
+    let snapshots = {
+        let config = config.clone();
+        let staging = staging.clone();
+        tokio::task::spawn_blocking(move || capture_snapshots(&config, &staging))
+    };
+    let identity = async {
+        match &benchmark_config.identity_command {
+            Some(command) => Some(hooks::run(&hook_context, "identity", command).await),
+            None => None,
         }
-    });
+    };
+    let (disks, snapshots, identity) = tokio::join!(check_node_disks(&config), snapshots, identity);
+    if let Err(error) = disks {
+        // Nothing of the run was recorded yet; leave no directory behind.
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let (source, tooling) = snapshots.context("source and tooling snapshot task failed")?;
     let started_at = Utc::now();
     annotations.tags.sort();
     annotations.tags.dedup();
@@ -159,30 +169,25 @@ pub async fn execute(
     let mut fingerprints = Vec::new();
     let mut transitions = Vec::new();
     let mut after_outputs = None;
+    let mut after_cut = false;
 
-    let repeat_reason = annotations
-        .repeat
-        .take()
-        .map(|reason| reason.trim().to_owned())
-        .filter(|reason| !reason.is_empty());
-    let hook_context = HookContext {
-        config: &config,
-        run_id: &id,
-        run_dir: &staging,
-        mode,
-        env: repeat_reason
-            .iter()
-            .map(|reason| ("ISUSCOPE_REPEAT_REASON", reason.clone()))
-            .collect(),
-    };
-    let benchmark_config = &config.config.benchmark;
-    if let Some(command) = &benchmark_config.identity_command {
+    if let Some(output) = identity {
         println!("→ identity");
-        let output = hooks::run(&hook_context, "identity", command).await;
         if output.result.status == "complete" {
             manifest.identity = Some(repeat::identity(&output.stdout));
         }
         absorb_hook(output, &mut manifest);
+    }
+    // Without before collectors no fingerprint can appear later, and prepare_command does not
+    // change what was already compared, so a repeat is known now: refuse it before
+    // prepare_command restarts anything.
+    if collector::selected(&config, mode, CollectorPhase::Before)
+        .next()
+        .is_none()
+        && let Some(check) = check_repeat(&store, &manifest, &[], repeat_reason.clone())?
+        && refuses(&check)
+    {
+        return refuse_repeat(&config, &store, &id, &check, false).await;
     }
     let mut prepare_error = None;
     if let Some(command) = &benchmark_config.prepare_command {
@@ -240,19 +245,20 @@ pub async fn execute(
     if prepare_error.is_none() {
         manifest.repeat = check_repeat(&store, &manifest, &fingerprints, repeat_reason.clone())?;
     }
-    let refused_as_repeat = manifest
-        .repeat
-        .as_ref()
-        .is_some_and(|check| check.changed.is_empty() && check.reason.is_none());
+    let refused_as_repeat = manifest.repeat.as_ref().is_some_and(refuses);
 
     if let Some(error) = prepare_error {
-        eprintln!("! {error}");
-        manifest.benchmark = BenchmarkResult {
-            mode: "not-started".into(),
-            passed: Some(false),
-            error: Some(error),
-            ..Default::default()
-        };
+        if shutdown.is_cancelled() {
+            manifest.benchmark = interrupted_benchmark();
+        } else {
+            eprintln!("! {error}");
+            manifest.benchmark = BenchmarkResult {
+                mode: "not-started".into(),
+                passed: Some(false),
+                error: Some(error),
+                ..Default::default()
+            };
+        }
         // before collectorを動かしていないので、後片付けするものも無い。
         after_outputs = Some(Vec::new());
     } else if shutdown.is_cancelled() {
@@ -277,21 +283,11 @@ pub async fn execute(
             ..Default::default()
         };
     } else if refused_as_repeat {
-        let base = manifest
+        let check = manifest
             .repeat
-            .as_ref()
-            .map(|check| short_id(&check.base_run_id).to_owned())
-            .unwrap_or_default();
-        let error = format!(
-            "nothing isuscope can see changed since run {base} (deployment, node fingerprints, observation settings); deploy the change, or pass --repeat \"<reason>\" to measure the same configuration again"
-        );
-        eprintln!("! {error}");
-        manifest.benchmark = BenchmarkResult {
-            mode: "not-started".into(),
-            passed: Some(false),
-            error: Some(error),
-            ..Default::default()
-        };
+            .take()
+            .context("repeat check was recorded")?;
+        return refuse_repeat(&config, &store, &id, &check, true).await;
     } else {
         println!("→ collectors: during");
         let (running, startup_failures) = timed(
@@ -325,15 +321,27 @@ pub async fn execute(
             );
             if let Some(command) = &benchmark_config.cleanup_command {
                 println!("→ cleanup");
+                // The signal that interrupted the benchmark must not cut its cleanup short; a
+                // second signal exits the process anyway.
+                let cleanup_context = HookContext {
+                    env: hook_context.env.clone(),
+                    shutdown: later_signal(&shutdown),
+                    ..hook_context
+                };
                 let output = timed(
                     "cleanup",
                     &mut manifest.stages,
-                    hooks::run(&hook_context, "cleanup", command),
+                    hooks::run(&cleanup_context, "cleanup", command),
                 )
                 .await;
                 absorb_hook(output, &mut manifest);
             }
         }
+        // during collectorを止めるのは境界に依らない（境界で決まるのは出力の解析だけ）ので、
+        // 境界を探す間に並行して止め始める。
+        let stop_started_at = Utc::now();
+        let stop_started = std::time::Instant::now();
+        let terminating = tokio::spawn(collector::terminate_during(running));
         // ベンチの出力に境界が無ければ、collector（access logの最後のinitialize要求など）から取る。
         // during collectorの解析とafter collectorの区間はこの境界で決まるので、その前に済ませる。
         if manifest.benchmark.started_at.is_some()
@@ -347,7 +355,14 @@ pub async fn execute(
             let boundary = timed(
                 "collectors_boundary",
                 &mut manifest.stages,
-                collector::run_phase(&config, mode, CollectorPhase::Boundary, &id, &staging, None),
+                collector::run_phase(
+                    &config,
+                    mode,
+                    CollectorPhase::Boundary,
+                    &id,
+                    &staging,
+                    later_signal(&shutdown),
+                ),
             )
             .await;
             apply_boundary(&mut manifest, &staging, &boundary);
@@ -372,18 +387,35 @@ pub async fn execute(
                 enrichment::run_all(&config, &id, &staging, &id),
             ),
             async {
-                let during = timed(
-                    "collectors_during_stop",
-                    &mut collector_stages,
-                    collector::stop_during(running, &staging),
-                )
-                .await;
+                // Recorded from when the collectors were told to stop, as before the overlap.
+                let during = match terminating.await {
+                    Ok(stopped) => collector::finalize_during(stopped, &staging).await,
+                    Err(error) => {
+                        eprintln!("! stopping the during collectors failed: {error}");
+                        Vec::new()
+                    }
+                };
+                collector_stages.push(StageTiming {
+                    name: "collectors_during_stop".into(),
+                    started_at: stop_started_at,
+                    duration_ms: stop_started.elapsed().as_millis() as u64,
+                });
+                let watch = later_signal(&shutdown);
+                let interruptible = watch.is_some();
                 let after = timed(
                     "collectors_after",
                     &mut collector_stages,
-                    collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None),
+                    collector::run_phase(
+                        &config,
+                        mode,
+                        CollectorPhase::After,
+                        &id,
+                        &staging,
+                        watch,
+                    ),
                 )
                 .await;
+                after_cut = interruptible && shutdown.is_cancelled();
                 (during, after)
             },
         );
@@ -406,12 +438,16 @@ pub async fn execute(
     let after = match after_outputs {
         Some(after) => after,
         None => {
-            timed(
+            let watch = later_signal(&shutdown);
+            let interruptible = watch.is_some();
+            let after = timed(
                 "collectors_after",
                 &mut manifest.stages,
-                collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, None),
+                collector::run_phase(&config, mode, CollectorPhase::After, &id, &staging, watch),
             )
-            .await
+            .await;
+            after_cut = interruptible && shutdown.is_cancelled();
+            after
         }
     };
     absorb(
@@ -421,6 +457,11 @@ pub async fn execute(
         &mut fingerprints,
         &mut transitions,
     );
+    // A signal cut the after collectors short: undo what the earlier phases left on the nodes
+    // (profilers, marks), as the recovery of an abandoned run would.
+    if after_cut {
+        collector::cleanup_abandoned(&config, std::slice::from_ref(&id)).await;
+    }
     // nodeへの操作はここまで。保存の間に次のdeployを始められるよう、共通lockを先に手放す。
     crate::lock::release_run_lock();
 
@@ -513,6 +554,37 @@ pub async fn execute(
     })
 }
 
+/// The source (Git) and tooling snapshots of a new run, written into its staging directory.
+/// A snapshot that fails is recorded with its error instead of stopping the run.
+fn capture_snapshots(
+    config: &LoadedConfig,
+    staging: &std::path::Path,
+) -> (SourceSnapshot, ToolingSnapshot) {
+    let mut source_excludes = config.config.source.exclude.clone();
+    if let Some(history_dir) = config.config.context.history_dir() {
+        source_excludes.push(history_dir.to_path_buf());
+    }
+    let source = git_snapshot::capture(
+        &config.source_repo(),
+        &staging.join("source"),
+        &source_excludes,
+    )
+    .unwrap_or_else(|error| SourceSnapshot {
+        repository: config.source_repo().display().to_string(),
+        dirty: true,
+        error: Some(format!("{error:#}")),
+        ..Default::default()
+    });
+    let tooling = tooling::capture(config, &staging.join("tooling")).unwrap_or_else(|error| {
+        ToolingSnapshot {
+            isuscope_version: env!("CARGO_PKG_VERSION").into(),
+            error: Some(format!("{error:#}")),
+            ..Default::default()
+        }
+    });
+    (source, tooling)
+}
+
 /// Runs one stage of the run and records when it started and how long it took.
 async fn timed<T>(
     name: &str,
@@ -599,8 +671,47 @@ fn absorb_hook(output: hooks::HookOutput, manifest: &mut RunManifest) {
             result.error.as_deref().unwrap_or("failed")
         );
     }
+    for warning in &result.warnings {
+        eprintln!("! {}: {warning}", result.name);
+    }
     manifest.logs.extend(output.logs);
     manifest.hooks.push(output.result);
+}
+
+/// The shutdown to hand to a stage that also cleans up (the boundary and after collectors,
+/// `cleanup_command`): a signal that already interrupted the run must not cut it short, so it
+/// gets none then, and a second signal exits the process instead.
+fn later_signal(shutdown: &Shutdown) -> Option<Shutdown> {
+    (!shutdown.is_cancelled()).then(|| shutdown.clone())
+}
+
+/// Nothing isuscope can see changed and no `--repeat` reason was given.
+fn refuses(check: &crate::model::RepeatCheck) -> bool {
+    check.changed.is_empty() && check.reason.is_none()
+}
+
+/// Stops a run refused as a repeat without saving it: a refusal is not a result, so it must
+/// not show up as a FAIL in `list`, `sql` or the analysis gate. Only what the before
+/// collectors left on the nodes is cleaned up; the after collectors are not run.
+async fn refuse_repeat(
+    config: &LoadedConfig,
+    store: &Store,
+    id: &str,
+    check: &crate::model::RepeatCheck,
+    ran_before_collectors: bool,
+) -> Result<RunOutcome> {
+    let base = short_id(&check.base_run_id);
+    eprintln!(
+        "! nothing isuscope can see changed since run {base} (deployment, node fingerprints, observation settings); deploy the change, or pass --repeat \"<reason>\" to measure the same configuration again"
+    );
+    if ran_before_collectors {
+        collector::cleanup_abandoned(config, &[id.to_owned()]).await;
+    }
+    crate::lock::release_run_lock();
+    store.discard(id)?;
+    println!();
+    println!("run       not saved (refused: same as {base})");
+    Ok(RunOutcome { passed: false })
 }
 
 /// Compares this run with the last one whose benchmark started. `None` when there is none.

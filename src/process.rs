@@ -12,30 +12,87 @@ pub enum Capture<T> {
     Abandoned,
 }
 
-/// 子processが終わった後の取り込みtaskを、締切まで待つ。直接の子が終わっても、同じprocess
-/// groupの孫がpipeを握っているとEOFが来ず、待ち続けてしまう。締切を過ぎたら、`group`
-/// （子のprocess group）があればそれを落とし、taskを止める。JoinHandleをdropしてもtaskは止まらず、
-/// `abort()`も呼んだ時点では止まっていないので、joinまで待つ。
-pub async fn finish_capture<T>(
-    mut task: tokio::task::JoinHandle<T>,
+/// 子processが終わった後の取り込みtask（stdoutとstderrなど）を、1つの締切まで待つ。直接の子が
+/// 終わっても、同じprocess groupの孫がpipeを握っているとEOFが来ず、待ち続けてしまう。締切は
+/// 全taskで共有するので、待つのは最長でも`deadline`1回分。過ぎたら、`group`（子のprocess group）
+/// があればそれを落とし、残ったtaskを止める。JoinHandleをdropしてもtaskは止まらず、`abort()`も
+/// 呼んだ時点では止まっていないので、joinまで待つ。結果は渡した順に返す。
+pub async fn finish_captures<T, const N: usize>(
+    tasks: [tokio::task::JoinHandle<T>; N],
     deadline: Duration,
     group: Option<u32>,
-) -> Capture<T> {
-    match tokio::time::timeout(deadline, &mut task).await {
-        Ok(joined) => Capture::Finished(joined),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(group) = group {
-                // SAFETY: a negative PID targets only the process group created for this child.
-                unsafe {
-                    libc::kill(-(group as i32), libc::SIGKILL);
-                }
+) -> [Capture<T>; N] {
+    let until = tokio::time::Instant::now() + deadline;
+    let mut waited = Vec::with_capacity(N);
+    for mut task in tasks {
+        // The task is polled before the deadline is checked, so one that already finished
+        // is taken even after an earlier task used up the time.
+        match tokio::time::timeout_at(until, &mut task).await {
+            Ok(joined) => waited.push(Ok(joined)),
+            Err(_) => waited.push(Err(task)),
+        }
+    }
+    if waited.iter().any(Result::is_err) {
+        #[cfg(unix)]
+        if let Some(group) = group {
+            // SAFETY: a negative PID targets only the process group created for this child.
+            unsafe {
+                libc::kill(-(group as i32), libc::SIGKILL);
             }
-            #[cfg(not(unix))]
-            let _ = group;
-            task.abort();
-            let _ = task.await;
-            Capture::Abandoned
+        }
+        #[cfg(not(unix))]
+        let _ = group;
+    }
+    let mut captures = Vec::with_capacity(N);
+    for result in waited {
+        captures.push(match result {
+            Ok(joined) => Capture::Finished(joined),
+            Err(task) => {
+                task.abort();
+                let _ = task.await;
+                Capture::Abandoned
+            }
+        });
+    }
+    captures
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("one capture per task"))
+}
+
+/// Process groups of children that are running now, so an immediate exit can stop them
+/// (each child gets its own group, which a terminal's signal does not reach).
+static GROUPS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Keeps a child's process group in the registry until dropped.
+pub struct RegisteredGroup(Option<u32>);
+
+/// Registers the process group of a child started with [`configure_group`].
+pub fn register_group(group: Option<u32>) -> RegisteredGroup {
+    if let (Some(group), Ok(mut groups)) = (group, GROUPS.lock()) {
+        groups.push(group);
+    }
+    RegisteredGroup(group)
+}
+
+impl Drop for RegisteredGroup {
+    fn drop(&mut self) {
+        if let (Some(group), Ok(mut groups)) = (self.0, GROUPS.lock())
+            && let Some(position) = groups.iter().position(|value| *value == group)
+        {
+            groups.swap_remove(position);
+        }
+    }
+}
+
+/// Sends SIGKILL to every registered process group. Used just before exiting on a second signal.
+pub fn kill_registered_groups() {
+    #[cfg(unix)]
+    if let Ok(groups) = GROUPS.lock() {
+        for group in groups.iter() {
+            // SAFETY: a negative PID targets only a process group created for one of our children.
+            unsafe {
+                libc::kill(-(*group as i32), libc::SIGKILL);
+            }
         }
     }
 }
