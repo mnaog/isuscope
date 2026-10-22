@@ -201,6 +201,15 @@ while :; do
   done
   emit host.memory_used_bytes "$mem" bytes
   emit host.load1 "$load" load
+  # 実行可能なtaskの数（このsampler自身を含む）。コア数より多い間は、どれかがCPUを待っている。
+  set -- $(awk '$1 == "procs_running" { r = $2 } $1 == "procs_blocked" { b = $2 } $1 == "ctxt" { c = $2 } END { print r + 0, b + 0, c + 0 }' /proc/stat)
+  emit host.procs_running "$1" tasks
+  emit host.procs_blocked "$2" tasks
+  ctxt=$3
+  if [ -n "${ctxt_previous:-}" ] && [ "$dt_cs" -gt 0 ]; then
+    emit host.context_switches_per_second "$(awk -v a="$ctxt_previous" -v b="$ctxt" -v dt="$dt_cs" 'BEGIN { printf "%.3f", (b - a) * 100 / dt }')" switches
+  fi
+  ctxt_previous=$ctxt
   # コア別。busyが1コアだけ高いなら、全体の余裕は当てにならない。
   cores_current=$(read_cores)
   printf '%s\n---\n%s\n' "$cores_previous" "$cores_current" | awk 'BEGIN { first = 1 }
@@ -334,10 +343,32 @@ unit_pids() {
   fi
   [ "$2" -gt 0 ] && echo "$2"
 }
+# 経過時間は/proc/uptimeから1/100秒で取り、率はその実測間隔で割る（host-samplerと同じ）。
+read_centis() {
+  read -r up _ < /proc/uptime
+  frac=${up#*.}
+  frac=${frac#0}
+  centis=$(( ${up%.*} * 100 + ${frac:-0} ))
+}
+# 全threadがCPUを待った時間（schedstatの2列目、ns）と、CPUを取り上げられた回数（nonvoluntary
+# context switch）の合計。CPU使用率が低くても、threadの数がコアより多いとここに待ちが出る。
+# kernelがschedstatを出さなければ空になり、その2つは出さない。
+read_sched() {
+  for pid in $1; do
+    cat /proc/"$pid"/task/*/schedstat 2>/dev/null || true
+    grep -h '^nonvoluntary_ctxt_switches' /proc/"$pid"/task/*/status 2>/dev/null || true
+  done | awk 'NF == 3 && $2 ~ /^[0-9]+$/ { d += $2; seen = 1 } $1 == "nonvoluntary_ctxt_switches:" { n += $2 }
+    END { if (seen) printf "%.0f:%.0f\n", d, n }'
+}
 previous=
+sched_previous=
+read_centis; previous_centis=$centis
 while :; do
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  read_centis; dt_cs=$(( centis - previous_centis )); previous_centis=$centis
+  [ "$dt_cs" -ge 50 ] && [ "$dt_cs" -le 6000 ] || dt_cs=0
   current=
+  sched_current=
   for unit in $units; do
     main=$(systemctl show "$unit" --property=MainPID --value 2>/dev/null || echo 0)
     case "$main" in ''|*[!0-9]*) main=0 ;; esac
@@ -347,14 +378,31 @@ while :; do
       *" $unit="*) before=${previous#*" $unit="}; before=${before%% *}
         if [ "$before" -gt 0 ] && [ "$main" -gt 0 ] && [ "$before" != "$main" ]; then emit service.process_restarts 1 restarts "$unit"; fi ;;
     esac
-    set -- $(for pid in $(unit_pids "$unit" "$main"); do cat "/proc/$pid/status" 2>/dev/null || true; done |
+    pids=$(unit_pids "$unit" "$main" || true)
+    set -- $(for pid in $pids; do cat "/proc/$pid/status" 2>/dev/null || true; done |
       awk '$1 == "VmRSS:" { rss += $2 } $1 == "Threads:" { threads += $2; processes++ } END { print rss * 1024, threads + 0, processes + 0 }')
     emit service.processes "$3" processes "$unit"
     [ "$3" -gt 0 ] || continue
     emit service.process_rss_bytes "$1" bytes "$unit"
     emit service.process_threads "$2" threads "$unit"
+    sched=$(read_sched "$pids")
+    [ -n "$sched" ] || continue
+    sched_current="$sched_current $unit=$sched"
+    case " $sched_previous " in
+      *" $unit="*) before=${sched_previous#*" $unit="}; before=${before%% *} ;;
+      *) continue ;;
+    esac
+    [ "$dt_cs" -gt 0 ] || continue
+    # threadが終わると合計が減る。減った秒は値を出さない（待ちを負の値や0と取り違えない）。
+    set -- $(awk -v a="$before" -v b="$sched" -v dt="$dt_cs" 'BEGIN {
+      split(a, x, ":"); split(b, y, ":"); d = y[1] - x[1]; n = y[2] - x[2]
+      if (d >= 0) printf "%.4f ", d / (dt * 1e7); else printf "- "
+      if (n >= 0) printf "%.3f\n", n * 100 / dt; else printf "-\n" }')
+    [ "$1" = - ] || emit service.run_delay_cores "$1" cores "$unit"
+    [ "$2" = - ] || emit service.involuntary_switches_per_second "$2" switches "$unit"
   done
   previous=$current
+  sched_previous=$sched_current
   sleep 1
 done
 ''']

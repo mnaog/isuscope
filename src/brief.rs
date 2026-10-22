@@ -115,6 +115,9 @@ pub struct BriefHostNode {
     pub pressure: Option<BriefPressure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load1_max: Option<f64>,
+    /// 実行可能なtaskの数のピーク（samplerを含む）。コア数を超えた分はCPUを待っている。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procs_running_max: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_used_max_mib: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -420,6 +423,13 @@ pub struct BriefService {
     /// ベンチの間にMainPIDが変わった回数。クラッシュやOOM killによる再起動の手がかり。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restarts: Option<usize>,
+    /// CPUを待っていたthreadの平均の数（runqueueで待った時間÷経過時間、`process-sampler`）。
+    /// CPU使用率に余裕があっても、threadの数がコアより多いとここに出る。lockの保持中に
+    /// preemptされると、lock待ちもこの分だけ延びる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_delay_avg_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_delay_max_cores: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1263,6 +1273,7 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         | "service.process_rss_bytes"
                         | "service.process_threads"
                         | "service.process_restarts"
+                        | "service.run_delay_cores"
                 ) {
                     continue;
                 }
@@ -1274,6 +1285,8 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         rss_max_mib: None,
                         threads_max: None,
                         restarts: None,
+                        run_delay_avg_cores: None,
+                        run_delay_max_cores: None,
                     });
                 match row.metric.as_str() {
                     "service.cpu_cores" => {
@@ -1283,6 +1296,11 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         service.rss_max_mib = Some(query::round_to(row.peak / 1_048_576.0, 1))
                     }
                     "service.process_threads" => service.threads_max = Some(row.peak),
+                    "service.run_delay_cores" => {
+                        service.run_delay_avg_cores =
+                            row.value.map(|value| query::round_to(value, 3));
+                        service.run_delay_max_cores = Some(query::round_to(row.peak, 3));
+                    }
                     _ => service.restarts = row.value.map(|count| count as usize),
                 }
             }
@@ -1311,6 +1329,7 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                 steal_avg_percent: average("host.cpu_steal_percent"),
                 pressure,
                 load1_max: peak("host.load1"),
+                procs_running_max: peak("host.procs_running"),
                 memory_used_max_mib: peak("host.memory_used_bytes")
                     .map(|bytes| query::round_to(bytes / 1_048_576.0, 1)),
                 disk_util_max_percent: peak("host.disk_util_percent"),
@@ -1738,6 +1757,8 @@ mod tests {
             ),
             row("service.process_threads", "core.service", 99.0, 228.0),
             row("service.process_restarts", "core.service", 1.0, 1.0),
+            row("service.run_delay_cores", "core.service", 0.41234, 1.9),
+            row("host.procs_running", "host", 3.0, 11.0),
             row(
                 "service.process_rss_bytes",
                 "nginx.service",
@@ -1759,7 +1780,13 @@ mod tests {
             ),
             (None, Some(1254.0), Some(228.0), Some(1))
         );
+        assert_eq!(
+            (core.run_delay_avg_cores, core.run_delay_max_cores),
+            (Some(0.412), Some(1.9))
+        );
+        assert_eq!(nodes[0].procs_running_max, Some(11.0));
         assert_eq!(services[1].restarts, None);
+        assert_eq!(services[1].run_delay_avg_cores, None);
     }
 
     #[test]

@@ -346,9 +346,12 @@ collectorが失敗したときは、`isuscope sql "SELECT name, node, status, er
 - CPU内訳、memory、load。
 - コア別の使用率（`host.core_busy_percent`と、最も詰まっているコアの`host.core_busy_max_percent`）。全体のCPUに余裕があっても1コアだけ飽和している構成を見落とさないためです。
 - PSI（`host.psi_cpu_some_percent`など、CPU・memory・I/Oの不足でtaskが足止めされた時間の割合）。
+- 実行可能なtaskの数（`host.procs_running`、samplerを含む）とcontext switchの回数。コア数を超えた分はCPUを待っています。
 - 接続とネットワークのcounter：`host.tcp_passive_opens_per_second`、`host.tcp_established`、`host.tcp_time_wait`、`host.tcp_listen_overflows_per_second`、`host.tcp_listen_drops_per_second`、`host.tcp_syn_cookies_sent_per_second`、`host.tcp_time_wait_overflow_per_second`、`host.tcp_retransmit_segments_per_second`、NICごとの`host.net_rx_packets_per_second`など、`host.cpu_softirq_percent`。取りこぼしのcounterが0のままなら、少なくとも受け付けの取りこぼしとしては説明できません（接続の失敗がサーバー側にないことの証明にはなりません）。
 
 毎秒値は`/proc/uptime`で測った実際の間隔で割るので、samplerが1秒より遅れても率が水増しされません。毎秒値は小数で出し、取りこぼし系（`host.tcp_listen_overflows`、`host.tcp_listen_drops`、`host.tcp_syn_cookies_sent`、`host.tcp_time_wait_overflow`、`host.tcp_retransmit_segments`）は区間の件数も整数で残します。整数で割っていたころは、1.01秒に1件の取りこぼしが0件/秒になり、「起きていない」と区別できませんでした。
+
+`process-sampler`は、unitの全threadがCPUを待った時間の合計を経過時間で割った`service.run_delay_cores`（CPUを待っていたthreadの平均の数）と、CPUを取り上げられた回数`service.involuntary_switches_per_second`も出します。CPU使用率が70〜80%でも、2 vCPUのnodeでtokioのworker 8本がnginxや計測とCPUを取り合えば、lockを持ったままpreemptされて待ちが延びます（practice-14-forthでは自作のlock統計でしか見えませんでした）。briefの`hosts`のserviceに平均とピーク（`run_delay_avg_cores`・`run_delay_max_cores`）、nodeに`procs_running_max`を出します。
 
 `service-throttle`は、cgroupのCPU上限で止められた時間（`service.cpu_throttled_percent`、`service.cpu_throttled_periods_per_second`）と割当量（`service.cpu_quota_cores`）をunitごとに出します。
 
