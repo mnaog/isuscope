@@ -98,7 +98,8 @@ impl BriefOutput {
         self.app_calls.cut(rows);
         self.app_locks.cut(rows);
         self.http.cut(rows);
-        self.http_by_count.cut(rows);
+        // 補助の欄なので、他の表より2行先に減らす。
+        self.http_by_count.cut(rows.saturating_sub(2).max(1));
         self.database.cut(rows);
         self.database_io.cut(rows);
         self.cpu.cut(rows);
@@ -723,7 +724,6 @@ pub struct BriefStaticFiles {
     pub routes: usize,
     pub count: f64,
     pub share_percent: f64,
-    pub total_ms: f64,
 }
 
 /// pathの最後の部分が`名前.拡張子`（拡張子は英数字で5文字まで）なら静的ファイルとみなす。
@@ -753,7 +753,6 @@ fn static_files(http: &[HttpRouteSummary]) -> Option<BriefStaticFiles> {
         routes: files.len(),
         count,
         share_percent: (count / total * 1000.0).round() / 10.0,
-        total_ms: query::round_to(files.iter().filter_map(|row| row.total_ms).sum::<f64>(), 3),
     })
 }
 
@@ -900,15 +899,22 @@ pub fn attach_app(
     });
     let window_name = window.map(|window| window.name.to_owned());
     let flag = window.map_or("whole", |window| window.name);
+    // 行の無い欄（アプリ計測の無いrun）には区間を付けない。
+    let calls_window = (!call_rows.is_empty())
+        .then(|| window_name.clone())
+        .flatten();
+    let locks_window = (!lock_rows.is_empty())
+        .then(|| window_name.clone())
+        .flatten();
     brief.app_calls = section(call_rows, limit)
-        .window(window_name.clone())
+        .window(calls_window)
         .more(|| {
             format!(
                 "isuscope query {short} --metric-prefix app.call. --scope series --window {flag} --limit 40"
             )
         });
     brief.app_locks = section(lock_rows, limit)
-        .window(window_name)
+        .window(locks_window)
         .more(|| {
             format!(
                 "isuscope query {short} --metric-prefix app.lock. --scope series --window {flag} --limit 40"
@@ -1280,7 +1286,8 @@ pub fn build(
         app_locks: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
-        http_by_count: section(http_by_count, limit)
+        // 補助の欄なので3行まで。他の表の行数を削ってまで並べない。
+        http_by_count: section(http_by_count, limit.min(3))
             .more(|| format!("isuscope query {short} --view http --sort count --limit 20")),
         http_static_files,
         database: section(database, limit)
@@ -2479,7 +2486,6 @@ mod tests {
                 routes: 3,
                 count: 812.0,
                 share_percent: 81.2,
-                total_ms: 812.0,
             })
         );
         assert!(is_static_file("/assets/root-BoSp76zW.css"));

@@ -2917,10 +2917,7 @@ const BRIEF_COLUMNS: &[(&str, &[&str])] = &[
             "route",
             "count",
             "share_percent",
-            "total_ms",
             "avg_ms",
-            "p95_ms",
-            "errors",
         ],
     ),
     (
