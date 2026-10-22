@@ -52,6 +52,10 @@ pub struct BriefOutput {
     /// 要求数の多いrouteのうち、`http`（合計時間の順）の上位に入らなかったもの。速くて回数の
     /// 多いroute（静的ファイルなど）は合計時間の順では埋もれ、nginxのCPUを食っていても見えない。
     pub http_by_count: BriefSection<HttpRouteSummary>,
+    /// 拡張子の付いたpath（`.js`・`.css`・画像など）への要求をまとめた数。静的ファイルは1 fileずつ
+    /// 別のrouteなので、1行ずつでは小さく見えても、合わせると全要求の過半を占めることがある。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_static_files: Option<BriefStaticFiles>,
     /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
     pub database_rows_filtered_out: usize,
@@ -708,6 +712,45 @@ pub struct BriefState {
     pub peak: u64,
 }
 
+#[derive(Debug, Serialize, PartialEq)]
+pub struct BriefStaticFiles {
+    pub routes: usize,
+    pub count: f64,
+    pub share_percent: f64,
+    pub total_ms: f64,
+}
+
+/// pathの最後の部分が`名前.拡張子`（拡張子は英数字で5文字まで）なら静的ファイルとみなす。
+fn is_static_file(route: &str) -> bool {
+    let path = route.split('?').next().unwrap_or(route);
+    let last = path.rsplit('/').next().unwrap_or(path);
+    match last.rsplit_once('.') {
+        Some((name, extension)) => {
+            !name.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 5
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+                && !extension.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+fn static_files(http: &[HttpRouteSummary]) -> Option<BriefStaticFiles> {
+    let total = http.iter().map(|row| row.count).sum::<f64>();
+    let files = http
+        .iter()
+        .filter(|row| is_static_file(&row.route))
+        .collect::<Vec<_>>();
+    let count = files.iter().map(|row| row.count).sum::<f64>();
+    (total > 0.0 && count > 0.0).then(|| BriefStaticFiles {
+        routes: files.len(),
+        count,
+        share_percent: (count / total * 1000.0).round() / 10.0,
+        total_ms: query::round_to(files.iter().filter_map(|row| row.total_ms).sum::<f64>(), 3),
+    })
+}
+
 #[derive(Debug, Serialize)]
 pub struct BriefAppCall {
     pub node: String,
@@ -1105,6 +1148,7 @@ pub fn build(
     let mut http = diagnostics.http;
     http.iter_mut().for_each(query::round_http_summary);
     let http_by_count = share_of_requests(&mut http, limit);
+    let http_static_files = static_files(&http);
     let (mut database, database_rows_filtered_out, database_window) =
         preferred_database(diagnostics.database, &run);
     database.iter_mut().for_each(query::round_database_summary);
@@ -1193,6 +1237,7 @@ pub fn build(
             .more(|| format!("isuscope query {short} --view http --limit 20")),
         http_by_count: section(http_by_count, limit)
             .more(|| format!("isuscope query {short} --view http --sort count --limit 20")),
+        http_static_files,
         database: section(database, limit)
             .window(database_window)
             .more(|| {
@@ -2381,6 +2426,19 @@ mod tests {
                 "/api/evaluation"
             ]
         );
+        assert_eq!(
+            static_files(&http),
+            Some(BriefStaticFiles {
+                routes: 3,
+                count: 812.0,
+                share_percent: 81.2,
+                total_ms: 812.0,
+            })
+        );
+        assert!(is_static_file("/assets/root-BoSp76zW.css"));
+        assert!(!is_static_file("/api/v1.2/items"));
+        assert!(!is_static_file("/api/rides/:ride_id"));
+        assert!(!is_static_file("/user/1.5"));
         // No requests at all: no share and nothing to list.
         let mut empty = vec![route("/x", 0.0, 0.0)];
         assert!(share_of_requests(&mut empty, 0).is_empty());
