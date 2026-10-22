@@ -98,6 +98,9 @@ enum Commands {
         /// state-log collectorが読む、アプリが状態の変化を書くfile。
         #[arg(long, default_value = isuscope::init::DEFAULT_STATE_LOG)]
         state_log: String,
+        /// app-metrics collectorが読む、アプリが外への呼び出しとlockの待ちを1秒ごとに書くfile。
+        #[arg(long, default_value = isuscope::init::DEFAULT_APP_METRICS)]
+        app_metrics: String,
         /// cgroupから追うsystemd unit。空白区切り。
         #[arg(long, default_value = "")]
         service_units: String,
@@ -668,6 +671,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         nginx_access_log,
         mysql_slow_log,
         state_log,
+        app_metrics,
         service_units,
         sample_output,
         no_scaffold,
@@ -678,6 +682,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             nginx_access_log: nginx_access_log.clone(),
             mysql_slow_log: mysql_slow_log.clone(),
             state_log: state_log.clone(),
+            app_metrics: app_metrics.clone(),
             service_units: service_units
                 .split_whitespace()
                 .map(ToOwned::to_owned)
@@ -2760,6 +2765,25 @@ fn build_brief(
 ) -> Result<brief::BriefOutput> {
     let diagnostics = load_diagnostics(config, store, requested)?;
     let review = store.run_review(&diagnostics.run)?;
+    // アプリ計測は1秒ごとの値なので、負荷区間（initializeの終わりが分からなければベンチ全体）で足す。
+    let run_benchmark = &diagnostics.run.benchmark;
+    let app_window = match (
+        run_benchmark.initialize_finished_at,
+        run_benchmark.started_at,
+        run_benchmark.finished_at,
+    ) {
+        (Some(start), _, Some(end)) => Some(brief::AppWindow {
+            name: "load",
+            start,
+            end,
+        }),
+        (None, Some(start), Some(end)) => Some(brief::AppWindow {
+            name: "whole",
+            start,
+            end,
+        }),
+        _ => None,
+    };
     let id = diagnostics.run.id.clone();
     let id_for_score = id.clone();
     let benchmark_metrics = store.query_metrics(&id, &[], Some("benchmark."), Some(false))?;
@@ -2821,6 +2845,8 @@ fn build_brief(
     brief::attach_limits(&mut brief, &limits, limit);
     let states = store.query_metrics(&brief.summary.id, &[], Some("state."), Some(false))?;
     brief::attach_states(&mut brief, &states, limit);
+    let app = store.query_metrics(&brief.summary.id, &[], Some("app."), Some(true))?;
+    brief::attach_app(&mut brief, &app, app_window.as_ref(), limit);
     brief.review = Some(brief::review(review));
     brief::attach_previous_comparison(&mut brief, store)?;
     brief::next_steps(&mut brief);
@@ -2851,6 +2877,8 @@ fn brief_json(brief: &brief::BriefOutput) -> Result<serde_json::Value> {
         ("upstreams", &["node"][..]),
         ("logs", &["node", "source"][..]),
         ("states", &["node", "kind"][..]),
+        ("app_calls", &["node", "target"][..]),
+        ("app_locks", &["node"][..]),
         ("database_io", &["node"][..]),
     ] {
         if let Some(section) = brief.get_mut(section) {

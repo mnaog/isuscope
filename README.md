@@ -104,7 +104,7 @@ isuscope init
 └── SETUP.md            # 導入先で読む短いチェックリスト
 ```
 
-実環境のpathは`init`の引数で埋め込めます。`--nginx-access-log`（既定`/var/log/nginx/access.log`）、`--mysql-slow-log`（既定`/var/log/mysql/mysql-slow.log`）、`--state-log`（既定`/var/tmp/isuscope-state.jsonl`）、`--service-units "isupipe.service mysql.service"`、`--sample-output`（`doctor`がparserを当てる保存済みベンチ出力）、`--data-dir`（既定`.isuscope/data`）です。
+実環境のpathは`init`の引数で埋め込めます。`--nginx-access-log`（既定`/var/log/nginx/access.log`）、`--mysql-slow-log`（既定`/var/log/mysql/mysql-slow.log`）、`--state-log`（既定`/var/tmp/isuscope-state.jsonl`）、`--app-metrics`（既定`/var/tmp/isuscope-app-metrics.jsonl`）、`--service-units "isupipe.service mysql.service"`、`--sample-output`（`doctor`がparserを当てる保存済みベンチ出力）、`--data-dir`（既定`.isuscope/data`）です。
 
 最初に`.isuscope/SETUP.md`を読み、少なくともベンチ起動方法、initializeと負荷走行の境界（出力のmarkerか`routes.toml`の`[initialize]`）、SSHとnode、アクセスログ（MariaDBなどではslow logも）、route正規化、app binaryと主要serviceを実環境へ合わせます。その後、shellの構文、setup、doctorを順に確認します。
 
@@ -181,6 +181,7 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 - `logs`：ベンチの間にアプリ・nginxのerror log・kernelが出したエラーを、数字を含む語を`<N>`にした型ごとに数えた多い順です。briefには件数と最初の1行だけを出します（型は`query --metric log.error_lines`）。
 - `database_io`：MySQLがfileの読み書きと、fsyncなどそれ以外の操作（`misc_wait_ms`、fsyncだけの時間ではない）で待った時間の長い順です。`database_memory`はbuffer poolとtableの大きさです。どちらもベンチの前後の差なのでinitializeを含みます。
 - `states`：アプリの状態ログから、状態にいた時間の合計が長い順です（[アプリの状態ログ](#アプリの状態ログ)）。
+- `app_calls`・`app_locks`：アプリ計測から、外への呼び出し（呼び先と結果ごとの試行の回数・割合・時間）と、lockごとの待った時間・持っていた時間の負荷区間の合計です（[アプリ計測](#アプリ計測)）。
 - `transitions`：行動遷移です（[行動遷移](#行動遷移)）。
 - `score_inputs`：`score-probe`が読んだ得点の源です（[得点が何でできているかを確定する](#得点が何でできているかを確定する)）。
 - `benchmark`・`benchmark_messages`：parserが出したbenchmark metricと、FAILの理由・エラーの実例です。
@@ -462,6 +463,28 @@ isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09
 ```
 
 記録は「今どうなっているか」で、「ここを速くすると何点増えるか」は分かりません。ロジックを変える案は実装の前に記録で前提を確かめ（合わない案は実装しない）、採否はスコアで決めます。
+
+## アプリ計測
+
+HTTPとSQLの記録には、アプリが外へ出す呼び出し（決済などの外部API）の失敗と再試行も、アプリの中のlockの待ちも出ません。practice-14では、決済の約70%が500/502/504で失敗して1件あたり2回以上やり直していたこと、全状態を1つのlockで守ったまま重い処理を走らせていたことが、3回続けてjournalctlと手で足したlogでしか見えず、それぞれ数run〜25 runの間残りました。アプリ計測は、アプリがそれを1秒ごとに集計して書き、isuscopeが毎回のrunで運ぶ記録です。
+
+アプリは標準のmetric行を書きます（`/var/tmp/isuscope-app-metrics.jsonl`へ追記。pathは`init --app-metrics`で変えられます）。書き手（Rustなら追加のcrateの要らない1 file）は、呼び出しを数えて1秒ごとにまとめて書くので、リクエストを待たせません。
+
+```json
+{"type":"metric","name":"app.call.count","value":12,"unit":"calls","labels":{"target":"payment","outcome":"502"},"timestamp":1760259047.001}
+```
+
+| metric | label | 意味 |
+|---|---|---|
+| `app.call.count`・`app.call.duration_sum`・`app.call.duration_max` | `target`, `outcome` | 外への呼び出しの試行の回数と時間（ms）。再試行も1回と数える。`outcome`はstatus codeか`error`・`timeout` |
+| `app.lock.count`・`app.lock.wait_sum`・`app.lock.wait_max`・`app.lock.hold_sum`・`app.lock.hold_max` | `lock` | lockを取った回数、取れるまで待った時間、持っていた時間（ms） |
+
+`app-metrics-mark`・`app-metrics-delta`（role `app`）がベンチの前後の差分を運び、行はそのまま標準のmetricとして読みます（parserは要りません）。ファイルがまだ無ければ`unavailable`になるだけで、runは止まりません。`brief`の`app_calls`は呼び先と結果ごとに負荷区間の回数・同じ呼び先に占める割合（失敗の結果ならそのまま失敗率）・合計・平均・最大を合計時間の順に、`app_locks`はlockごとの回数・待った時間（合計・平均・最大）・持っていた時間を待った時間の順に並べます。時間の推移と比較は`series`と`query --scope series --window load`で読みます。
+
+```console
+isuscope query latest --base BASE_RUN --metric-prefix app.lock.wait_sum --scope series --window load
+isuscope series latest --metric app.call.count --label target=payment --window load
+```
 
 ## License
 

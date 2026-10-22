@@ -42,6 +42,12 @@ pub struct BriefOutput {
     /// アプリの状態ログ（`state-log` collector）から、対象がその状態にいた時間の合計が長い順。
     /// 状態ログが無いrunでは空。行は`isuscope states sql`・`states timeline`で読む。
     pub states: BriefSection<BriefState>,
+    /// アプリ計測（`app-metrics` collector）の外への呼び出し。呼び先と結果ごとに、負荷区間の
+    /// 試行の回数と時間。合計時間の長い順。アプリがまだ書いていなければ空。
+    pub app_calls: BriefSection<BriefAppCall>,
+    /// アプリ計測のlock。lockごとに、負荷区間の取得の回数、待った時間、持っていた時間。
+    /// 待った時間の合計が長い順。
+    pub app_locks: BriefSection<BriefAppLock>,
     pub http: BriefSection<HttpRouteSummary>,
     /// 要求数の多いrouteのうち、`http`（合計時間の順）の上位に入らなかったもの。速くて回数の
     /// 多いroute（静的ファイルなど）は合計時間の順では埋もれ、nginxのCPUを食っていても見えない。
@@ -85,6 +91,8 @@ impl BriefOutput {
         self.limits.cut(rows);
         self.logs.cut(rows);
         self.states.cut(rows);
+        self.app_calls.cut(rows);
+        self.app_locks.cut(rows);
         self.http.cut(rows);
         self.http_by_count.cut(rows);
         self.database.cut(rows);
@@ -700,6 +708,165 @@ pub struct BriefState {
     pub peak: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct BriefAppCall {
+    pub node: String,
+    pub target: String,
+    pub outcome: String,
+    pub count: f64,
+    /// 同じ呼び先の試行に占める割合。失敗の結果なら、そのまま失敗率になる。
+    pub share_percent: Option<f64>,
+    pub total_ms: f64,
+    pub avg_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefAppLock {
+    pub node: String,
+    pub lock: String,
+    pub count: f64,
+    pub wait_ms: f64,
+    pub wait_avg_ms: Option<f64>,
+    pub wait_max_ms: Option<f64>,
+    pub hold_ms: f64,
+    pub hold_avg_ms: Option<f64>,
+    pub hold_max_ms: Option<f64>,
+}
+
+/// アプリ計測の区間。`start`より後、`end`（書き手が1秒ごとに書く時刻なので、最後の1秒を含める）まで。
+pub struct AppWindow {
+    pub name: &'static str,
+    pub start: chrono::DateTime<chrono::Utc>,
+    pub end: chrono::DateTime<chrono::Utc>,
+}
+
+/// `app-metrics-delta`が運んだ1秒ごとの`app.`の値を区間で足し、`app_calls`・`app_locks`欄を作る。
+pub fn attach_app(
+    brief: &mut BriefOutput,
+    metrics: &[Metric],
+    window: Option<&AppWindow>,
+    limit: usize,
+) {
+    let short = brief.run.clone();
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let inside = |metric: &Metric| match (window, metric.timestamp) {
+        (None, _) => true,
+        (Some(window), Some(at)) => {
+            at > window.start && at <= window.end + chrono::Duration::seconds(1)
+        }
+        (Some(_), None) => false,
+    };
+    let mut calls = BTreeMap::<(String, String, String), [f64; 3]>::new();
+    let mut locks = BTreeMap::<(String, String), [f64; 5]>::new();
+    for metric in metrics.iter().filter(|metric| inside(metric)) {
+        let node = metric
+            .labels
+            .get("node")
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        if let Some(field) = metric.name.strip_prefix("app.call.") {
+            let index = match field {
+                "count" => 0,
+                "duration_sum" => 1,
+                "duration_max" => 2,
+                _ => continue,
+            };
+            let row = calls
+                .entry((node, label(metric, "target"), label(metric, "outcome")))
+                .or_default();
+            if index == 2 {
+                row[2] = row[2].max(metric.value);
+            } else {
+                row[index] += metric.value;
+            }
+        } else if let Some(field) = metric.name.strip_prefix("app.lock.") {
+            let index = match field {
+                "count" => 0,
+                "wait_sum" => 1,
+                "wait_max" => 2,
+                "hold_sum" => 3,
+                "hold_max" => 4,
+                _ => continue,
+            };
+            let row = locks.entry((node, label(metric, "lock"))).or_default();
+            if index == 2 || index == 4 {
+                row[index] = row[index].max(metric.value);
+            } else {
+                row[index] += metric.value;
+            }
+        }
+    }
+    let mut target_counts = BTreeMap::<(String, String), f64>::new();
+    for ((node, target, _), values) in &calls {
+        *target_counts
+            .entry((node.clone(), target.clone()))
+            .or_default() += values[0];
+    }
+    let average = |total: f64, count: f64| (count > 0.0).then(|| query::round_to(total / count, 3));
+    let mut call_rows = calls
+        .into_iter()
+        .map(|((node, target, outcome), [count, total, max])| {
+            let all = target_counts
+                .get(&(node.clone(), target.clone()))
+                .copied()
+                .unwrap_or_default();
+            BriefAppCall {
+                share_percent: (all > 0.0).then(|| (count / all * 1000.0).round() / 10.0),
+                node,
+                target,
+                outcome,
+                count,
+                total_ms: query::round_to(total, 3),
+                avg_ms: average(total, count),
+                max_ms: (count > 0.0).then_some(query::round_to(max, 3)),
+            }
+        })
+        .collect::<Vec<_>>();
+    call_rows.sort_by(|a, b| {
+        b.total_ms
+            .total_cmp(&a.total_ms)
+            .then(b.count.total_cmp(&a.count))
+    });
+    let mut lock_rows = locks
+        .into_iter()
+        .map(
+            |((node, lock), [count, wait, wait_max, hold, hold_max])| BriefAppLock {
+                node,
+                lock,
+                count,
+                wait_ms: query::round_to(wait, 3),
+                wait_avg_ms: average(wait, count),
+                wait_max_ms: (count > 0.0).then_some(query::round_to(wait_max, 3)),
+                hold_ms: query::round_to(hold, 3),
+                hold_avg_ms: average(hold, count),
+                hold_max_ms: (count > 0.0).then_some(query::round_to(hold_max, 3)),
+            },
+        )
+        .collect::<Vec<_>>();
+    lock_rows.sort_by(|a, b| {
+        b.wait_ms
+            .total_cmp(&a.wait_ms)
+            .then(b.hold_ms.total_cmp(&a.hold_ms))
+    });
+    let window_name = window.map(|window| window.name.to_owned());
+    let flag = window.map_or("whole", |window| window.name);
+    brief.app_calls = section(call_rows, limit)
+        .window(window_name.clone())
+        .more(|| {
+            format!(
+                "isuscope query {short} --metric-prefix app.call. --scope series --window {flag} --limit 40"
+            )
+        });
+    brief.app_locks = section(lock_rows, limit)
+        .window(window_name)
+        .more(|| {
+            format!(
+                "isuscope query {short} --metric-prefix app.lock. --scope series --window {flag} --limit 40"
+            )
+        });
+}
+
 /// `state-log-delta`の集計metric（`state.`）から`states`欄を作り、欠けを`warnings`に出す。
 pub fn attach_states(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
     let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
@@ -1020,6 +1187,8 @@ pub fn build(
         limits: section(Vec::new(), limit),
         logs: section(Vec::new(), limit),
         states: section(Vec::new(), limit),
+        app_calls: section(Vec::new(), limit),
+        app_locks: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
         http_by_count: section(http_by_count, limit)
@@ -2216,5 +2385,98 @@ mod tests {
         let mut empty = vec![route("/x", 0.0, 0.0)];
         assert!(share_of_requests(&mut empty, 0).is_empty());
         assert_eq!(empty[0].share_percent, None);
+    }
+
+    #[test]
+    fn app_calls_and_locks_sum_the_load_window_and_rank_by_time() {
+        let diagnostics = crate::report::diagnose(
+            test_run(),
+            Vec::new(),
+            Vec::new(),
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+        );
+        let options = || query::MetricQueryOptions {
+            scope: query::QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: None,
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        };
+        let empty = || query::metric_query("run".into(), Vec::new(), options());
+        let mut brief = build(diagnostics, empty(), empty(), 5);
+        let start = chrono::DateTime::parse_from_rfc3339("2026-10-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = |seconds: i64| start + chrono::Duration::seconds(seconds);
+        let metric = |name: &str, value: f64, second: i64, labels: &[(&str, &str)]| Metric {
+            name: name.into(),
+            value,
+            unit: String::new(),
+            timestamp: Some(at(second)),
+            labels: labels
+                .iter()
+                .chain(&[("node", "app3")])
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        };
+        let failed = [("target", "payment"), ("outcome", "502")];
+        let ok = [("target", "payment"), ("outcome", "204")];
+        let store = [("lock", "store")];
+        let metrics = [
+            // initializeの間（区間の外）は足さない。
+            metric("app.call.count", 100.0, 0, &failed),
+            metric("app.call.count", 7.0, 2, &failed),
+            metric("app.call.duration_sum", 70.0, 2, &failed),
+            metric("app.call.duration_max", 30.0, 2, &failed),
+            metric("app.call.count", 7.0, 3, &failed),
+            metric("app.call.duration_sum", 140.0, 3, &failed),
+            metric("app.call.duration_max", 50.0, 3, &failed),
+            metric("app.call.count", 6.0, 3, &ok),
+            metric("app.call.duration_sum", 30.0, 3, &ok),
+            metric("app.call.duration_max", 9.0, 3, &ok),
+            metric("app.lock.count", 1000.0, 2, &store),
+            metric("app.lock.wait_sum", 400.0, 2, &store),
+            metric("app.lock.wait_max", 12.0, 2, &store),
+            metric("app.lock.hold_sum", 900.0, 2, &store),
+            metric("app.lock.hold_max", 3.0, 2, &store),
+            metric("app.lock.count", 10.0, 2, &[("lock", "ids")]),
+            metric("app.lock.wait_sum", 0.5, 2, &[("lock", "ids")]),
+        ];
+        let window = AppWindow {
+            name: "load",
+            start: at(1),
+            end: at(60),
+        };
+        attach_app(&mut brief, &metrics, Some(&window), 5);
+        let calls = &brief.app_calls;
+        assert_eq!(calls.window.as_deref(), Some("load"));
+        assert_eq!(calls.items.len(), 2);
+        let first = &calls.items[0];
+        assert_eq!(
+            (
+                first.outcome.as_str(),
+                first.count,
+                first.total_ms,
+                first.avg_ms,
+                first.max_ms
+            ),
+            ("502", 14.0, 210.0, Some(15.0), Some(50.0))
+        );
+        assert_eq!(first.share_percent, Some(70.0));
+        assert_eq!(calls.items[1].share_percent, Some(30.0));
+        let locks = &brief.app_locks;
+        assert_eq!(locks.items[0].lock, "store");
+        assert_eq!(
+            (locks.items[0].wait_avg_ms, locks.items[0].hold_max_ms),
+            (Some(0.4), Some(3.0))
+        );
+        assert_eq!(locks.items[1].lock, "ids");
+        assert_eq!(locks.items[1].hold_max_ms, Some(0.0));
     }
 }
