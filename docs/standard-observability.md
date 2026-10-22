@@ -18,7 +18,7 @@ cookieなどの匿名識別子を利用したリクエスト間の行動遷移�
 
 | collector | phase | 常時取得するもの | unavailableの条件 |
 |---|---|---|---|
-| remote-fingerprint | before | `/usr/local/lib/isuscope/fingerprint.sh`が出すnodeの識別値。同じ構成の再測定の判定と、briefの比較の前提に使う | scriptが配置されていない |
+| remote-fingerprint | before | `/usr/local/lib/isuscope/fingerprint.sh`が出すnodeの識別値（雛形はkernel・OS・インスタンスの型`instance.type`（EC2のIMDSv2、読めなければ`unknown`）・CPUの型番`cpu.model`・vCPU数・nginxとMySQLの版と設定・配ったfile）。同じ構成の再測定の判定と、briefの比較の前提、`hosts`の型とCPUの表示に使う | scriptが配置されていない |
 | host-sampler | during | `/proc`だけから1秒ごとに、CPU内訳、コア別の使用率、PSI、memory、load、実行可能・I/O待ちのtask数とcontext switchの回数、TCPの接続・取りこぼしcounter、NICごとのpacket・byte | なし（`/proc`は常にある） |
 | sysstat | during | CPU内訳、disk IOPS・帯域・queue・latency・utilのベンチ区間sample | `sar`がない |
 | service-sampler | during | 指定systemd unitのCPU、memory、disk I/O、PID数 | unit未指定、cgroup v2でない、unitが停止中 |

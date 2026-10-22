@@ -2845,6 +2845,9 @@ fn build_brief(
     brief::attach_limits(&mut brief, &limits, limit);
     let states = store.query_metrics(&brief.summary.id, &[], Some("state."), Some(false))?;
     brief::attach_states(&mut brief, &states, limit);
+    let instance_types = store.fingerprint_by_node(&brief.summary.id, "instance.type")?;
+    let cpu_models = store.fingerprint_by_node(&brief.summary.id, "cpu.model")?;
+    brief::attach_node_facts(&mut brief, &instance_types, &cpu_models);
     let app = store.query_metrics(&brief.summary.id, &[], Some("app."), Some(true))?;
     brief::attach_app(&mut brief, &app, app_window.as_ref(), limit);
     brief.review = Some(brief::review(review));

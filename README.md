@@ -171,7 +171,7 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 
 `brief`は`--limit`で各欄の件数を抑えます。それでも全体が約12KBを超えるときは、順位の表をすべて同じ行数まで減らして`warnings`で伝えます（nodeごとの表`hosts`・`clients`・`database_memory`は減らしません）。件数で切った欄には、残りを見るコマンドを`more`に添えます（切っていない欄には付きません）。
 
-- `hosts`：**nodeごとに1行**で、全nodeの状況を最初の1画面で見切るためのものです。CPUの平均とピーク、最も詰まっていたコア、iowait・stealの平均、PSI、load、memory、disk、上位のservice（CPU・RSS・thread数のピークと、ベンチの間の再起動回数）を並べます。負荷の低いnodeもまとめずに全行を出します。`window`は要約した区間で、initializeの終わりが分かるrunは`load`、分からなければ`whole`です。
+- `hosts`：**nodeごとに1行**で、全nodeの状況を最初の1画面で見切るためのものです。fingerprintの`instance.type`・`cpu.model`があればnodeの型とCPUの型番を並べ、型が2種類以上混ざっていれば`warnings`で伝えます（型の違うnodeが混ざる構成では、同じ役割の負荷も型を踏まえて比べます）。CPUの平均とピーク、最も詰まっていたコア、iowait・stealの平均、PSI、load、memory、disk、上位のservice（CPU・RSS・thread数のピークと、ベンチの間の再起動回数）を並べます。負荷の低いnodeもまとめずに全行を出します。`window`は要約した区間で、initializeの終わりが分かるrunは`load`、分からなければ`whole`です。
 - `clients`：ベンチ側の接続の使い方をnodeごとに1行で出します（[ベンチ側の接続](#ベンチ側の接続)）。`window`は`hosts`と同じです。
 - `http`・`database`：判断に使う主要な列（回数・合計・平均・p95、HTTPはエラー数と全要求に占める割合`share_percent`、DBはlockと1回あたりの検査行数）だけを出し、分位・最大・行数などの残りは`query`で見ます。
 - `http_by_count`：要求数の多い順に、`http`（合計時間の順）の上位に入らなかったrouteです。合計時間の順では、速くて回数の多いroute（静的ファイル、pollingなど）が埋もれ、SSEのように長く開いたままの要求が上を占めます。practice-14-seventhでは静的ファイルが全要求の57%を占めてnginxを飽和させていたのに、約20 run気づきませんでした。続きは`query --view http --sort count`で見ます。静的ファイルは1 fileずつ別のrouteなので1行ずつは小さく見えます。拡張子の付いたpathへの要求をまとめた数（route数・回数・全要求に占める割合・合計時間）を`http_static_files`に出します。`database`は負荷区間の行だけで順位を付け、その区間を`window`に出します（initializeの一括投入が上位を占めないように）。

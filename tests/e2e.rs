@@ -99,6 +99,8 @@ mod lifecycle;
 mod log_rotation;
 #[path = "e2e/node_disk.rs"]
 mod node_disk;
+#[path = "e2e/node_facts.rs"]
+mod node_facts;
 #[path = "e2e/operation_lock.rs"]
 mod operation_lock;
 #[path = "e2e/output_contract.rs"]

@@ -113,6 +113,12 @@ impl BriefOutput {
 #[derive(Debug, Serialize)]
 pub struct BriefHostNode {
     pub node: String,
+    /// インスタンスの型とCPUの型番（ベンチ前のfingerprint）。型の違うnodeが混ざる構成で、
+    /// どのnodeが速いかを名前の順ではなく見分ける。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
     pub cpu_busy_avg_percent: Option<f64>,
     pub cpu_busy_max_percent: Option<f64>,
     /// 最も詰まっていたコアのピーク。全体に余裕があっても1コアだけ飽和する構成を見落とさない。
@@ -910,6 +916,45 @@ pub fn attach_app(
         });
 }
 
+/// ベンチ前のfingerprint（`instance.type`・`cpu.model`）を`hosts`のnodeへ付ける。値の分からない
+/// node（`unknown`、計測の無いnode）には付けない。型が2種類以上あれば`warnings`で伝える。
+pub fn attach_node_facts(
+    brief: &mut BriefOutput,
+    instance_types: &[(String, String)],
+    cpu_models: &[(String, String)],
+) {
+    let known = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty() && value != "unknown").then(|| value.to_owned())
+    };
+    for host in &mut brief.hosts.items {
+        host.instance_type = instance_types
+            .iter()
+            .find(|(node, _)| *node == host.node)
+            .and_then(|(_, value)| known(value));
+        host.cpu_model = cpu_models
+            .iter()
+            .find(|(node, _)| *node == host.node)
+            .and_then(|(_, value)| known(value));
+    }
+    let mut types = BTreeMap::<&str, Vec<&str>>::new();
+    for host in &brief.hosts.items {
+        if let Some(kind) = host.instance_type.as_deref() {
+            types.entry(kind).or_default().push(&host.node);
+        }
+    }
+    if types.len() > 1 {
+        let listed = types
+            .iter()
+            .map(|(kind, nodes)| format!("{kind} ({})", nodes.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        brief.warnings.push(format!(
+            "hosts: nodes run different instance types: {listed}; compare a role's load across nodes with their types in mind"
+        ));
+    }
+}
+
 /// `state-log-delta`の集計metric（`state.`）から`states`欄を作り、欠けを`warnings`に出す。
 pub fn attach_states(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
     let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
@@ -1534,6 +1579,8 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
             services.truncate(3);
             BriefHostNode {
                 node: node.into(),
+                instance_type: None,
+                cpu_model: None,
                 cpu_busy_avg_percent: average("host.cpu_busy_percent")
                     .or_else(|| average("host.cpu_percent")),
                 cpu_busy_max_percent: peak("host.cpu_busy_percent")
