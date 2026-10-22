@@ -6,7 +6,9 @@ use isuscope::{
     doctor, enrichment, init,
     metric_semantics::{self, MetricAggregation},
     model::{AnalysisVerdict, RunManifest, RunMode},
-    query::{self, DatabaseQueryOptions, HttpQueryOptions, MetricQueryOptions, QueryScope},
+    query::{
+        self, DatabaseQueryOptions, HttpQueryOptions, HttpSort, MetricQueryOptions, QueryScope,
+    },
     report::{self, RunDiagnostics},
     result_commands,
     runner::{self, RunAnnotations},
@@ -96,6 +98,9 @@ enum Commands {
         /// state-log collectorが読む、アプリが状態の変化を書くfile。
         #[arg(long, default_value = isuscope::init::DEFAULT_STATE_LOG)]
         state_log: String,
+        /// app-metrics collectorが読む、アプリが外への呼び出しとlockの待ちを1秒ごとに書くfile。
+        #[arg(long, default_value = isuscope::init::DEFAULT_APP_METRICS)]
+        app_metrics: String,
         /// cgroupから追うsystemd unit。空白区切り。
         #[arg(long, default_value = "")]
         service_units: String,
@@ -263,6 +268,9 @@ enum Commands {
         /// 出力で保持するlabel。provenance labelは常に保持します。
         #[arg(long = "group-by")]
         group_by: Vec<String>,
+        /// `--view http`の行の並べ方。既定は合計時間の順。
+        #[arg(long, value_enum, default_value_t = QuerySortArg::Total)]
+        sort: QuerySortArg,
         /// 出力行数の上限。
         #[arg(long, default_value_t = 100, value_parser = parse_list_limit)]
         limit: usize,
@@ -496,6 +504,15 @@ enum QueryViewArg {
     Transitions,
 }
 
+/// `--view http`の行の並べ方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum QuerySortArg {
+    /// 合計時間の多い順（比較は合計時間の差の大きい順）。
+    Total,
+    /// 回数の多い順（比較は回数の差の大きい順）。速くて回数の多いrouteを探すときに使う。
+    Count,
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum QueryScopeArg {
     Run,
@@ -654,6 +671,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         nginx_access_log,
         mysql_slow_log,
         state_log,
+        app_metrics,
         service_units,
         sample_output,
         no_scaffold,
@@ -664,6 +682,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             nginx_access_log: nginx_access_log.clone(),
             mysql_slow_log: mysql_slow_log.clone(),
             state_log: state_log.clone(),
+            app_metrics: app_metrics.clone(),
             service_units: service_units
                 .split_whitespace()
                 .map(ToOwned::to_owned)
@@ -798,6 +817,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             labels,
             label_contains,
             group_by,
+            sort,
             limit,
         } => {
             show_query(
@@ -815,6 +835,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 labels,
                 label_contains,
                 group_by,
+                sort,
                 limit,
             )?;
             Ok(true)
@@ -1182,8 +1203,12 @@ fn show_query(
     labels: Vec<(String, String)>,
     label_contains: Vec<(String, String)>,
     group_by: Vec<String>,
+    sort: QuerySortArg,
     limit: usize,
 ) -> Result<()> {
+    if sort != QuerySortArg::Total && !matches!(view, QueryViewArg::Http) {
+        bail!("--sort applies only to `--view http`");
+    }
     let store = Store::open(&config.data_dir)?;
     let id = store.require_id(requested, "run")?;
     let base_id = base_requested
@@ -1372,15 +1397,23 @@ fn show_query(
                 source,
                 labels,
                 label_contains,
+                sort: match sort {
+                    QuerySortArg::Total => HttpSort::Total,
+                    QuerySortArg::Count => HttpSort::Count,
+                },
                 limit: query_limit,
             };
+            let sort = options.sort;
             let candidate = query::http_query(id, candidate_metrics, options.clone());
             if let Some(base_id) = base_id {
                 let base_metrics =
                     store.query_metrics(&base_id, &[], Some("http."), Some(false))?;
                 let base = query::http_query(base_id, base_metrics, options);
                 write_capped_json(
-                    &columns(query::http_query_diff(base, candidate, limit), all_columns),
+                    &columns(
+                        query::http_query_diff(base, candidate, sort, limit),
+                        all_columns,
+                    ),
                     &QUERY_CAP,
                 )?;
             } else {
@@ -2732,6 +2765,25 @@ fn build_brief(
 ) -> Result<brief::BriefOutput> {
     let diagnostics = load_diagnostics(config, store, requested)?;
     let review = store.run_review(&diagnostics.run)?;
+    // アプリ計測は1秒ごとの値なので、負荷区間（initializeの終わりが分からなければベンチ全体）で足す。
+    let run_benchmark = &diagnostics.run.benchmark;
+    let app_window = match (
+        run_benchmark.initialize_finished_at,
+        run_benchmark.started_at,
+        run_benchmark.finished_at,
+    ) {
+        (Some(start), _, Some(end)) => Some(brief::AppWindow {
+            name: "load",
+            start,
+            end,
+        }),
+        (None, Some(start), Some(end)) => Some(brief::AppWindow {
+            name: "whole",
+            start,
+            end,
+        }),
+        _ => None,
+    };
     let id = diagnostics.run.id.clone();
     let id_for_score = id.clone();
     let benchmark_metrics = store.query_metrics(&id, &[], Some("benchmark."), Some(false))?;
@@ -2793,6 +2845,11 @@ fn build_brief(
     brief::attach_limits(&mut brief, &limits, limit);
     let states = store.query_metrics(&brief.summary.id, &[], Some("state."), Some(false))?;
     brief::attach_states(&mut brief, &states, limit);
+    let instance_types = store.fingerprint_by_node(&brief.summary.id, "instance.type")?;
+    let cpu_models = store.fingerprint_by_node(&brief.summary.id, "cpu.model")?;
+    brief::attach_node_facts(&mut brief, &instance_types, &cpu_models);
+    let app = store.query_metrics(&brief.summary.id, &[], Some("app."), Some(true))?;
+    brief::attach_app(&mut brief, &app, app_window.as_ref(), limit);
     brief.review = Some(brief::review(review));
     brief::attach_previous_comparison(&mut brief, store)?;
     brief::next_steps(&mut brief);
@@ -2817,11 +2874,14 @@ fn brief_json(brief: &brief::BriefOutput) -> Result<serde_json::Value> {
         ("benchmark", &["unit", "aggregation", "samples"][..]),
         ("score_inputs", &["unit", "aggregation", "samples"][..]),
         ("http", &["node", "method"][..]),
+        ("http_by_count", &["node", "method"][..]),
         ("database", &["node", "engine", "source", "window"][..]),
         ("cpu", &["node", "source"][..]),
         ("upstreams", &["node"][..]),
         ("logs", &["node", "source"][..]),
         ("states", &["node", "kind"][..]),
+        ("app_calls", &["node", "target"][..]),
+        ("app_locks", &["node"][..]),
         ("database_io", &["node"][..]),
     ] {
         if let Some(section) = brief.get_mut(section) {
@@ -2838,7 +2898,26 @@ const BRIEF_COLUMNS: &[(&str, &[&str])] = &[
     (
         "http",
         &[
-            "node", "method", "route", "count", "total_ms", "avg_ms", "p95_ms", "errors",
+            "node",
+            "method",
+            "route",
+            "count",
+            "share_percent",
+            "total_ms",
+            "avg_ms",
+            "p95_ms",
+            "errors",
+        ],
+    ),
+    (
+        "http_by_count",
+        &[
+            "node",
+            "method",
+            "route",
+            "count",
+            "share_percent",
+            "avg_ms",
         ],
     ),
     (

@@ -33,6 +33,25 @@ path_key() {
 }
 
 emit kernel "$(uname -srmo)"
+# 型の違うnodeが混ざる構成や、同じ型で別世代のCPUに当たったnodeを、同じ構成と取り違えない。
+# 型はEC2のIMDSv2から読み、起動中は変わらないので/dev/shm（再起動で消える）に覚えておく。
+instance_cache=/dev/shm/isuscope-instance-type
+if [ -s "${instance_cache}" ]; then
+  instance_type=$(cat "${instance_cache}")
+else
+  token=$(curl -sf -m 1 -X PUT http://169.254.169.254/latest/api/token \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)
+  instance_type=$(curl -sf -m 1 -H "X-aws-ec2-metadata-token: ${token}" \
+    http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null || true)
+  # 読めなかったときは覚えず、次のベンチでもう一度読む。
+  if [ -n "${instance_type}" ]; then
+    printf '%s' "${instance_type}" >"${instance_cache}" 2>/dev/null || true
+  fi
+  instance_type=${instance_type:-unknown}
+fi
+emit instance.type "${instance_type}"
+emit cpu.model "$(awk -F': *' '/^model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null)"
+emit cpu.vcpus "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo unknown)"
 # /etc/os-release is the standard source on the supported Linux hosts.
 # shellcheck disable=SC1091
 emit os.release "$(. /etc/os-release; printf '%s %s' "${ID:-unknown}" "${VERSION_ID:-unknown}")"

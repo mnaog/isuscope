@@ -12,17 +12,17 @@ cookieなどの匿名識別子を利用したリクエスト間の行動遷移�
 
 標準collectorの対象roleは次のとおりです。roleを指定しないcollectorは設定した全nodeで動きます。
 
-- perf・off-CPU・state-log：`app`
+- perf・off-CPU・state-log・app-metrics：`app`
 - nginx系（access logの差分、alp、initialize-boundary）：`nginx`か`edge`
 - MySQL系：`db`か`mysql`
 
 | collector | phase | 常時取得するもの | unavailableの条件 |
 |---|---|---|---|
-| remote-fingerprint | before | `/usr/local/lib/isuscope/fingerprint.sh`が出すnodeの識別値。同じ構成の再測定の判定と、briefの比較の前提に使う | scriptが配置されていない |
-| host-sampler | during | `/proc`だけから1秒ごとに、CPU内訳、コア別の使用率、PSI、memory、load、TCPの接続・取りこぼしcounter、NICごとのpacket・byte | なし（`/proc`は常にある） |
+| remote-fingerprint | before | `/usr/local/lib/isuscope/fingerprint.sh`が出すnodeの識別値（雛形はkernel・OS・インスタンスの型`instance.type`（EC2のIMDSv2、読めなければ`unknown`）・CPUの型番`cpu.model`・vCPU数・nginxとMySQLの版と設定・配ったfile）。同じ構成の再測定の判定と、briefの比較の前提、`hosts`の型とCPUの表示に使う | scriptが配置されていない |
+| host-sampler | during | `/proc`だけから1秒ごとに、CPU内訳、コア別の使用率、PSI、memory、load、実行可能・I/O待ちのtask数とcontext switchの回数、TCPの接続・取りこぼしcounter、NICごとのpacket・byte | なし（`/proc`は常にある） |
 | sysstat | during | CPU内訳、disk IOPS・帯域・queue・latency・utilのベンチ区間sample | `sar`がない |
 | service-sampler | during | 指定systemd unitのCPU、memory、disk I/O、PID数 | unit未指定、cgroup v2でない、unitが停止中 |
-| process-sampler | during | 指定systemd unitの全process（cgroup v2・v1、見つからなければMainPID）のRSS合計・thread数・process数を/procから1秒ごと。MainPIDが変わったら再起動として数える。RSSはcgroupの`memory.current`（page cacheを含む）とは別の値 | unit未指定、`systemctl`か`/proc`がない |
+| process-sampler | during | 指定systemd unitの全process（cgroup v2・v1、見つからなければMainPID）のRSS合計・thread数・process数と、全threadがCPUを待った時間（`/proc/<pid>/task/*/schedstat`）・CPUを取り上げられた回数（nonvoluntary context switch）を/procから1秒ごと。schedstatが無いkernelでは後の2つを出さない。MainPIDが変わったら再起動として数える。RSSはcgroupの`memory.current`（page cacheを含む）とは別の値 | unit未指定、`systemctl`か`/proc`がない |
 | service-throttle | during | 指定systemd unitがcgroupのCPU上限で止められた時間の割合・回数と、CPUの割当量 | unit未指定、cgroup v2でない |
 | perf-start・perf-stop・perf-series | before・after | detachしたsystem-wide sampleとhot symbol。perf.dataは`perf-series`の1回の`perf script`で読み、ベンチの区間`[始まり, 終わり)`のsampleだけから、区間全体と5秒ごとのsymbol別の割合を作る（perfはafter phaseまで止まらないので、ベンチの後のsampleは捨てる） | `perf`がない、権限不足、kernelが非対応 |
 | perf-flamegraph | after（既定は無効） | perf.dataを読み直してFlame GraphのSVGを作る | `perf`・`stackcollapse-perf.pl`・`flamegraph.pl`がない |
@@ -38,6 +38,7 @@ cookieなどの匿名識別子を利用したリクエスト間の行動遷移�
 | slp | after | slow logの差分をnode上でinitializeと負荷区間に分け、文ごとの回数・合計・最大・p95・p99・lock・rowsと、DB全体の5秒ごとの回数・時間 | slow logが無い（statement digestが使えればpreflightは通り、SQLはmysql-digestが出す）。slow logもstatement digestも無いDB nodeでは、SQLの無いrunを始めないよう`doctor`のpreflightが失敗する。slow logがあるのにslpが無い場合も`failed`（Ansibleのobservability roleが入れる） |
 | app-log | before/after | `service_units`のjournal、nginxのerror log（access logと同じdirectoryの`error.log`）、kernelのwarning以上を、beforeで記録した位置（journalはcursor、error logは大きさ）より後だけnode上で読む。行の数字を含む語を`<N>`にした型ごとに数え、多い順に10型と1行の実例だけを持ち帰る。appのunitはerror・timeout・失敗などの語を含む行だけを数える。journaldは1 unitあたり既定で30秒に10,000行までしか残さず、捨てた通知は区間が明けて次の行が来たときに出るので、捨てた行数は数えない（briefは1万行以上読んだunitに、件数が少ない可能性を警告する） | journalもerror logも読めない |
 | state-log | before/after | アプリが状態の変化を1行ずつ書くfile（既定`/var/tmp/isuscope-state.jsonl`）を、beforeで記録した位置（device・inode・大きさ）より後だけ運ぶ。作り直されたfileは先頭から読み、1 runで256MiBを超えた分は運ばずに大きさを残す。生の行はrunのlogに残し、`isuscope states sql`・`states timeline`がSQLiteへ載せて読む（runごとに残す） | アプリがまだ書いていない（file が無い） |
+| app-metrics-mark・app-metrics-delta | before/after | アプリが1秒ごとに集計して書くmetric行のfile（既定`/var/tmp/isuscope-app-metrics.jsonl`）を、beforeで記録した位置より後だけ運ぶ（1 runで64MiBまで）。外への呼び出しの試行の回数と時間、lockの待ちと保持の時間。標準のmetric行なのでparserは要らない | fileがまだ無い（アプリに書き手が入っていない） |
 | network-allowance | before/after | EC2のENAが上限を超えて捨てた・遅らせたpacketの数（`ethtool -S`の`bw_in`・`bw_out`・`pps`・`conntrack`・`linklocal`の`*_allowance_exceeded`）の前後の差と、後の`conntrack_allowance_available`。initializeを含む。briefは増えたcounterを`warnings`に出す | `ethtool`がない、どのdeviceもallowance counterを持たない（ENA以外） |
 | mysql-io-mark・mysql-io-delta | before・after | Performance Schemaのfile別（`file_summary_by_instance`）とtable別（`table_io_waits_summary_by_table`）の累積値を前後に1回ずつ読んだ差。あわせてbuffer poolの大きさとtableのdata・indexの大きさ。ベンチ中は何もしない | MySQLがない、Performance Schemaが無効、間でmysqldが再起動した |
 
@@ -78,11 +79,12 @@ unavailable_exit_codes = [75]
 | mysql-io | `db.file.{read,write}_wait`（ms）、`db.file.misc_wait`（ms、fsync・open・close・statなど読み書き以外の操作の合計。fsyncだけの時間ではない）、`db.file.{read,write}_bytes`、`db.table.{read,write}_time`（ms）、`db.table.rows_{read,written}`、`db.table.size`、`db.memory.buffer_pool`、`db.memory.tables` | `node`, `engine`; fileは`file`（datadirからの相対path）、tableは`table`（`schema.table`） |
 | perf-series | `cpu.sample_percent`, `cpu.sample_count`（5秒bucketと取得全体。全体は`perf report --no-children --sort comm,dso,symbol`の自己時間と同じ切り方で、sample数で数える） | `node`, `process`, `symbol`, `binary` |
 | perf-series | `cpu.process_percent`（5秒bucketと取得全体） | `node`, `process` |
-| host-sampler | `host.cpu_{busy,user,nice,system,iowait,steal,idle,softirq}_percent`（`host.cpu_percent`はbusyの互換名）、`host.core_busy_percent`・`host.core_busy_max_percent`、`host.psi_{cpu,memory,io}_{some,full}_percent`、`host.memory_used_bytes`、`host.load1`、`host.tcp_*`（接続数、毎秒の開設・取りこぼし・再送と区間の件数）、`host.net_{rx,tx}_{packets,bytes}_per_second`（1秒ごと） | `node`; コア別は`core`、NICは`device` |
+| host-sampler | `host.cpu_{busy,user,nice,system,iowait,steal,idle,softirq}_percent`（`host.cpu_percent`はbusyの互換名）、`host.core_busy_percent`・`host.core_busy_max_percent`、`host.psi_{cpu,memory,io}_{some,full}_percent`、`host.memory_used_bytes`、`host.load1`、`host.procs_running`・`host.procs_blocked`（その瞬間の実行可能・I/O待ちのtask数。samplerを含む）、`host.context_switches_per_second`、`host.tcp_*`（接続数、毎秒の開設・取りこぼし・再送と区間の件数）、`host.net_{rx,tx}_{packets,bytes}_per_second`（1秒ごと） | `node`; コア別は`core`、NICは`device` |
 | sysstat | `host.cpu_busy_percent`, `host.cpu_{user,system,iowait,steal,idle}_percent`, `host.disk_{iops,read_bytes_per_second,write_bytes_per_second,queue_depth,await,util_percent}` | `node`; diskは`device` |
 | service-sampler | `service.cpu_cores`, `service.memory_bytes`, `service.io_{read,write}_bytes_per_second`, `service.pids` | `node`, `service` |
 | service-throttle | `service.cpu_throttled_percent`, `service.cpu_throttled_periods_per_second`, `service.cpu_quota_cores` | `node`, `service` |
-| process-sampler | `service.process_rss_bytes`, `service.process_threads`, `service.processes`, `service.process_restarts`（MainPIDが変わった秒に1） | `node`, `service` |
+| process-sampler | `service.process_rss_bytes`, `service.process_threads`, `service.processes`, `service.process_restarts`（MainPIDが変わった秒に1）、`service.run_delay_cores`（CPUを待っていたthreadの平均の数。runqueueで待った時間÷経過時間。threadが終わって合計が減った秒は出さない）、`service.involuntary_switches_per_second` | `node`, `service` |
+| app-metrics-delta | `app.call.count`・`app.call.duration_sum`・`app.call.duration_max`（ms）、`app.lock.count`・`app.lock.wait_sum`・`app.lock.wait_max`・`app.lock.hold_sum`・`app.lock.hold_max`（ms）。1秒ごと | `node`; 呼び出しは`target`・`outcome`、lockは`lock` |
 | network-allowance | `net.allowance_exceeded`（packets、前後の差）、`net.conntrack_allowance_available` | `node`, `device`; 前者は`counter`（`bw_out_allowance_exceeded`など） |
 | limits | `limit.somaxconn`, `limit.nginx_{worker_connections,worker_rlimit_nofile,keepalive_requests,workers}`, `limit.service_nofile`, `limit.mysql_max_connections` | `node`; `limit.service_nofile`は`service` |
 

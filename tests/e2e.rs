@@ -65,6 +65,8 @@ mod agent_context;
 mod analysis;
 #[path = "e2e/app_logs.rs"]
 mod app_logs;
+#[path = "e2e/app_metrics.rs"]
+mod app_metrics;
 #[path = "e2e/benchmark_guard.rs"]
 mod benchmark_guard;
 #[path = "e2e/benchmark_messages.rs"]
@@ -97,6 +99,8 @@ mod lifecycle;
 mod log_rotation;
 #[path = "e2e/node_disk.rs"]
 mod node_disk;
+#[path = "e2e/node_facts.rs"]
+mod node_facts;
 #[path = "e2e/operation_lock.rs"]
 mod operation_lock;
 #[path = "e2e/output_contract.rs"]

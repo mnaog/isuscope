@@ -519,12 +519,17 @@ pub async fn execute(
     for reason in manifest.failure_reasons().iter().take(3) {
         println!("failure   {reason}");
     }
-    let mut error_categories = Vec::<Option<&str>>::new();
-    for message in manifest.benchmark_messages(BenchmarkMessageKind::Error) {
-        let category = message.category.as_deref();
-        if !error_categories.contains(&category) && error_categories.len() < 3 {
-            error_categories.push(category);
-            println!("error     {}", message.text);
+    for (kind, label) in [
+        (BenchmarkMessageKind::Error, "error   "),
+        (BenchmarkMessageKind::Warning, "warning "),
+    ] {
+        let mut categories = Vec::<Option<&str>>::new();
+        for message in manifest.benchmark_messages(kind) {
+            let category = message.category.as_deref();
+            if !categories.contains(&category) && categories.len() < 3 {
+                categories.push(category);
+                println!("{label}  {}", message.text);
+            }
         }
     }
     if manifest.benchmark.operator_lines_dropped > 0 {

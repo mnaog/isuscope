@@ -104,7 +104,7 @@ isuscope init
 └── SETUP.md            # 導入先で読む短いチェックリスト
 ```
 
-実環境のpathは`init`の引数で埋め込めます。`--nginx-access-log`（既定`/var/log/nginx/access.log`）、`--mysql-slow-log`（既定`/var/log/mysql/mysql-slow.log`）、`--state-log`（既定`/var/tmp/isuscope-state.jsonl`）、`--service-units "isupipe.service mysql.service"`、`--sample-output`（`doctor`がparserを当てる保存済みベンチ出力）、`--data-dir`（既定`.isuscope/data`）です。
+実環境のpathは`init`の引数で埋め込めます。`--nginx-access-log`（既定`/var/log/nginx/access.log`）、`--mysql-slow-log`（既定`/var/log/mysql/mysql-slow.log`）、`--state-log`（既定`/var/tmp/isuscope-state.jsonl`）、`--app-metrics`（既定`/var/tmp/isuscope-app-metrics.jsonl`）、`--service-units "isupipe.service mysql.service"`、`--sample-output`（`doctor`がparserを当てる保存済みベンチ出力）、`--data-dir`（既定`.isuscope/data`）です。
 
 最初に`.isuscope/SETUP.md`を読み、少なくともベンチ起動方法、initializeと負荷走行の境界（出力のmarkerか`routes.toml`の`[initialize]`）、SSHとnode、アクセスログ（MariaDBなどではslow logも）、route正規化、app binaryと主要serviceを実環境へ合わせます。その後、shellの構文、setup、doctorを順に確認します。
 
@@ -171,15 +171,17 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 
 `brief`は`--limit`で各欄の件数を抑えます。それでも全体が約12KBを超えるときは、順位の表をすべて同じ行数まで減らして`warnings`で伝えます（nodeごとの表`hosts`・`clients`・`database_memory`は減らしません）。件数で切った欄には、残りを見るコマンドを`more`に添えます（切っていない欄には付きません）。
 
-- `hosts`：**nodeごとに1行**で、全nodeの状況を最初の1画面で見切るためのものです。CPUの平均とピーク、最も詰まっていたコア、iowait・stealの平均、PSI、load、memory、disk、上位のservice（CPU・RSS・thread数のピークと、ベンチの間の再起動回数）を並べます。負荷の低いnodeもまとめずに全行を出します。`window`は要約した区間で、initializeの終わりが分かるrunは`load`、分からなければ`whole`です。
+- `hosts`：**nodeごとに1行**で、全nodeの状況を最初の1画面で見切るためのものです。fingerprintの`instance.type`・`cpu.model`があればnodeの型とCPUの型番を並べ、型が2種類以上混ざっていれば`warnings`で伝えます（型の違うnodeが混ざる構成では、同じ役割の負荷も型を踏まえて比べます）。CPUの平均とピーク、最も詰まっていたコア、iowait・stealの平均、PSI、load、memory、disk、上位のservice（CPU・RSS・thread数のピークと、ベンチの間の再起動回数）を並べます。負荷の低いnodeもまとめずに全行を出します。`window`は要約した区間で、initializeの終わりが分かるrunは`load`、分からなければ`whole`です。
 - `clients`：ベンチ側の接続の使い方をnodeごとに1行で出します（[ベンチ側の接続](#ベンチ側の接続)）。`window`は`hosts`と同じです。
-- `http`・`database`：判断に使う主要な列（回数・合計・平均・p95、HTTPはエラー数、DBはlockと1回あたりの検査行数）だけを出し、分位・最大・行数などの残りは`query`で見ます。`database`は負荷区間の行だけで順位を付け、その区間を`window`に出します（initializeの一括投入が上位を占めないように）。
+- `http`・`database`：判断に使う主要な列（回数・合計・平均・p95、HTTPはエラー数と全要求に占める割合`share_percent`、DBはlockと1回あたりの検査行数）だけを出し、分位・最大・行数などの残りは`query`で見ます。
+- `http_by_count`：要求数の多い順に、`http`（合計時間の順）の上位に入らなかったrouteです。合計時間の順では、速くて回数の多いroute（静的ファイル、pollingなど）が埋もれ、SSEのように長く開いたままの要求が上を占めます。practice-14-seventhでは静的ファイルが全要求の57%を占めてnginxを飽和させていたのに、約20 run気づきませんでした。続きは`query --view http --sort count`で見ます。静的ファイルは1 fileずつ別のrouteなので1行ずつは小さく見えます。拡張子の付いたpathへの要求をまとめた数（route数・回数・全要求に占める割合）を`http_static_files`に出します。`http_by_count`は3行までで、表を切るときは他の表より2行先に減らします。`database`は負荷区間の行だけで順位を付け、その区間を`window`に出します（initializeの一括投入が上位を占めないように）。
 - `cpu`：perfのsymbol別の割合です。idle taskの待機（`swapper`の`native_safe_halt`など）を除いて順位を付けます。
 - `upstreams`：接続先ごとの要求数・再試行・p95です（[upstream](#upstream)）。
 - `limits`：ベンチの前に`limits` collectorが読んだ接続・fdの上限値を、nodeと読んだ設定のkey（`config_key`：`net.core.somaxconn`、nginxの`worker_connections`・`worker_rlimit_nofile`・`keepalive_requests`、unitの`LimitNOFILE`と`service`、MySQLの`max_connections`）ごとに`value`で並べ、同じ上限を数える観測値があればベンチ中のピーク（`peak`と`peak_metric`：接続あたりのrequest数、MySQLの接続数）を隣に置きます。`evidence`は上限に当たったときにだけ出る決まった文言のlog行（Too many open files／EMFILE、worker_connections are not enough、Too many connections、possible SYN flooding）の数と例、listen overflowの数です。上限に近いかどうかの判定はしません。upstreamの切断やconnection refusedのような一般的な接続エラーは上限を示さないので`logs`だけに出ます。`evidence`のある行が先に並びます。上限値も観測も無ければ空です。
 - `logs`：ベンチの間にアプリ・nginxのerror log・kernelが出したエラーを、数字を含む語を`<N>`にした型ごとに数えた多い順です。briefには件数と最初の1行だけを出します（型は`query --metric log.error_lines`）。
 - `database_io`：MySQLがfileの読み書きと、fsyncなどそれ以外の操作（`misc_wait_ms`、fsyncだけの時間ではない）で待った時間の長い順です。`database_memory`はbuffer poolとtableの大きさです。どちらもベンチの前後の差なのでinitializeを含みます。
 - `states`：アプリの状態ログから、状態にいた時間の合計が長い順です（[アプリの状態ログ](#アプリの状態ログ)）。
+- `app_calls`・`app_locks`：アプリ計測から、外への呼び出し（呼び先と結果ごとの試行の回数・割合・時間）と、lockごとの待った時間・持っていた時間の負荷区間の合計です（[アプリ計測](#アプリ計測)）。
 - `transitions`：行動遷移です（[行動遷移](#行動遷移)）。
 - `score_inputs`：`score-probe`が読んだ得点の源です（[得点が何でできているかを確定する](#得点が何でできているかを確定する)）。
 - `benchmark`・`benchmark_messages`：parserが出したbenchmark metricと、FAILの理由・エラーの実例です。
@@ -210,6 +212,8 @@ isuscope query latest --base BASE_RUN --view transitions --label-contains to=eva
 - `--all-columns`を付けると、すべての値の比較元・今回と、主要な値の差（`calls_delta`）も出します。
 
 database viewはcollector sourceを保ったままSQL digestを集約します。statement digestとslow logの両方を取ったrunでは同じ文が`mysql-digest`と`slp`の2行になるので、`--source`で片方に絞ります。`--group-by sql-shape`は可変長`IN`と複数行`VALUES`をまとめ、その行では`digest`が文の形になり、元の文が2種類以上あるときだけ`digest_examples`に並べます（長いdigest exampleは短縮します）。
+
+`--view http`は既定で合計時間の順（比較は合計時間の差の大きい順）に並べます。`--sort count`で回数の順（比較は回数の差の大きい順）にできます。
 
 ### seriesとsql
 
@@ -289,7 +293,7 @@ isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metri
 
 ### benchmark出力のparser
 
-parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例（categoryごとに最初の5件、最大20 category、各1000文字）で、runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure_reason`、`brief`の`benchmark_messages`、`run`終了時の`failure`／`error`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
+parserは`metric`に加えて`{"type":"message","kind":"failure"|"error"|"warning","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例、`warning`はFAILにしなかった警告（減点・遅延など）の実例で、どちらもcategoryごとに最初の5件、kindごとに最大20 category、各1000文字です（`warn`も`warning`として読みます）。警告の件数で打ち切るベンチがあるので、警告もcategoryごとの件数をmetricで出し、実例をmessageで残します。runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure_reason`、`brief`の`benchmark_messages`（`failure`・`errors`・`warnings`）、`run`終了時の`failure`／`error`／`warning`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
 
 ### 最初のrunで確認すること
 
@@ -343,9 +347,12 @@ collectorが失敗したときは、`isuscope sql "SELECT name, node, status, er
 - CPU内訳、memory、load。
 - コア別の使用率（`host.core_busy_percent`と、最も詰まっているコアの`host.core_busy_max_percent`）。全体のCPUに余裕があっても1コアだけ飽和している構成を見落とさないためです。
 - PSI（`host.psi_cpu_some_percent`など、CPU・memory・I/Oの不足でtaskが足止めされた時間の割合）。
+- 実行可能なtaskの数（`host.procs_running`、samplerを含む）とcontext switchの回数。コア数を超えた分はCPUを待っています。
 - 接続とネットワークのcounter：`host.tcp_passive_opens_per_second`、`host.tcp_established`、`host.tcp_time_wait`、`host.tcp_listen_overflows_per_second`、`host.tcp_listen_drops_per_second`、`host.tcp_syn_cookies_sent_per_second`、`host.tcp_time_wait_overflow_per_second`、`host.tcp_retransmit_segments_per_second`、NICごとの`host.net_rx_packets_per_second`など、`host.cpu_softirq_percent`。取りこぼしのcounterが0のままなら、少なくとも受け付けの取りこぼしとしては説明できません（接続の失敗がサーバー側にないことの証明にはなりません）。
 
 毎秒値は`/proc/uptime`で測った実際の間隔で割るので、samplerが1秒より遅れても率が水増しされません。毎秒値は小数で出し、取りこぼし系（`host.tcp_listen_overflows`、`host.tcp_listen_drops`、`host.tcp_syn_cookies_sent`、`host.tcp_time_wait_overflow`、`host.tcp_retransmit_segments`）は区間の件数も整数で残します。整数で割っていたころは、1.01秒に1件の取りこぼしが0件/秒になり、「起きていない」と区別できませんでした。
+
+`process-sampler`は、unitの全threadがCPUを待った時間の合計を経過時間で割った`service.run_delay_cores`（CPUを待っていたthreadの平均の数）と、CPUを取り上げられた回数`service.involuntary_switches_per_second`も出します。CPU使用率が70〜80%でも、2 vCPUのnodeでtokioのworker 8本がnginxや計測とCPUを取り合えば、lockを持ったままpreemptされて待ちが延びます（practice-14-forthでは自作のlock統計でしか見えませんでした）。briefの`hosts`のserviceに平均とピーク（`run_delay_avg_cores`・`run_delay_max_cores`）、nodeに`procs_running_max`を出します。
 
 `service-throttle`は、cgroupのCPU上限で止められた時間（`service.cpu_throttled_percent`、`service.cpu_throttled_periods_per_second`）と割当量（`service.cpu_quota_cores`）をunitごとに出します。
 
@@ -456,6 +463,28 @@ isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09
 ```
 
 記録は「今どうなっているか」で、「ここを速くすると何点増えるか」は分かりません。ロジックを変える案は実装の前に記録で前提を確かめ（合わない案は実装しない）、採否はスコアで決めます。
+
+## アプリ計測
+
+HTTPとSQLの記録には、アプリが外へ出す呼び出し（決済などの外部API）の失敗と再試行も、アプリの中のlockの待ちも出ません。practice-14では、決済の約70%が500/502/504で失敗して1件あたり2回以上やり直していたこと、全状態を1つのlockで守ったまま重い処理を走らせていたことが、3回続けてjournalctlと手で足したlogでしか見えず、それぞれ数run〜25 runの間残りました。アプリ計測は、アプリがそれを1秒ごとに集計して書き、isuscopeが毎回のrunで運ぶ記録です。
+
+アプリは標準のmetric行を書きます（`/var/tmp/isuscope-app-metrics.jsonl`へ追記。pathは`init --app-metrics`で変えられます）。書き手（Rustなら追加のcrateの要らない1 file）は、呼び出しを数えて1秒ごとにまとめて書くので、リクエストを待たせません。
+
+```json
+{"type":"metric","name":"app.call.count","value":12,"unit":"calls","labels":{"target":"payment","outcome":"502"},"timestamp":1760259047.001}
+```
+
+| metric | label | 意味 |
+|---|---|---|
+| `app.call.count`・`app.call.duration_sum`・`app.call.duration_max` | `target`, `outcome` | 外への呼び出しの試行の回数と時間（ms）。再試行も1回と数える。`outcome`はstatus codeか`error`・`timeout` |
+| `app.lock.count`・`app.lock.wait_sum`・`app.lock.wait_max`・`app.lock.hold_sum`・`app.lock.hold_max` | `lock` | lockを取った回数、取れるまで待った時間、持っていた時間（ms） |
+
+`app-metrics-mark`・`app-metrics-delta`（role `app`）がベンチの前後の差分を運び、行はそのまま標準のmetricとして読みます（parserは要りません）。ファイルがまだ無ければ`unavailable`になるだけで、runは止まりません。`brief`の`app_calls`は呼び先と結果ごとに負荷区間の回数・同じ呼び先に占める割合（失敗の結果ならそのまま失敗率）・合計・平均・最大を合計時間の順に、`app_locks`はlockごとの回数・待った時間（合計・平均・最大）・持っていた時間を待った時間の順に並べます。時間の推移と比較は`series`と`query --scope series --window load`で読みます。
+
+```console
+isuscope query latest --base BASE_RUN --metric-prefix app.lock.wait_sum --scope series --window load
+isuscope series latest --metric app.call.count --label target=payment --window load
+```
 
 ## License
 

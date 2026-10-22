@@ -42,7 +42,20 @@ pub struct BriefOutput {
     /// アプリの状態ログ（`state-log` collector）から、対象がその状態にいた時間の合計が長い順。
     /// 状態ログが無いrunでは空。行は`isuscope states sql`・`states timeline`で読む。
     pub states: BriefSection<BriefState>,
+    /// アプリ計測（`app-metrics` collector）の外への呼び出し。呼び先と結果ごとに、負荷区間の
+    /// 試行の回数と時間。合計時間の長い順。アプリがまだ書いていなければ空。
+    pub app_calls: BriefSection<BriefAppCall>,
+    /// アプリ計測のlock。lockごとに、負荷区間の取得の回数、待った時間、持っていた時間。
+    /// 待った時間の合計が長い順。
+    pub app_locks: BriefSection<BriefAppLock>,
     pub http: BriefSection<HttpRouteSummary>,
+    /// 要求数の多いrouteのうち、`http`（合計時間の順）の上位に入らなかったもの。速くて回数の
+    /// 多いroute（静的ファイルなど）は合計時間の順では埋もれ、nginxのCPUを食っていても見えない。
+    pub http_by_count: BriefSection<HttpRouteSummary>,
+    /// 拡張子の付いたpath（`.js`・`.css`・画像など）への要求をまとめた数。静的ファイルは1 fileずつ
+    /// 別のrouteなので、1行ずつでは小さく見えても、合わせると全要求の過半を占めることがある。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_static_files: Option<BriefStaticFiles>,
     /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
     pub database_rows_filtered_out: usize,
@@ -82,7 +95,11 @@ impl BriefOutput {
         self.limits.cut(rows);
         self.logs.cut(rows);
         self.states.cut(rows);
+        self.app_calls.cut(rows);
+        self.app_locks.cut(rows);
         self.http.cut(rows);
+        // 補助の欄なので、他の表より2行先に減らす。
+        self.http_by_count.cut(rows.saturating_sub(2).max(1));
         self.database.cut(rows);
         self.database_io.cut(rows);
         self.cpu.cut(rows);
@@ -97,6 +114,12 @@ impl BriefOutput {
 #[derive(Debug, Serialize)]
 pub struct BriefHostNode {
     pub node: String,
+    /// インスタンスの型とCPUの型番（ベンチ前のfingerprint）。型の違うnodeが混ざる構成で、
+    /// どのnodeが速いかを名前の順ではなく見分ける。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_model: Option<String>,
     pub cpu_busy_avg_percent: Option<f64>,
     pub cpu_busy_max_percent: Option<f64>,
     /// 最も詰まっていたコアのピーク。全体に余裕があっても1コアだけ飽和する構成を見落とさない。
@@ -111,6 +134,9 @@ pub struct BriefHostNode {
     pub pressure: Option<BriefPressure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load1_max: Option<f64>,
+    /// 実行可能なtaskの数のピーク（samplerを含む）。コア数を超えた分はCPUを待っている。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procs_running_max: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_used_max_mib: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -416,6 +442,13 @@ pub struct BriefService {
     /// ベンチの間にMainPIDが変わった回数。クラッシュやOOM killによる再起動の手がかり。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restarts: Option<usize>,
+    /// CPUを待っていたthreadの平均の数（runqueueで待った時間÷経過時間、`process-sampler`）。
+    /// CPU使用率に余裕があっても、threadの数がコアより多いとここに出る。lockの保持中に
+    /// preemptされると、lock待ちもこの分だけ延びる。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_delay_avg_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_delay_max_cores: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -446,6 +479,9 @@ pub struct BriefRun {
 pub struct BriefBenchmarkMessages {
     pub failure: Vec<String>,
     pub errors: Vec<BriefErrorSamples>,
+    /// 失敗にしなかった警告（減点・遅延など）。上限の件数でFAILにするベンチがあるので残す。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<BriefErrorSamples>,
     pub omitted_count: usize,
 }
 
@@ -455,23 +491,28 @@ pub struct BriefErrorSamples {
     pub samples: Vec<String>,
 }
 
-pub fn benchmark_messages(run: &RunManifest) -> BriefBenchmarkMessages {
-    let mut errors = Vec::<BriefErrorSamples>::new();
-    for message in run.benchmark_messages(BenchmarkMessageKind::Error) {
-        match errors
+fn samples_by_category(run: &RunManifest, kind: BenchmarkMessageKind) -> Vec<BriefErrorSamples> {
+    let mut groups = Vec::<BriefErrorSamples>::new();
+    for message in run.benchmark_messages(kind) {
+        match groups
             .iter_mut()
             .find(|group| group.category == message.category)
         {
             Some(group) => group.samples.push(message.text.clone()),
-            None => errors.push(BriefErrorSamples {
+            None => groups.push(BriefErrorSamples {
                 category: message.category.clone(),
                 samples: vec![message.text.clone()],
             }),
         }
     }
+    groups
+}
+
+pub fn benchmark_messages(run: &RunManifest) -> BriefBenchmarkMessages {
     BriefBenchmarkMessages {
         failure: run.failure_reasons(),
-        errors,
+        errors: samples_by_category(run, BenchmarkMessageKind::Error),
+        warnings: samples_by_category(run, BenchmarkMessageKind::Warning),
         omitted_count: run
             .enrichments
             .iter()
@@ -676,6 +717,248 @@ pub struct BriefState {
     pub p95_ms: Option<f64>,
     pub open: u64,
     pub peak: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct BriefStaticFiles {
+    pub routes: usize,
+    pub count: f64,
+    pub share_percent: f64,
+}
+
+/// pathの最後の部分が`名前.拡張子`（拡張子は英数字で5文字まで）なら静的ファイルとみなす。
+fn is_static_file(route: &str) -> bool {
+    let path = route.split('?').next().unwrap_or(route);
+    let last = path.rsplit('/').next().unwrap_or(path);
+    match last.rsplit_once('.') {
+        Some((name, extension)) => {
+            !name.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= 5
+                && extension.chars().all(|c| c.is_ascii_alphanumeric())
+                && !extension.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+fn static_files(http: &[HttpRouteSummary]) -> Option<BriefStaticFiles> {
+    let total = http.iter().map(|row| row.count).sum::<f64>();
+    let files = http
+        .iter()
+        .filter(|row| is_static_file(&row.route))
+        .collect::<Vec<_>>();
+    let count = files.iter().map(|row| row.count).sum::<f64>();
+    (total > 0.0 && count > 0.0).then(|| BriefStaticFiles {
+        routes: files.len(),
+        count,
+        share_percent: (count / total * 1000.0).round() / 10.0,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefAppCall {
+    pub node: String,
+    pub target: String,
+    pub outcome: String,
+    pub count: f64,
+    /// 同じ呼び先の試行に占める割合。失敗の結果なら、そのまま失敗率になる。
+    pub share_percent: Option<f64>,
+    pub total_ms: f64,
+    pub avg_ms: Option<f64>,
+    pub max_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefAppLock {
+    pub node: String,
+    pub lock: String,
+    pub count: f64,
+    pub wait_ms: f64,
+    pub wait_avg_ms: Option<f64>,
+    pub wait_max_ms: Option<f64>,
+    pub hold_ms: f64,
+    pub hold_avg_ms: Option<f64>,
+    pub hold_max_ms: Option<f64>,
+}
+
+/// アプリ計測の区間。`start`より後、`end`（書き手が1秒ごとに書く時刻なので、最後の1秒を含める）まで。
+pub struct AppWindow {
+    pub name: &'static str,
+    pub start: chrono::DateTime<chrono::Utc>,
+    pub end: chrono::DateTime<chrono::Utc>,
+}
+
+/// `app-metrics-delta`が運んだ1秒ごとの`app.`の値を区間で足し、`app_calls`・`app_locks`欄を作る。
+pub fn attach_app(
+    brief: &mut BriefOutput,
+    metrics: &[Metric],
+    window: Option<&AppWindow>,
+    limit: usize,
+) {
+    let short = brief.run.clone();
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let inside = |metric: &Metric| match (window, metric.timestamp) {
+        (None, _) => true,
+        (Some(window), Some(at)) => {
+            at > window.start && at <= window.end + chrono::Duration::seconds(1)
+        }
+        (Some(_), None) => false,
+    };
+    let mut calls = BTreeMap::<(String, String, String), [f64; 3]>::new();
+    let mut locks = BTreeMap::<(String, String), [f64; 5]>::new();
+    for metric in metrics.iter().filter(|metric| inside(metric)) {
+        let node = metric
+            .labels
+            .get("node")
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        if let Some(field) = metric.name.strip_prefix("app.call.") {
+            let index = match field {
+                "count" => 0,
+                "duration_sum" => 1,
+                "duration_max" => 2,
+                _ => continue,
+            };
+            let row = calls
+                .entry((node, label(metric, "target"), label(metric, "outcome")))
+                .or_default();
+            if index == 2 {
+                row[2] = row[2].max(metric.value);
+            } else {
+                row[index] += metric.value;
+            }
+        } else if let Some(field) = metric.name.strip_prefix("app.lock.") {
+            let index = match field {
+                "count" => 0,
+                "wait_sum" => 1,
+                "wait_max" => 2,
+                "hold_sum" => 3,
+                "hold_max" => 4,
+                _ => continue,
+            };
+            let row = locks.entry((node, label(metric, "lock"))).or_default();
+            if index == 2 || index == 4 {
+                row[index] = row[index].max(metric.value);
+            } else {
+                row[index] += metric.value;
+            }
+        }
+    }
+    let mut target_counts = BTreeMap::<(String, String), f64>::new();
+    for ((node, target, _), values) in &calls {
+        *target_counts
+            .entry((node.clone(), target.clone()))
+            .or_default() += values[0];
+    }
+    let average = |total: f64, count: f64| (count > 0.0).then(|| query::round_to(total / count, 3));
+    let mut call_rows = calls
+        .into_iter()
+        .map(|((node, target, outcome), [count, total, max])| {
+            let all = target_counts
+                .get(&(node.clone(), target.clone()))
+                .copied()
+                .unwrap_or_default();
+            BriefAppCall {
+                share_percent: (all > 0.0).then(|| (count / all * 1000.0).round() / 10.0),
+                node,
+                target,
+                outcome,
+                count,
+                total_ms: query::round_to(total, 3),
+                avg_ms: average(total, count),
+                max_ms: (count > 0.0).then_some(query::round_to(max, 3)),
+            }
+        })
+        .collect::<Vec<_>>();
+    call_rows.sort_by(|a, b| {
+        b.total_ms
+            .total_cmp(&a.total_ms)
+            .then(b.count.total_cmp(&a.count))
+    });
+    let mut lock_rows = locks
+        .into_iter()
+        .map(
+            |((node, lock), [count, wait, wait_max, hold, hold_max])| BriefAppLock {
+                node,
+                lock,
+                count,
+                wait_ms: query::round_to(wait, 3),
+                wait_avg_ms: average(wait, count),
+                wait_max_ms: (count > 0.0).then_some(query::round_to(wait_max, 3)),
+                hold_ms: query::round_to(hold, 3),
+                hold_avg_ms: average(hold, count),
+                hold_max_ms: (count > 0.0).then_some(query::round_to(hold_max, 3)),
+            },
+        )
+        .collect::<Vec<_>>();
+    lock_rows.sort_by(|a, b| {
+        b.wait_ms
+            .total_cmp(&a.wait_ms)
+            .then(b.hold_ms.total_cmp(&a.hold_ms))
+    });
+    let window_name = window.map(|window| window.name.to_owned());
+    let flag = window.map_or("whole", |window| window.name);
+    // 行の無い欄（アプリ計測の無いrun）には区間を付けない。
+    let calls_window = (!call_rows.is_empty())
+        .then(|| window_name.clone())
+        .flatten();
+    let locks_window = (!lock_rows.is_empty())
+        .then(|| window_name.clone())
+        .flatten();
+    brief.app_calls = section(call_rows, limit)
+        .window(calls_window)
+        .more(|| {
+            format!(
+                "isuscope query {short} --metric-prefix app.call. --scope series --window {flag} --limit 40"
+            )
+        });
+    brief.app_locks = section(lock_rows, limit)
+        .window(locks_window)
+        .more(|| {
+            format!(
+                "isuscope query {short} --metric-prefix app.lock. --scope series --window {flag} --limit 40"
+            )
+        });
+}
+
+/// ベンチ前のfingerprint（`instance.type`・`cpu.model`）を`hosts`のnodeへ付ける。値の分からない
+/// node（`unknown`、計測の無いnode）には付けない。型が2種類以上あれば`warnings`で伝える。
+pub fn attach_node_facts(
+    brief: &mut BriefOutput,
+    instance_types: &[(String, String)],
+    cpu_models: &[(String, String)],
+) {
+    let known = |value: &str| {
+        let value = value.trim();
+        (!value.is_empty() && value != "unknown").then(|| value.to_owned())
+    };
+    for host in &mut brief.hosts.items {
+        host.instance_type = instance_types
+            .iter()
+            .find(|(node, _)| *node == host.node)
+            .and_then(|(_, value)| known(value));
+        host.cpu_model = cpu_models
+            .iter()
+            .find(|(node, _)| *node == host.node)
+            .and_then(|(_, value)| known(value));
+    }
+    let mut types = BTreeMap::<&str, Vec<&str>>::new();
+    for host in &brief.hosts.items {
+        if let Some(kind) = host.instance_type.as_deref() {
+            types.entry(kind).or_default().push(&host.node);
+        }
+    }
+    if types.len() > 1 {
+        let listed = types
+            .iter()
+            .map(|(kind, nodes)| format!("{kind} ({})", nodes.join(", ")))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        brief.warnings.push(format!(
+            "hosts: nodes run different instance types: {listed}; compare a role's load across nodes with their types in mind"
+        ));
+    }
 }
 
 /// `state-log-delta`の集計metric（`state.`）から`states`欄を作り、欠けを`warnings`に出す。
@@ -915,6 +1198,8 @@ pub fn build(
     let (coverage_issues, coverage_notes_hidden) = coverage_issues(diagnostics.coverage);
     let mut http = diagnostics.http;
     http.iter_mut().for_each(query::round_http_summary);
+    let http_by_count = share_of_requests(&mut http, limit);
+    let http_static_files = static_files(&http);
     let (mut database, database_rows_filtered_out, database_window) =
         preferred_database(diagnostics.database, &run);
     database.iter_mut().for_each(query::round_database_summary);
@@ -997,8 +1282,14 @@ pub fn build(
         limits: section(Vec::new(), limit),
         logs: section(Vec::new(), limit),
         states: section(Vec::new(), limit),
+        app_calls: section(Vec::new(), limit),
+        app_locks: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
+        // 補助の欄なので3行まで。他の表の行数を削ってまで並べない。
+        http_by_count: section(http_by_count, limit.min(3))
+            .more(|| format!("isuscope query {short} --view http --sort count --limit 20")),
+        http_static_files,
         database: section(database, limit)
             .window(database_window)
             .more(|| {
@@ -1248,6 +1539,7 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         | "service.process_rss_bytes"
                         | "service.process_threads"
                         | "service.process_restarts"
+                        | "service.run_delay_cores"
                 ) {
                     continue;
                 }
@@ -1259,6 +1551,8 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         rss_max_mib: None,
                         threads_max: None,
                         restarts: None,
+                        run_delay_avg_cores: None,
+                        run_delay_max_cores: None,
                     });
                 match row.metric.as_str() {
                     "service.cpu_cores" => {
@@ -1268,6 +1562,11 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                         service.rss_max_mib = Some(query::round_to(row.peak / 1_048_576.0, 1))
                     }
                     "service.process_threads" => service.threads_max = Some(row.peak),
+                    "service.run_delay_cores" => {
+                        service.run_delay_avg_cores =
+                            row.value.map(|value| query::round_to(value, 3));
+                        service.run_delay_max_cores = Some(query::round_to(row.peak, 3));
+                    }
                     _ => service.restarts = row.value.map(|count| count as usize),
                 }
             }
@@ -1287,6 +1586,8 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
             services.truncate(3);
             BriefHostNode {
                 node: node.into(),
+                instance_type: None,
+                cpu_model: None,
                 cpu_busy_avg_percent: average("host.cpu_busy_percent")
                     .or_else(|| average("host.cpu_percent")),
                 cpu_busy_max_percent: peak("host.cpu_busy_percent")
@@ -1296,6 +1597,7 @@ fn host_nodes(rows: &[HostSummary]) -> Vec<BriefHostNode> {
                 steal_avg_percent: average("host.cpu_steal_percent"),
                 pressure,
                 load1_max: peak("host.load1"),
+                procs_running_max: peak("host.procs_running"),
                 memory_used_max_mib: peak("host.memory_used_bytes")
                     .map(|bytes| query::round_to(bytes / 1_048_576.0, 1)),
                 disk_util_max_percent: peak("host.disk_util_percent"),
@@ -1357,6 +1659,21 @@ pub fn next_steps(brief: &mut BriefOutput) {
             window_flag(brief.database.window.as_deref())
         ));
     }
+}
+
+/// 各routeに全要求数に占める割合を付け、回数の上位のうち合計時間の上位`limit`件に入らなかった
+/// ものを返す。`http`は合計時間の順のまま。
+fn share_of_requests(http: &mut [HttpRouteSummary], limit: usize) -> Vec<HttpRouteSummary> {
+    let total = http.iter().map(|row| row.count).sum::<f64>();
+    if total > 0.0 {
+        for row in http.iter_mut() {
+            row.share_percent = Some((row.count / total * 1000.0).round() / 10.0);
+        }
+    }
+    let mut by_count = http.iter().skip(limit).cloned().collect::<Vec<_>>();
+    query::sort_http_by_count(&mut by_count);
+    by_count.retain(|row| row.count > 0.0);
+    by_count
 }
 
 fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
@@ -1480,6 +1797,7 @@ mod tests {
                 method: "POST".into(),
                 route: format!("/user/:userId/present/receive/{index}"),
                 count: 584.0,
+                share_percent: None,
                 total_ms: Some(633035.0),
                 avg_ms: Some(1083.964),
                 min_ms: Some(1.0),
@@ -1707,6 +2025,8 @@ mod tests {
             ),
             row("service.process_threads", "core.service", 99.0, 228.0),
             row("service.process_restarts", "core.service", 1.0, 1.0),
+            row("service.run_delay_cores", "core.service", 0.41234, 1.9),
+            row("host.procs_running", "host", 3.0, 11.0),
             row(
                 "service.process_rss_bytes",
                 "nginx.service",
@@ -1728,7 +2048,13 @@ mod tests {
             ),
             (None, Some(1254.0), Some(228.0), Some(1))
         );
+        assert_eq!(
+            (core.run_delay_avg_cores, core.run_delay_max_cores),
+            (Some(0.412), Some(1.9))
+        );
+        assert_eq!(nodes[0].procs_running_max, Some(11.0));
         assert_eq!(services[1].restarts, None);
+        assert_eq!(services[1].run_delay_avg_cores, None);
     }
 
     #[test]
@@ -2118,5 +2444,150 @@ mod tests {
             (memory.buffer_pool_mib, memory.tables_mib),
             (128.0, 537.015625)
         );
+    }
+
+    #[test]
+    fn fast_frequent_routes_surface_beside_the_total_time_ranking() {
+        let route = |name: &str, count: f64, total_ms: f64| HttpRouteSummary {
+            node: "app1".into(),
+            method: "GET".into(),
+            route: name.into(),
+            count,
+            total_ms: Some(total_ms),
+            ..Default::default()
+        };
+        // Sorted by total time, as report::http_routes returns them.
+        let mut http = vec![
+            route("/api/notification", 10.0, 70_000.0),
+            route("/api/coordinate", 170.0, 16_000.0),
+            route("/api/evaluation", 8.0, 2_000.0),
+            route("/assets/app.js", 600.0, 600.0),
+            route("/assets/app.css", 200.0, 200.0),
+            route("/favicon.ico", 12.0, 12.0),
+        ];
+        let by_count = share_of_requests(&mut http, 2);
+        assert_eq!(http[1].share_percent, Some(17.0));
+        assert_eq!(http[3].share_percent, Some(60.0));
+        assert_eq!(
+            by_count
+                .iter()
+                .map(|row| row.route.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "/assets/app.js",
+                "/assets/app.css",
+                "/favicon.ico",
+                "/api/evaluation"
+            ]
+        );
+        assert_eq!(
+            static_files(&http),
+            Some(BriefStaticFiles {
+                routes: 3,
+                count: 812.0,
+                share_percent: 81.2,
+            })
+        );
+        assert!(is_static_file("/assets/root-BoSp76zW.css"));
+        assert!(!is_static_file("/api/v1.2/items"));
+        assert!(!is_static_file("/api/rides/:ride_id"));
+        assert!(!is_static_file("/user/1.5"));
+        // No requests at all: no share and nothing to list.
+        let mut empty = vec![route("/x", 0.0, 0.0)];
+        assert!(share_of_requests(&mut empty, 0).is_empty());
+        assert_eq!(empty[0].share_percent, None);
+    }
+
+    #[test]
+    fn app_calls_and_locks_sum_the_load_window_and_rank_by_time() {
+        let diagnostics = crate::report::diagnose(
+            test_run(),
+            Vec::new(),
+            Vec::new(),
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+        );
+        let options = || query::MetricQueryOptions {
+            scope: query::QueryScope::Run,
+            window: None,
+            metrics: Vec::new(),
+            metric_prefix: None,
+            node: None,
+            source: None,
+            labels: Vec::new(),
+            label_contains: Vec::new(),
+            group_by: Vec::new(),
+            limit: usize::MAX,
+        };
+        let empty = || query::metric_query("run".into(), Vec::new(), options());
+        let mut brief = build(diagnostics, empty(), empty(), 5);
+        let start = chrono::DateTime::parse_from_rfc3339("2026-10-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = |seconds: i64| start + chrono::Duration::seconds(seconds);
+        let metric = |name: &str, value: f64, second: i64, labels: &[(&str, &str)]| Metric {
+            name: name.into(),
+            value,
+            unit: String::new(),
+            timestamp: Some(at(second)),
+            labels: labels
+                .iter()
+                .chain(&[("node", "app3")])
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        };
+        let failed = [("target", "payment"), ("outcome", "502")];
+        let ok = [("target", "payment"), ("outcome", "204")];
+        let store = [("lock", "store")];
+        let metrics = [
+            // initializeの間（区間の外）は足さない。
+            metric("app.call.count", 100.0, 0, &failed),
+            metric("app.call.count", 7.0, 2, &failed),
+            metric("app.call.duration_sum", 70.0, 2, &failed),
+            metric("app.call.duration_max", 30.0, 2, &failed),
+            metric("app.call.count", 7.0, 3, &failed),
+            metric("app.call.duration_sum", 140.0, 3, &failed),
+            metric("app.call.duration_max", 50.0, 3, &failed),
+            metric("app.call.count", 6.0, 3, &ok),
+            metric("app.call.duration_sum", 30.0, 3, &ok),
+            metric("app.call.duration_max", 9.0, 3, &ok),
+            metric("app.lock.count", 1000.0, 2, &store),
+            metric("app.lock.wait_sum", 400.0, 2, &store),
+            metric("app.lock.wait_max", 12.0, 2, &store),
+            metric("app.lock.hold_sum", 900.0, 2, &store),
+            metric("app.lock.hold_max", 3.0, 2, &store),
+            metric("app.lock.count", 10.0, 2, &[("lock", "ids")]),
+            metric("app.lock.wait_sum", 0.5, 2, &[("lock", "ids")]),
+        ];
+        let window = AppWindow {
+            name: "load",
+            start: at(1),
+            end: at(60),
+        };
+        attach_app(&mut brief, &metrics, Some(&window), 5);
+        let calls = &brief.app_calls;
+        assert_eq!(calls.window.as_deref(), Some("load"));
+        assert_eq!(calls.items.len(), 2);
+        let first = &calls.items[0];
+        assert_eq!(
+            (
+                first.outcome.as_str(),
+                first.count,
+                first.total_ms,
+                first.avg_ms,
+                first.max_ms
+            ),
+            ("502", 14.0, 210.0, Some(15.0), Some(50.0))
+        );
+        assert_eq!(first.share_percent, Some(70.0));
+        assert_eq!(calls.items[1].share_percent, Some(30.0));
+        let locks = &brief.app_locks;
+        assert_eq!(locks.items[0].lock, "store");
+        assert_eq!(
+            (locks.items[0].wait_avg_ms, locks.items[0].hold_max_ms),
+            (Some(0.4), Some(3.0))
+        );
+        assert_eq!(locks.items[1].lock, "ids");
+        assert_eq!(locks.items[1].hold_max_ms, Some(0.0));
     }
 }

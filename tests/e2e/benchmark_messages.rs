@@ -14,10 +14,13 @@ fn parser_messages_record_why_a_benchmark_failed_and_sample_its_errors() {
     let project = tempdir().unwrap();
     let config_dir = project.path().join(".isuscope");
     fs::create_dir_all(&config_dir).unwrap();
-    // Seven errors in one category keep five samples; an unknown kind is reported.
+    // Seven errors in one category keep five samples; warnings are kept apart from errors in the
+    // same category; an unknown kind is reported.
     let mut records = vec![
         r#"{"type":"message","kind":"failure","text":"validation: GET /user/0/home expected(403) != actual(401)"}"#.to_owned(),
         r#"{"type":"message","kind":"error","category":"validation","text":"validation-error-invalid-status-code"}"#.to_owned(),
+        r#"{"type":"message","kind":"warning","category":"timeout","text":"late response (CODE=17)"}"#.to_owned(),
+        r#"{"type":"message","kind":"warn","category":"CODE=30","text":"nearby chair is on a ride (CODE=30)"}"#.to_owned(),
         r#"{"type":"message","kind":"note","text":"not a known kind"}"#.to_owned(),
     ];
     for index in 0..7 {
@@ -56,6 +59,10 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
         stdout.contains("error     dial tcp 10.0.0.0:80: i/o timeout"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains("warning   late response (CODE=17)"),
+        "{stdout}"
+    );
 
     let list: Value = parsed(&isuscope(project.path(), &["list"]).stdout).unwrap();
     let summary = &list["runs"]["rows"][0];
@@ -86,6 +93,11 @@ command = ["sh", "-c", '''printf '%s\n' '{parser_output}' ''']
         .unwrap();
     assert_eq!(timeouts["samples"].as_array().unwrap().len(), 5);
     assert_eq!(messages["omitted_count"], 2);
+    let warnings = messages["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 2, "{messages}");
+    assert_eq!(warnings[0]["category"], "timeout");
+    assert_eq!(warnings[0]["samples"][0], "late response (CODE=17)");
+    assert_eq!(warnings[1]["category"], "CODE=30");
     assert_eq!(brief["run"], summary["run"]);
 
     let manifest: Value =

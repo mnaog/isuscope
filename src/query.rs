@@ -882,13 +882,47 @@ pub fn database_query_diff(
     )
 }
 
+/// HTTPの行の並べ方。合計時間の順では、速くて回数の多いroute（静的ファイルなど）が下に埋もれ、
+/// SSEのような長く開いたままの要求が上を占めるので、回数の順でも引けるようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpSort {
+    #[default]
+    Total,
+    Count,
+}
+
+impl HttpSort {
+    /// 比較の行を並べるときに使う値の名前。
+    fn column(self) -> &'static str {
+        match self {
+            HttpSort::Total => "total_ms",
+            HttpSort::Count => "count",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpQueryOptions {
     pub node: Option<String>,
     pub source: Option<String>,
     pub labels: Vec<(String, String)>,
     pub label_contains: Vec<(String, String)>,
+    pub sort: HttpSort,
     pub limit: usize,
+}
+
+/// 回数の多い順（同じなら合計時間、routeの順）。
+pub fn sort_http_by_count(rows: &mut [report::HttpRouteSummary]) {
+    rows.sort_by(|a, b| {
+        b.count
+            .total_cmp(&a.count)
+            .then_with(|| {
+                b.total_ms
+                    .unwrap_or_default()
+                    .total_cmp(&a.total_ms.unwrap_or_default())
+            })
+            .then_with(|| a.route.cmp(&b.route))
+    });
 }
 
 #[derive(Debug, Serialize)]
@@ -939,6 +973,9 @@ pub fn http_query(
         })
         .collect::<Vec<_>>();
     let mut rows = report::http_routes(&filtered);
+    if options.sort == HttpSort::Count {
+        sort_http_by_count(&mut rows);
+    }
     rows.iter_mut().for_each(round_http_summary);
     let total_count = rows.len();
     rows.truncate(options.limit);
@@ -956,6 +993,7 @@ pub fn http_query(
 pub fn http_query_diff(
     base: HttpQueryOutput,
     candidate: HttpQueryOutput,
+    sort: HttpSort,
     limit: usize,
 ) -> QueryDiffOutput<report::HttpRouteSummary> {
     type Key = (String, String, String);
@@ -1009,7 +1047,7 @@ pub fn http_query_diff(
             }
         })
         .collect::<Vec<_>>();
-    sort_diff_rows(&mut rows, "total_ms");
+    sort_diff_rows(&mut rows, sort.column());
     finish_diff(
         "http",
         base_run_id,

@@ -519,6 +519,27 @@ impl Store {
         serde_json::from_slice(&raw).context("invalid run manifest")
     }
 
+    /// 名前の1つ（`instance.type`など）について、nodeごとの値を返します。nodeの無い行は除きます。
+    pub fn fingerprint_by_node(&self, id: &str, name: &str) -> Result<Vec<(String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT value, labels_json FROM fingerprints WHERE run_id=?1 AND name=?2 ORDER BY id",
+        )?;
+        let rows = statement.query_map(rusqlite::params![id, name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut values = Vec::new();
+        for row in rows {
+            let (value, labels) = row?;
+            let labels =
+                serde_json::from_str::<std::collections::BTreeMap<String, String>>(&labels)
+                    .context("invalid fingerprint labels")?;
+            if let Some(node) = labels.get("node") {
+                values.push((node.clone(), value));
+            }
+        }
+        Ok(values)
+    }
+
     /// runの環境fingerprintを`名前 + labels -> 値`で返します。1つも記録していないrunは
     /// `None`（「同じ」ではなく「不明」）を返します。
     pub fn fingerprint_index(

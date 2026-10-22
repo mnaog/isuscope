@@ -368,13 +368,16 @@ pub struct CollectorResult {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BenchmarkMessageKind {
     /// Why the benchmark failed, e.g. the validation error that stopped it.
     Failure,
     /// A representative error the benchmark reported, grouped by `category`.
     Error,
+    /// A warning the benchmark counted without failing (a deduction, a late response), grouped
+    /// by `category`. Benchmarks often fail once warnings reach a limit, so they are kept too.
+    Warning,
 }
 
 /// A benchmark output line kept verbatim by a parser. Metrics carry counts; messages keep
