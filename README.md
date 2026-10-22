@@ -289,7 +289,7 @@ isuscope sql "SELECT j.key label, COUNT(DISTINCT j.value) cardinality FROM metri
 
 ### benchmark出力のparser
 
-parserは`metric`に加えて`{"type":"message","kind":"failure"|"error","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例（categoryごとに最初の5件、最大20 category、各1000文字）で、runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure_reason`、`brief`の`benchmark_messages`、`run`終了時の`failure`／`error`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
+parserは`metric`に加えて`{"type":"message","kind":"failure"|"error"|"warning","category":"...","text":"..."}`を出せます。`failure`はFAILした理由（最初の10件）、`error`はエラーの実例、`warning`はFAILにしなかった警告（減点・遅延など）の実例で、どちらもcategoryごとに最初の5件、kindごとに最大20 category、各1000文字です（`warn`も`warning`として読みます）。警告の件数で打ち切るベンチがあるので、警告もcategoryごとの件数をmetricで出し、実例をmessageで残します。runの`enrichments[].messages`に保存されます。上限を超えた件数は`omitted_message_count`に残ります。FAIL runは分析不要なので、`list`の`failure_reason`、`brief`の`benchmark_messages`（`failure`・`errors`・`warnings`）、`run`終了時の`failure`／`error`／`warning`行がその理由の記録になります。parserが理由を出さなかったFAIL（adapterが何も出さずに終了した場合など）は、isuscopeが記録した`benchmark.error`を理由として表示します。benchmark出力に不正なUTF-8が混ざっても、捕捉とparserはその行だけを読み飛ばして続けます。既存runへは`isuscope enrich`で再適用できます。
 
 ### 最初のrunで確認すること
 

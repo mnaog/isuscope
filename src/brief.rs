@@ -446,6 +446,9 @@ pub struct BriefRun {
 pub struct BriefBenchmarkMessages {
     pub failure: Vec<String>,
     pub errors: Vec<BriefErrorSamples>,
+    /// 失敗にしなかった警告（減点・遅延など）。上限の件数でFAILにするベンチがあるので残す。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<BriefErrorSamples>,
     pub omitted_count: usize,
 }
 
@@ -455,23 +458,28 @@ pub struct BriefErrorSamples {
     pub samples: Vec<String>,
 }
 
-pub fn benchmark_messages(run: &RunManifest) -> BriefBenchmarkMessages {
-    let mut errors = Vec::<BriefErrorSamples>::new();
-    for message in run.benchmark_messages(BenchmarkMessageKind::Error) {
-        match errors
+fn samples_by_category(run: &RunManifest, kind: BenchmarkMessageKind) -> Vec<BriefErrorSamples> {
+    let mut groups = Vec::<BriefErrorSamples>::new();
+    for message in run.benchmark_messages(kind) {
+        match groups
             .iter_mut()
             .find(|group| group.category == message.category)
         {
             Some(group) => group.samples.push(message.text.clone()),
-            None => errors.push(BriefErrorSamples {
+            None => groups.push(BriefErrorSamples {
                 category: message.category.clone(),
                 samples: vec![message.text.clone()],
             }),
         }
     }
+    groups
+}
+
+pub fn benchmark_messages(run: &RunManifest) -> BriefBenchmarkMessages {
     BriefBenchmarkMessages {
         failure: run.failure_reasons(),
-        errors,
+        errors: samples_by_category(run, BenchmarkMessageKind::Error),
+        warnings: samples_by_category(run, BenchmarkMessageKind::Warning),
         omitted_count: run
             .enrichments
             .iter()

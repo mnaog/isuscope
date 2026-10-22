@@ -23,7 +23,7 @@ pub const PARSER_LABEL: &str = "isuscope.parser";
 
 /// Failure messages kept per parser. The first lines usually name the cause.
 const MAX_FAILURE_MESSAGES: usize = 10;
-/// Error samples kept per category, and categories kept per parser.
+/// Error and warning samples kept per category, and categories kept per parser and kind.
 const MAX_ERROR_SAMPLES_PER_CATEGORY: usize = 5;
 const MAX_ERROR_CATEGORIES: usize = 20;
 const MAX_MESSAGE_CHARS: usize = 1000;
@@ -290,7 +290,7 @@ async fn execute(
             Ok(parsed) => {
                 if parsed.invalid > 0 {
                     errors.push(format!(
-                        "{} message records were ignored; kind must be `failure` or `error` and text must not be empty",
+                        "{} message records were ignored; kind must be `failure`, `error` or `warning` and text must not be empty",
                         parsed.invalid
                     ));
                 }
@@ -330,8 +330,8 @@ struct ParsedMessages {
     invalid: usize,
 }
 
-/// Reads `{"type":"message","kind":"failure"|"error","category":...,"text":...}` records.
-/// Failures keep the first lines; errors keep the first samples of each category.
+/// Reads `{"type":"message","kind":"failure"|"error"|"warning","category":...,"text":...}` records.
+/// Failures keep the first lines; errors and warnings keep the first samples of each category.
 fn parse_messages(path: &Path) -> Result<ParsedMessages> {
     let decoder = zstd::stream::read::Decoder::new(std::fs::File::open(path)?)?;
     let mut parsed = ParsedMessages {
@@ -340,7 +340,8 @@ fn parse_messages(path: &Path) -> Result<ParsedMessages> {
         invalid: 0,
     };
     let mut failures = 0;
-    let mut error_samples = BTreeMap::<Option<String>, usize>::new();
+    let mut samples = BTreeMap::<(BenchmarkMessageKind, Option<String>), usize>::new();
+    let mut categories = BTreeMap::<BenchmarkMessageKind, usize>::new();
     for line in BufReader::new(decoder).split(b'\n').map_while(Result::ok) {
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
@@ -351,6 +352,7 @@ fn parse_messages(path: &Path) -> Result<ParsedMessages> {
         let kind = match value.get("kind").and_then(Value::as_str) {
             Some("failure") => BenchmarkMessageKind::Failure,
             Some("error") => BenchmarkMessageKind::Error,
+            Some("warning" | "warn") => BenchmarkMessageKind::Warning,
             _ => {
                 parsed.invalid += 1;
                 continue;
@@ -376,18 +378,22 @@ fn parse_messages(path: &Path) -> Result<ParsedMessages> {
                 failures += 1;
                 failures <= MAX_FAILURE_MESSAGES
             }
-            BenchmarkMessageKind::Error => {
-                let known = error_samples.len();
-                match error_samples.get_mut(&category) {
+            BenchmarkMessageKind::Error | BenchmarkMessageKind::Warning => {
+                match samples.get_mut(&(kind, category.clone())) {
                     Some(count) => {
                         *count += 1;
                         *count <= MAX_ERROR_SAMPLES_PER_CATEGORY
                     }
-                    None if known < MAX_ERROR_CATEGORIES => {
-                        error_samples.insert(category.clone(), 1);
-                        true
+                    None => {
+                        let known = categories.entry(kind).or_default();
+                        if *known < MAX_ERROR_CATEGORIES {
+                            *known += 1;
+                            samples.insert((kind, category.clone()), 1);
+                            true
+                        } else {
+                            false
+                        }
                     }
-                    None => false,
                 }
             }
         };
