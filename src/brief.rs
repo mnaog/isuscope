@@ -43,6 +43,9 @@ pub struct BriefOutput {
     /// 状態ログが無いrunでは空。行は`isuscope states sql`・`states timeline`で読む。
     pub states: BriefSection<BriefState>,
     pub http: BriefSection<HttpRouteSummary>,
+    /// 要求数の多いrouteのうち、`http`（合計時間の順）の上位に入らなかったもの。速くて回数の
+    /// 多いroute（静的ファイルなど）は合計時間の順では埋もれ、nginxのCPUを食っていても見えない。
+    pub http_by_count: BriefSection<HttpRouteSummary>,
     /// `window`はDBの行を要約した区間（`load`など）。区間を持たない古いrunでは付かない。
     pub database: BriefSection<DatabaseSummary>,
     pub database_rows_filtered_out: usize,
@@ -83,6 +86,7 @@ impl BriefOutput {
         self.logs.cut(rows);
         self.states.cut(rows);
         self.http.cut(rows);
+        self.http_by_count.cut(rows);
         self.database.cut(rows);
         self.database_io.cut(rows);
         self.cpu.cut(rows);
@@ -923,6 +927,7 @@ pub fn build(
     let (coverage_issues, coverage_notes_hidden) = coverage_issues(diagnostics.coverage);
     let mut http = diagnostics.http;
     http.iter_mut().for_each(query::round_http_summary);
+    let http_by_count = share_of_requests(&mut http, limit);
     let (mut database, database_rows_filtered_out, database_window) =
         preferred_database(diagnostics.database, &run);
     database.iter_mut().for_each(query::round_database_summary);
@@ -1007,6 +1012,8 @@ pub fn build(
         states: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
+        http_by_count: section(http_by_count, limit)
+            .more(|| format!("isuscope query {short} --view http --sort count --limit 20")),
         database: section(database, limit)
             .window(database_window)
             .more(|| {
@@ -1367,6 +1374,21 @@ pub fn next_steps(brief: &mut BriefOutput) {
     }
 }
 
+/// 各routeに全要求数に占める割合を付け、回数の上位のうち合計時間の上位`limit`件に入らなかった
+/// ものを返す。`http`は合計時間の順のまま。
+fn share_of_requests(http: &mut [HttpRouteSummary], limit: usize) -> Vec<HttpRouteSummary> {
+    let total = http.iter().map(|row| row.count).sum::<f64>();
+    if total > 0.0 {
+        for row in http.iter_mut() {
+            row.share_percent = Some((row.count / total * 1000.0).round() / 10.0);
+        }
+    }
+    let mut by_count = http.iter().skip(limit).cloned().collect::<Vec<_>>();
+    query::sort_http_by_count(&mut by_count);
+    by_count.retain(|row| row.count > 0.0);
+    by_count
+}
+
 fn section<T>(mut items: Vec<T>, limit: usize) -> BriefSection<T> {
     let total_count = items.len();
     items.truncate(limit);
@@ -1488,6 +1510,7 @@ mod tests {
                 method: "POST".into(),
                 route: format!("/user/:userId/present/receive/{index}"),
                 count: 584.0,
+                share_percent: None,
                 total_ms: Some(633035.0),
                 avg_ms: Some(1083.964),
                 min_ms: Some(1.0),
@@ -2126,5 +2149,45 @@ mod tests {
             (memory.buffer_pool_mib, memory.tables_mib),
             (128.0, 537.015625)
         );
+    }
+
+    #[test]
+    fn fast_frequent_routes_surface_beside_the_total_time_ranking() {
+        let route = |name: &str, count: f64, total_ms: f64| HttpRouteSummary {
+            node: "app1".into(),
+            method: "GET".into(),
+            route: name.into(),
+            count,
+            total_ms: Some(total_ms),
+            ..Default::default()
+        };
+        // Sorted by total time, as report::http_routes returns them.
+        let mut http = vec![
+            route("/api/notification", 10.0, 70_000.0),
+            route("/api/coordinate", 170.0, 16_000.0),
+            route("/api/evaluation", 8.0, 2_000.0),
+            route("/assets/app.js", 600.0, 600.0),
+            route("/assets/app.css", 200.0, 200.0),
+            route("/favicon.ico", 12.0, 12.0),
+        ];
+        let by_count = share_of_requests(&mut http, 2);
+        assert_eq!(http[1].share_percent, Some(17.0));
+        assert_eq!(http[3].share_percent, Some(60.0));
+        assert_eq!(
+            by_count
+                .iter()
+                .map(|row| row.route.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "/assets/app.js",
+                "/assets/app.css",
+                "/favicon.ico",
+                "/api/evaluation"
+            ]
+        );
+        // No requests at all: no share and nothing to list.
+        let mut empty = vec![route("/x", 0.0, 0.0)];
+        assert!(share_of_requests(&mut empty, 0).is_empty());
+        assert_eq!(empty[0].share_percent, None);
     }
 }

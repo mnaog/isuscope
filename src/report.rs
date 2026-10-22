@@ -222,12 +222,15 @@ fn load_window(
     ))
 }
 
-#[derive(Debug, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct HttpRouteSummary {
     pub node: String,
     pub method: String,
     pub route: String,
     pub count: f64,
+    /// 全routeの要求数に占める割合。briefだけが付ける（queryの行には無い）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_percent: Option<f64>,
     pub total_ms: Option<f64>,
     pub avg_ms: Option<f64>,
     pub min_ms: Option<f64>,

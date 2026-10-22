@@ -6,7 +6,9 @@ use isuscope::{
     doctor, enrichment, init,
     metric_semantics::{self, MetricAggregation},
     model::{AnalysisVerdict, RunManifest, RunMode},
-    query::{self, DatabaseQueryOptions, HttpQueryOptions, MetricQueryOptions, QueryScope},
+    query::{
+        self, DatabaseQueryOptions, HttpQueryOptions, HttpSort, MetricQueryOptions, QueryScope,
+    },
     report::{self, RunDiagnostics},
     result_commands,
     runner::{self, RunAnnotations},
@@ -263,6 +265,9 @@ enum Commands {
         /// 出力で保持するlabel。provenance labelは常に保持します。
         #[arg(long = "group-by")]
         group_by: Vec<String>,
+        /// `--view http`の行の並べ方。既定は合計時間の順。
+        #[arg(long, value_enum, default_value_t = QuerySortArg::Total)]
+        sort: QuerySortArg,
         /// 出力行数の上限。
         #[arg(long, default_value_t = 100, value_parser = parse_list_limit)]
         limit: usize,
@@ -494,6 +499,15 @@ enum QueryViewArg {
     Http,
     /// 行動遷移（匿名viewerごとのroute遷移の回数・割合・間隔）。`--label from=...`・`to=...`で絞る。
     Transitions,
+}
+
+/// `--view http`の行の並べ方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum QuerySortArg {
+    /// 合計時間の多い順（比較は合計時間の差の大きい順）。
+    Total,
+    /// 回数の多い順（比較は回数の差の大きい順）。速くて回数の多いrouteを探すときに使う。
+    Count,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -798,6 +812,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             labels,
             label_contains,
             group_by,
+            sort,
             limit,
         } => {
             show_query(
@@ -815,6 +830,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
                 labels,
                 label_contains,
                 group_by,
+                sort,
                 limit,
             )?;
             Ok(true)
@@ -1182,8 +1198,12 @@ fn show_query(
     labels: Vec<(String, String)>,
     label_contains: Vec<(String, String)>,
     group_by: Vec<String>,
+    sort: QuerySortArg,
     limit: usize,
 ) -> Result<()> {
+    if sort != QuerySortArg::Total && !matches!(view, QueryViewArg::Http) {
+        bail!("--sort applies only to `--view http`");
+    }
     let store = Store::open(&config.data_dir)?;
     let id = store.require_id(requested, "run")?;
     let base_id = base_requested
@@ -1372,15 +1392,23 @@ fn show_query(
                 source,
                 labels,
                 label_contains,
+                sort: match sort {
+                    QuerySortArg::Total => HttpSort::Total,
+                    QuerySortArg::Count => HttpSort::Count,
+                },
                 limit: query_limit,
             };
+            let sort = options.sort;
             let candidate = query::http_query(id, candidate_metrics, options.clone());
             if let Some(base_id) = base_id {
                 let base_metrics =
                     store.query_metrics(&base_id, &[], Some("http."), Some(false))?;
                 let base = query::http_query(base_id, base_metrics, options);
                 write_capped_json(
-                    &columns(query::http_query_diff(base, candidate, limit), all_columns),
+                    &columns(
+                        query::http_query_diff(base, candidate, sort, limit),
+                        all_columns,
+                    ),
                     &QUERY_CAP,
                 )?;
             } else {
@@ -2817,6 +2845,7 @@ fn brief_json(brief: &brief::BriefOutput) -> Result<serde_json::Value> {
         ("benchmark", &["unit", "aggregation", "samples"][..]),
         ("score_inputs", &["unit", "aggregation", "samples"][..]),
         ("http", &["node", "method"][..]),
+        ("http_by_count", &["node", "method"][..]),
         ("database", &["node", "engine", "source", "window"][..]),
         ("cpu", &["node", "source"][..]),
         ("upstreams", &["node"][..]),
@@ -2838,7 +2867,29 @@ const BRIEF_COLUMNS: &[(&str, &[&str])] = &[
     (
         "http",
         &[
-            "node", "method", "route", "count", "total_ms", "avg_ms", "p95_ms", "errors",
+            "node",
+            "method",
+            "route",
+            "count",
+            "share_percent",
+            "total_ms",
+            "avg_ms",
+            "p95_ms",
+            "errors",
+        ],
+    ),
+    (
+        "http_by_count",
+        &[
+            "node",
+            "method",
+            "route",
+            "count",
+            "share_percent",
+            "total_ms",
+            "avg_ms",
+            "p95_ms",
+            "errors",
         ],
     ),
     (
