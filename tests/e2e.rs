@@ -91,6 +91,8 @@ mod documented_commands;
 mod enrichment;
 #[path = "e2e/failure_modes.rs"]
 mod failure_modes;
+#[path = "e2e/go_profile.rs"]
+mod go_profile;
 #[path = "e2e/init.rs"]
 mod init;
 #[path = "e2e/lifecycle.rs"]

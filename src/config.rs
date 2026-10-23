@@ -343,6 +343,8 @@ pub enum CollectorParser {
     PerfScript,
     /// アプリが状態の変化を1行ずつ書いたJSON行（状態ログ）。[`crate::states`]を参照。
     StateLog,
+    /// Goのアプリの窓口が返した負荷の区間のpprof。[`crate::go_profile`]を参照。
+    GoProfile,
 }
 
 #[derive(Debug, Clone, Deserialize)]

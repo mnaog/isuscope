@@ -48,6 +48,25 @@ pub struct BriefOutput {
     /// アプリ計測のlock。lockごとに、負荷区間の取得の回数、待った時間、持っていた時間。
     /// 待った時間の合計が長い順。
     pub app_locks: BriefSection<BriefAppLock>,
+    /// アプリ計測のGoのruntimeの値（`app.go.*`）。nodeごとに、負荷区間のGCのCPUの割合、mutexと
+    /// 実行の待ち、割り当て、GC、goroutineの数。Goの書き手が無ければ空。
+    pub app_runtime: BriefSection<BriefAppRuntime>,
+    /// Goのprofile（`go-profile` collector）の、葉の関数ごとのCPU。`flat_percent`はその関数そのもの、
+    /// `cum_percent`は呼んだ先も含めた割合（どちらもそのnodeのGoのprocessのCPUに対して）。
+    pub go_cpu: BriefSection<BriefGoCpu>,
+    /// 同じCPUを、最も内側のアプリの関数（`main.`）へ寄せたもの。標準libraryやruntimeの中の時間も
+    /// それを呼んだアプリの関数に入るので、直す場所がそのまま分かる。
+    pub go_cpu_app: BriefSection<BriefGoApp>,
+    /// 同じCPUを、アプリが要求に付けた`method`・`route`のlabelで分けたもの。APIごとのCPU。
+    pub go_routes: BriefSection<BriefGoRoute>,
+    /// GoのprocessのCPUを、葉の関数の種類（GC、割り当て、lock、scheduler、HTTP、暗号、JSON、SQL、
+    /// アプリなど）に分けた割合。`source`はprofile（`pprof`）か、profileの無いnodeでのperfのsymbol（`perf`）。
+    pub go_classes: BriefSection<BriefGoClass>,
+    /// Goのmutexの取り合い（`kind` `mutex`、取り合いになったlockを放したアプリの関数）と、goroutineが
+    /// 待った場所（`block`、待ったアプリの関数）。待ちの長い順。
+    pub go_waits: BriefSection<BriefGoWait>,
+    /// Goの割り当てを、割り当てたアプリの関数ごとに。多い順。
+    pub go_allocs: BriefSection<BriefGoAlloc>,
     pub http: BriefSection<HttpRouteSummary>,
     /// 要求数の多いrouteのうち、`http`（合計時間の順）の上位に入らなかったもの。速くて回数の
     /// 多いroute（静的ファイルなど）は合計時間の順では埋もれ、nginxのCPUを食っていても見えない。
@@ -97,6 +116,12 @@ impl BriefOutput {
         self.states.cut(rows);
         self.app_calls.cut(rows);
         self.app_locks.cut(rows);
+        self.go_cpu.cut(rows);
+        self.go_cpu_app.cut(rows);
+        self.go_routes.cut(rows);
+        self.go_classes.cut(rows);
+        self.go_waits.cut(rows);
+        self.go_allocs.cut(rows);
         self.http.cut(rows);
         // 補助の欄なので、他の表より2行先に減らす。
         self.http_by_count.cut(rows.saturating_sub(2).max(1));
@@ -961,6 +986,409 @@ pub fn attach_node_facts(
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct BriefAppRuntime {
+    pub node: String,
+    /// runtimeが見積もったCPUのうちGCの割合（GCとアプリのCPUの和に対して）。
+    pub gc_cpu_percent: Option<f64>,
+    /// アプリ（GC以外のGoのコード）が使ったcoreの数の平均。
+    pub user_cpu_cores: Option<f64>,
+    /// 全mutex（包んでいないものも含む）の待ちの、1秒あたりの合計。
+    pub mutex_wait_ms_per_s: Option<f64>,
+    /// 実行できるgoroutineがCPUを待った時間の平均と、各1秒のp99の最大。
+    pub sched_wait_avg_us: Option<f64>,
+    pub sched_wait_p99_max_ms: Option<f64>,
+    pub alloc_mb_per_s: Option<f64>,
+    pub gc_per_s: Option<f64>,
+    pub gc_pause_max_ms: Option<f64>,
+    pub heap_live_max_mb: Option<f64>,
+    pub goroutines_max: Option<f64>,
+    pub gomaxprocs: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefGoCpu {
+    pub node: String,
+    pub function: String,
+    pub flat_percent: f64,
+    pub cum_percent: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefGoApp {
+    pub node: String,
+    pub function: String,
+    pub percent: f64,
+    /// profileを取った区間の平均で、何core使ったか。
+    pub cores: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefGoRoute {
+    pub node: String,
+    pub method: String,
+    pub route: String,
+    pub percent: f64,
+    pub cores: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefGoClass {
+    pub node: String,
+    pub process: String,
+    pub source: String,
+    pub class: String,
+    pub percent: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefGoWait {
+    pub node: String,
+    pub kind: String,
+    pub site: String,
+    pub delay_ms: f64,
+    pub count: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BriefGoAlloc {
+    pub node: String,
+    pub site: String,
+    pub mb: f64,
+    pub share_percent: Option<f64>,
+    pub objects: Option<f64>,
+}
+
+/// アプリ計測のGoのruntimeの値（`app.go.*`、1秒ごと）を負荷区間で要約し、`app_runtime`欄を作る。
+pub fn attach_app_runtime(brief: &mut BriefOutput, metrics: &[Metric], window: Option<&AppWindow>) {
+    let inside = |metric: &Metric| match (window, metric.timestamp) {
+        (None, _) => true,
+        (Some(window), Some(at)) => {
+            at > window.start && at <= window.end + chrono::Duration::seconds(1)
+        }
+        (Some(_), None) => false,
+    };
+    #[derive(Default)]
+    struct Node {
+        sums: BTreeMap<String, f64>,
+        maxima: BTreeMap<String, f64>,
+        seconds: std::collections::BTreeSet<i64>,
+    }
+    let mut nodes = BTreeMap::<String, Node>::new();
+    for metric in metrics.iter().filter(|metric| inside(metric)) {
+        let Some(field) = metric.name.strip_prefix("app.go.") else {
+            continue;
+        };
+        let node = metric
+            .labels
+            .get("node")
+            .cloned()
+            .unwrap_or_else(|| "local".into());
+        let row = nodes.entry(node).or_default();
+        if let Some(at) = metric.timestamp {
+            row.seconds.insert(at.timestamp());
+        }
+        *row.sums.entry(field.to_owned()).or_default() += metric.value;
+        let maximum = row.maxima.entry(field.to_owned()).or_insert(f64::MIN);
+        *maximum = maximum.max(metric.value);
+    }
+    let rows = nodes
+        .into_iter()
+        .filter_map(|(node, row)| {
+            let seconds = match window {
+                Some(window) => (window.end - window.start).num_milliseconds() as f64 / 1000.0,
+                None => row.seconds.len() as f64,
+            };
+            if row.sums.is_empty() || seconds <= 0.0 {
+                return None;
+            }
+            let sum = |name: &str| row.sums.get(name).copied();
+            let maximum = |name: &str| row.maxima.get(name).copied();
+            let rate = |name: &str, scale: f64| {
+                sum(name).map(|value| query::round_to(value / seconds * scale, 3))
+            };
+            let gc = sum("gc_cpu_ms").unwrap_or_default();
+            let user = sum("user_cpu_ms").unwrap_or_default();
+            Some(BriefAppRuntime {
+                node,
+                gc_cpu_percent: (gc + user > 0.0)
+                    .then(|| query::round_to(gc / (gc + user) * 100.0, 1)),
+                user_cpu_cores: rate("user_cpu_ms", 0.001),
+                mutex_wait_ms_per_s: rate("mutex_wait_ms", 1.0),
+                sched_wait_avg_us: match (sum("sched_wait_ms"), sum("sched_waits")) {
+                    (Some(total), Some(count)) if count > 0.0 => {
+                        Some(query::round_to(total / count * 1000.0, 1))
+                    }
+                    _ => None,
+                },
+                sched_wait_p99_max_ms: maximum("sched_wait_p99_ms")
+                    .map(|value| query::round_to(value, 3)),
+                alloc_mb_per_s: rate("alloc_bytes", 1.0 / 1_048_576.0),
+                gc_per_s: rate("gc_cycles", 1.0),
+                gc_pause_max_ms: maximum("gc_pause_max_ms").map(|value| query::round_to(value, 3)),
+                heap_live_max_mb: maximum("heap_live_bytes")
+                    .map(|value| query::round_to(value / 1_048_576.0, 1)),
+                goroutines_max: maximum("goroutines"),
+                gomaxprocs: maximum("gomaxprocs"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let short = brief.run.clone();
+    let flag = window.map_or("whole", |window| window.name);
+    brief.app_runtime = section(rows, usize::MAX)
+        .window(window.map(|window| window.name.to_owned()))
+        .more(|| format!("isuscope query {short} --metric-prefix app.go. --scope series --window {flag} --limit 40"));
+}
+
+/// Goのprofileの集計（`go.`）と、perfのsymbol別の割合（`cpu.sample_percent`、時刻なし）から、
+/// `go_cpu`・`go_cpu_app`・`go_routes`・`go_classes`・`go_waits`・`go_allocs`欄を作る。
+pub fn attach_go(brief: &mut BriefOutput, go: &[Metric], perf: &[Metric], limit: usize) {
+    let short = brief.run.clone();
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let node_of = |metric: &Metric| {
+        metric
+            .labels
+            .get("node")
+            .cloned()
+            .unwrap_or_else(|| "local".into())
+    };
+    let mut totals = BTreeMap::<String, f64>::new();
+    let mut windows = BTreeMap::<String, f64>::new();
+    let mut cumulative = BTreeMap::<(String, String), f64>::new();
+    let mut alloc_totals = BTreeMap::<String, f64>::new();
+    for metric in go {
+        let node = node_of(metric);
+        match metric.name.as_str() {
+            "go.cpu.seconds" => *totals.entry(node).or_default() += metric.value,
+            "go.cpu.window_seconds" => {
+                let window = windows.entry(node).or_default();
+                *window = window.max(metric.value);
+            }
+            "go.cpu.cum_seconds" => {
+                *cumulative
+                    .entry((node, label(metric, "function")))
+                    .or_default() += metric.value
+            }
+            "go.alloc.bytes" => *alloc_totals.entry(node).or_default() += metric.value,
+            _ => {}
+        }
+    }
+    let percent = |node: &str, value: f64| {
+        totals
+            .get(node)
+            .filter(|total| **total > 0.0)
+            .map(|total| query::round_to(value / total * 100.0, 1))
+    };
+    let cores = |node: &str, value: f64| {
+        windows
+            .get(node)
+            .filter(|window| **window > 0.0)
+            .map(|window| query::round_to(value / window, 3))
+    };
+    let by_value = |metrics: &mut Vec<(&Metric, f64)>| {
+        metrics.sort_by(|a, b| b.1.total_cmp(&a.1));
+    };
+    let pick = |name: &str| {
+        let mut rows = go
+            .iter()
+            .filter(|metric| metric.name == name)
+            .map(|metric| (metric, metric.value))
+            .collect::<Vec<_>>();
+        by_value(&mut rows);
+        rows
+    };
+    let flat = pick("go.cpu.flat_seconds")
+        .into_iter()
+        .filter_map(|(metric, value)| {
+            let node = node_of(metric);
+            let function = label(metric, "function");
+            Some(BriefGoCpu {
+                flat_percent: percent(&node, value)?,
+                cum_percent: cumulative
+                    .get(&(node.clone(), function.clone()))
+                    .and_then(|cum| percent(&node, *cum)),
+                node,
+                function,
+            })
+        })
+        .collect::<Vec<_>>();
+    let app = pick("go.cpu.app_seconds")
+        .into_iter()
+        .filter_map(|(metric, value)| {
+            let node = node_of(metric);
+            Some(BriefGoApp {
+                percent: percent(&node, value)?,
+                cores: cores(&node, value),
+                function: label(metric, "function"),
+                node,
+            })
+        })
+        .collect::<Vec<_>>();
+    let routes = pick("go.cpu.route_seconds")
+        .into_iter()
+        .filter_map(|(metric, value)| {
+            let node = node_of(metric);
+            Some(BriefGoRoute {
+                percent: percent(&node, value)?,
+                cores: cores(&node, value),
+                method: label(metric, "method"),
+                route: label(metric, "route"),
+                node,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut classes = pick("go.cpu.class_seconds")
+        .into_iter()
+        .filter_map(|(metric, value)| {
+            let node = node_of(metric);
+            Some(BriefGoClass {
+                percent: percent(&node, value)?,
+                process: String::new(),
+                source: "pprof".into(),
+                class: label(metric, "class"),
+                node,
+            })
+        })
+        .collect::<Vec<_>>();
+    classes.extend(perf_go_classes(perf, &totals));
+    // 内訳の表なので、nodeとprocessごとに1%以上の種類を、多い順に8つまで並べる。
+    classes.retain(|row| row.percent >= 1.0);
+    classes.sort_by(|a, b| {
+        (&a.node, &a.process, &a.source)
+            .cmp(&(&b.node, &b.process, &b.source))
+            .then(b.percent.total_cmp(&a.percent))
+    });
+    let mut kept = BTreeMap::<(String, String, String), usize>::new();
+    classes.retain(|row| {
+        let count = kept
+            .entry((row.node.clone(), row.process.clone(), row.source.clone()))
+            .or_default();
+        *count += 1;
+        *count <= 8
+    });
+    let mut waits = Vec::new();
+    for (kind, delay, count) in [
+        ("mutex", "go.mutex.delay_ms", "go.mutex.contentions"),
+        ("block", "go.block.delay_ms", "go.block.count"),
+    ] {
+        let counts = go
+            .iter()
+            .filter(|metric| metric.name == count)
+            .map(|metric| ((node_of(metric), label(metric, "site")), metric.value))
+            .collect::<BTreeMap<_, _>>();
+        for metric in go.iter().filter(|metric| metric.name == delay) {
+            let key = (node_of(metric), label(metric, "site"));
+            waits.push(BriefGoWait {
+                count: counts.get(&key).copied(),
+                node: key.0,
+                kind: kind.into(),
+                site: key.1,
+                delay_ms: query::round_to(metric.value, 3),
+            });
+        }
+    }
+    waits.sort_by(|a, b| b.delay_ms.total_cmp(&a.delay_ms));
+    let objects = go
+        .iter()
+        .filter(|metric| metric.name == "go.alloc.objects")
+        .map(|metric| ((node_of(metric), label(metric, "site")), metric.value))
+        .collect::<BTreeMap<_, _>>();
+    let allocs = pick("go.alloc.bytes")
+        .into_iter()
+        .map(|(metric, value)| {
+            let key = (node_of(metric), label(metric, "site"));
+            BriefGoAlloc {
+                mb: query::round_to(value / 1_048_576.0, 1),
+                share_percent: alloc_totals
+                    .get(&key.0)
+                    .filter(|total| **total > 0.0)
+                    .map(|total| query::round_to(value / total * 100.0, 1)),
+                objects: objects.get(&key).copied(),
+                node: key.0,
+                site: key.1,
+            }
+        })
+        .collect::<Vec<_>>();
+    brief.go_cpu = section(flat, limit)
+        .more(|| format!("isuscope query {short} --metric go.cpu.flat_seconds --limit 40"));
+    brief.go_cpu_app = section(app, limit)
+        .more(|| format!("isuscope query {short} --metric go.cpu.app_seconds --limit 40"));
+    brief.go_routes = section(routes, limit)
+        .more(|| format!("isuscope query {short} --metric go.cpu.route_seconds --limit 40"));
+    brief.go_classes = section(classes, usize::MAX)
+        .more(|| format!("isuscope query {short} --metric go.cpu.class_seconds --limit 40"));
+    brief.go_waits = section(waits, limit)
+        .more(|| format!("isuscope query {short} --metric-prefix go.mutex. --limit 40"));
+    brief.go_allocs = section(allocs, limit)
+        .more(|| format!("isuscope query {short} --metric go.alloc.bytes --limit 40"));
+}
+
+/// profileの無いnodeでは、perfのsymbol別の割合からGoのprocessのCPUを種類に分ける。Goのprocessは、
+/// 同じprocessのsymbolに`runtime.`の関数があるもの。kernelの中は`kernel`、Go以外のlibraryは`other`。
+fn perf_go_classes(perf: &[Metric], profiled: &BTreeMap<String, f64>) -> Vec<BriefGoClass> {
+    let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
+    let mut go_binaries = std::collections::BTreeSet::<(String, String, String)>::new();
+    for metric in perf
+        .iter()
+        .filter(|metric| metric.name == "cpu.sample_percent")
+    {
+        if label(metric, "symbol").starts_with("runtime.") {
+            go_binaries.insert((
+                label(metric, "node"),
+                label(metric, "process"),
+                label(metric, "binary"),
+            ));
+        }
+    }
+    let mut shares = BTreeMap::<(String, String), BTreeMap<&'static str, f64>>::new();
+    for metric in perf
+        .iter()
+        .filter(|metric| metric.name == "cpu.sample_percent")
+    {
+        let (node, process, binary) = (
+            label(metric, "node"),
+            label(metric, "process"),
+            label(metric, "binary"),
+        );
+        if profiled.contains_key(&node)
+            || !go_binaries
+                .iter()
+                .any(|(n, p, _)| *n == node && *p == process)
+        {
+            continue;
+        }
+        let class = if binary.contains("kernel") {
+            "kernel"
+        } else if go_binaries.contains(&(node.clone(), process.clone(), binary)) {
+            crate::go_profile::function_class(&label(metric, "symbol"))
+        } else {
+            "other"
+        };
+        *shares
+            .entry((node, process))
+            .or_default()
+            .entry(class)
+            .or_default() += metric.value;
+    }
+    let mut rows = Vec::new();
+    for ((node, process), classes) in shares {
+        let total = classes.values().sum::<f64>();
+        if total <= 0.0 {
+            continue;
+        }
+        for (class, value) in classes {
+            rows.push(BriefGoClass {
+                node: node.clone(),
+                process: process.clone(),
+                source: "perf".into(),
+                class: class.into(),
+                percent: query::round_to(value / total * 100.0, 1),
+            });
+        }
+    }
+    rows
+}
+
 /// `state-log-delta`の集計metric（`state.`）から`states`欄を作り、欠けを`warnings`に出す。
 pub fn attach_states(brief: &mut BriefOutput, metrics: &[Metric], limit: usize) {
     let label = |metric: &Metric, name: &str| metric.labels.get(name).cloned().unwrap_or_default();
@@ -1284,6 +1712,13 @@ pub fn build(
         states: section(Vec::new(), limit),
         app_calls: section(Vec::new(), limit),
         app_locks: section(Vec::new(), limit),
+        app_runtime: section(Vec::new(), usize::MAX),
+        go_cpu: section(Vec::new(), limit),
+        go_cpu_app: section(Vec::new(), limit),
+        go_routes: section(Vec::new(), limit),
+        go_classes: section(Vec::new(), limit),
+        go_waits: section(Vec::new(), limit),
+        go_allocs: section(Vec::new(), limit),
         http: section(http, limit)
             .more(|| format!("isuscope query {short} --view http --limit 20")),
         // 補助の欄なので3行まで。他の表の行数を削ってまで並べない。

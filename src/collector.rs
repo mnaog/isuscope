@@ -801,6 +801,7 @@ pub(crate) fn parse_standard_output(
         CollectorParser::Sysstat => Ok(parse_sysstat(&raw, interval)),
         CollectorParser::ServiceCgroup => Ok(parse_service_cgroup(&raw, interval)),
         CollectorParser::PerfScript => parse_perf_script(&raw, grid, interval),
+        CollectorParser::GoProfile => crate::go_profile::parse(&raw),
         CollectorParser::StateLog => Ok(crate::states::metrics(
             &crate::states::read(std::io::Cursor::new(raw)),
             interval.map(|(start, end)| crate::states::Window {

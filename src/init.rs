@@ -9,6 +9,9 @@ pub const DEFAULT_STATE_LOG: &str = "/var/tmp/isuscope-state.jsonl";
 /// アプリ計測（外への呼び出し、lockの待ち）の既定のpath。アプリの書き手も、環境変数で変えなければここへ書く。
 pub const DEFAULT_APP_METRICS: &str = "/var/tmp/isuscope-app-metrics.jsonl";
 
+/// Goのアプリのprofileの窓口（scaffoldの`profile.go`）の既定のaddress。アプリ側の`ISUCON_PROFILE_ADDR`と同じにする。
+pub const DEFAULT_GO_PROFILE: &str = "127.0.0.1:6060";
+
 /// Values that differ per project. `init` fills them with defaults; the starter template
 /// passes the paths its Ansible role installed. The collectors themselves stay one file.
 #[derive(Debug, Clone)]
@@ -20,6 +23,8 @@ pub struct ConfigOptions {
     pub state_log: String,
     /// アプリが1秒ごとに集計を書くfile（アプリ計測）。アプリ側と同じpathにする。
     pub app_metrics: String,
+    /// Goのアプリがprofileを返す窓口のaddress（app nodeの中から見たもの）。
+    pub go_profile: String,
     pub service_units: Vec<String>,
     pub sample_output: Option<String>,
     /// Append commented `[lock]`, `[ssh]` and `[[nodes]]` examples. A project that adds its
@@ -35,6 +40,7 @@ impl Default for ConfigOptions {
             mysql_slow_log: "/var/log/mysql/mysql-slow.log".into(),
             state_log: DEFAULT_STATE_LOG.into(),
             app_metrics: DEFAULT_APP_METRICS.into(),
+            go_profile: DEFAULT_GO_PROFILE.into(),
             service_units: Vec::new(),
             sample_output: None,
             scaffold: true,
@@ -87,6 +93,7 @@ pub fn render_config(options: &ConfigOptions) -> String {
         .replace("@@MYSQL_SLOW_LOG@@", &options.mysql_slow_log)
         .replace("@@STATE_LOG@@", &options.state_log)
         .replace("@@APP_METRICS@@", &options.app_metrics)
+        .replace("@@GO_PROFILE@@", &options.go_profile)
         .replace("@@SERVICE_UNITS@@", &units)
         .replace("@@SAMPLE_OUTPUT@@", &sample);
     if options.scaffold {
