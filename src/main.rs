@@ -101,6 +101,9 @@ enum Commands {
         /// app-metrics collectorが読む、アプリが外への呼び出しとlockの待ちを1秒ごとに書くfile。
         #[arg(long, default_value = isuscope::init::DEFAULT_APP_METRICS)]
         app_metrics: String,
+        /// go-profile collectorが呼ぶ、Goのアプリのprofileの窓口（app nodeの中から見たaddress）。
+        #[arg(long, default_value = isuscope::init::DEFAULT_GO_PROFILE)]
+        go_profile: String,
         /// cgroupから追うsystemd unit。空白区切り。
         #[arg(long, default_value = "")]
         service_units: String,
@@ -672,6 +675,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
         mysql_slow_log,
         state_log,
         app_metrics,
+        go_profile,
         service_units,
         sample_output,
         no_scaffold,
@@ -683,6 +687,7 @@ async fn real_main(cli: Cli) -> Result<bool> {
             mysql_slow_log: mysql_slow_log.clone(),
             state_log: state_log.clone(),
             app_metrics: app_metrics.clone(),
+            go_profile: go_profile.clone(),
             service_units: service_units
                 .split_whitespace()
                 .map(ToOwned::to_owned)
@@ -2838,6 +2843,15 @@ fn build_brief(
     brief::attach_node_facts(&mut brief, &instance_types, &cpu_models);
     let app = store.query_metrics(&brief.summary.id, &[], Some("app."), Some(true))?;
     brief::attach_app(&mut brief, &app, app_window.as_ref(), limit);
+    brief::attach_app_runtime(&mut brief, &app, app_window.as_ref());
+    let go = store.query_metrics(&brief.summary.id, &[], Some("go."), Some(false))?;
+    let perf = store.query_metrics(
+        &brief.summary.id,
+        &["cpu.sample_percent".into()],
+        None,
+        Some(false),
+    )?;
+    brief::attach_go(&mut brief, &go, &perf, limit);
     brief.review = Some(brief::review(review));
     brief::attach_previous_comparison(&mut brief, store)?;
     brief::next_steps(&mut brief);
@@ -2870,6 +2884,13 @@ fn brief_json(brief: &brief::BriefOutput) -> Result<serde_json::Value> {
         ("states", &["node", "kind"][..]),
         ("app_calls", &["node", "target"][..]),
         ("app_locks", &["node"][..]),
+        ("app_runtime", &["node"][..]),
+        ("go_cpu", &["node"][..]),
+        ("go_cpu_app", &["node"][..]),
+        ("go_routes", &["node", "method"][..]),
+        ("go_classes", &["node", "process", "source"][..]),
+        ("go_waits", &["node", "kind"][..]),
+        ("go_allocs", &["node"][..]),
         ("database_io", &["node"][..]),
     ] {
         if let Some(section) = brief.get_mut(section) {

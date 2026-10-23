@@ -1216,6 +1216,64 @@ timeout_seconds = 60
 max_output_bytes = 75497472
 unavailable_exit_codes = [75]
 
+# Goのprofile（pprof）。Goのアプリの窓口（scaffoldの`profile.go`。`ISUCON_PROFILE_ADDR`と同じaddress）に
+# ベンチの前にstartを、後にstopを送り、区間のCPU（関数、アプリの関数、APIごと、種類ごと）、mutexの
+# 取り合いとgoroutineの待ち、割り当て、goroutineの数を運ぶ。briefの`go_cpu`・`go_routes`・`go_mutex`・
+# `go_allocs`欄と、`go_classes`欄（CPUの種類ごとの割合）に出る。CPUはベンチの前から取るので、initializeの
+# 数秒も入る。窓口の無いアプリ（Go以外、まだ入れていない）ではunavailableになるだけで、runは止めない。
+# 取ったCPUのprofileはrunのlogに残り、scaffoldの`make pgo RUN=...`がPGOのprofileにする。
+[[collectors]]
+name = "go-profile-start"
+phase = "before"
+transport = "ssh"
+sequence = "go-profile"
+roles = ["app"]
+preflight = ["sh", "-c", '''
+command -v curl >/dev/null 2>&1 || { echo "curl is not installed"; exit 75; }
+curl -fsS -m 3 -o /dev/null "http://@@GO_PROFILE@@/debug/pprof/" 2>/dev/null || { echo "no Go profile endpoint at @@GO_PROFILE@@ (the app serves it once profile.go is deployed)"; exit 75; }
+echo "Go profile endpoint at @@GO_PROFILE@@"
+''']
+command = ["sh", "-c", '''
+command -v curl >/dev/null 2>&1 || exit 75
+curl -fsS -m 10 -o /dev/null -X POST "http://@@GO_PROFILE@@/debug/isuscope/start?run={run_id}" 2>/dev/null || exit 75
+''']
+timeout_seconds = 15
+unavailable_exit_codes = [75]
+
+[[collectors]]
+name = "go-profile-stop"
+phase = "after"
+transport = "ssh"
+sequence = "go-profile"
+roles = ["app"]
+command = ["sh", "-c", '''
+command -v curl >/dev/null 2>&1 || exit 75
+curl -fsS -m 60 -X POST "http://@@GO_PROFILE@@/debug/isuscope/stop?run={run_id}" || exit 75
+''']
+parser = "go-profile"
+timeout_seconds = 90
+max_output_bytes = 268435456
+unavailable_exit_codes = [75]
+
+# Goのflight recorder（直前の実行の記録、`go tool trace`で開く）。アプリを`ISUCON_FLIGHT_RECORDER=<秒>`で
+# 起動したときだけ記録がある。ベンチの後に取るので、負荷の最後の<秒>が残る（負荷の途中の急な落ち込みを
+# 見るなら、負荷の長さより長くする）。1 nodeで数十MBになるので既定では動かさない。使うときは`enabled = true`。
+# 出力はrunのlog（`collector:go-flight:stdout`）に残る。
+[[collectors]]
+name = "go-flight"
+phase = "after"
+transport = "ssh"
+sequence = "go-profile"
+enabled = false
+roles = ["app"]
+command = ["sh", "-c", '''
+command -v curl >/dev/null 2>&1 || exit 75
+curl -fsS -m 60 "http://@@GO_PROFILE@@/debug/isuscope/flight" || exit 75
+''']
+timeout_seconds = 90
+max_output_bytes = 536870912
+unavailable_exit_codes = [75]
+
 [[collectors]]
 # SQLが遅い理由の切り分け用。実行中thread、行lock待ち、log flush待ち、buffer poolの読み込みを
 # 2秒ごとに見る。累積counterは区間差分、現在値はそのまま。Performance Schemaは使わない。

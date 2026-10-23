@@ -10,6 +10,7 @@ pub mod discovery_capture;
 pub mod doctor;
 pub mod enrichment;
 pub mod git_snapshot;
+pub mod go_profile;
 pub mod hooks;
 pub mod init;
 pub mod lock;

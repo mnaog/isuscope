@@ -104,7 +104,7 @@ isuscope init
 └── SETUP.md            # 導入先で読む短いチェックリスト
 ```
 
-実環境のpathは`init`の引数で埋め込めます。`--nginx-access-log`（既定`/var/log/nginx/access.log`）、`--mysql-slow-log`（既定`/var/log/mysql/mysql-slow.log`）、`--state-log`（既定`/var/tmp/isuscope-state.jsonl`）、`--app-metrics`（既定`/var/tmp/isuscope-app-metrics.jsonl`）、`--service-units "isupipe.service mysql.service"`、`--sample-output`（`doctor`がparserを当てる保存済みベンチ出力）、`--data-dir`（既定`.isuscope/data`）です。
+実環境のpathは`init`の引数で埋め込めます。`--nginx-access-log`（既定`/var/log/nginx/access.log`）、`--mysql-slow-log`（既定`/var/log/mysql/mysql-slow.log`）、`--state-log`（既定`/var/tmp/isuscope-state.jsonl`）、`--app-metrics`（既定`/var/tmp/isuscope-app-metrics.jsonl`）、`--go-profile`（Goのアプリのprofileの窓口、既定`127.0.0.1:6060`）、`--service-units "isupipe.service mysql.service"`、`--sample-output`（`doctor`がparserを当てる保存済みベンチ出力）、`--data-dir`（既定`.isuscope/data`）です。
 
 最初に`.isuscope/SETUP.md`を読み、少なくともベンチ起動方法、initializeと負荷走行の境界（出力のmarkerか`routes.toml`の`[initialize]`）、SSHとnode、アクセスログ（MariaDBなどではslow logも）、route正規化、app binaryと主要serviceを実環境へ合わせます。その後、shellの構文、setup、doctorを順に確認します。
 
@@ -182,6 +182,8 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 - `database_io`：MySQLがfileの読み書きと、fsyncなどそれ以外の操作（`misc_wait_ms`、fsyncだけの時間ではない）で待った時間の長い順です。`database_memory`はbuffer poolとtableの大きさです。どちらもベンチの前後の差なのでinitializeを含みます。
 - `states`：アプリの状態ログから、状態にいた時間の合計が長い順です（[アプリの状態ログ](#アプリの状態ログ)）。
 - `app_calls`・`app_locks`：アプリ計測から、外への呼び出し（呼び先と結果ごとの試行の回数・割合・時間）と、lockごとの待った時間・持っていた時間の負荷区間の合計です（[アプリ計測](#アプリ計測)）。
+- `app_runtime`：Goのアプリ計測の書き手が書くruntimeの値（`app.go.*`）を、nodeごとに負荷区間で要約したものです（GCのCPUの割合、アプリのcore数、全mutexの待ち、goroutineの実行待ち、割り当て、GC、goroutineの数。[Goのprofile](#goのprofile)）。
+- `go_cpu`・`go_cpu_app`・`go_routes`・`go_classes`・`go_waits`・`go_allocs`：Goのアプリのprofileから、関数ごと、アプリの関数へ寄せたもの、APIごとのCPU、CPUの種類ごとの割合、mutexの取り合いとgoroutineの待ち、割り当てです。`go_classes`は、profileの無いnodeではperfのsymbolからGoのprocessを分けます（[Goのprofile](#goのprofile)）。
 - `transitions`：行動遷移です（[行動遷移](#行動遷移)）。
 - `score_inputs`：`score-probe`が読んだ得点の源です（[得点が何でできているかを確定する](#得点が何でできているかを確定する)）。
 - `benchmark`・`benchmark_messages`：parserが出したbenchmark metricと、FAILの理由・エラーの実例です。
@@ -476,7 +478,7 @@ isuscope states timeline latest --kind chair --id 01J8XYZ --around 2026-10-12T09
 
 HTTPとSQLの記録には、アプリが外へ出す呼び出し（決済などの外部API）の失敗と再試行も、アプリの中のlockの待ちも出ません。practice-14では、決済の約70%が500/502/504で失敗して1件あたり2回以上やり直していたこと、全状態を1つのlockで守ったまま重い処理を走らせていたことが、3回続けてjournalctlと手で足したlogでしか見えず、それぞれ数run〜25 runの間残りました。アプリ計測は、アプリがそれを1秒ごとに集計して書き、isuscopeが毎回のrunで運ぶ記録です。
 
-アプリは標準のmetric行を書きます（`/var/tmp/isuscope-app-metrics.jsonl`へ追記。pathは`init --app-metrics`で変えられます）。書き手（Rustなら追加のcrateの要らない1 file）は、呼び出しを数えて1秒ごとにまとめて書くので、リクエストを待たせません。
+アプリは標準のmetric行を書きます（`/var/tmp/isuscope-app-metrics.jsonl`へ追記。pathは`init --app-metrics`で変えられます）。書き手（starter templateのGoの`app_metrics.go`は標準libraryだけの1 file）は、呼び出しを数えて1秒ごとにまとめて書くので、リクエストを待たせません。
 
 ```json
 {"type":"metric","name":"app.call.count","value":12,"unit":"calls","labels":{"target":"payment","outcome":"502"},"timestamp":1760259047.001}
@@ -492,6 +494,45 @@ HTTPとSQLの記録には、アプリが外へ出す呼び出し（決済など�
 ```console
 isuscope query latest --base BASE_RUN --metric-prefix app.lock.wait_sum --scope series --window load
 isuscope series latest --metric app.call.count --label target=payment --window load
+```
+
+## Goのprofile
+
+perfはCPUの葉のsymbolしか数えないので、Goのアプリでは、どのAPIの、どの呼び出しの連なりがCPUを使ったか、どのmutexの取り合いで待ったかが分かりません。Goのruntimeはそれを自分で数えられるので、アプリに窓口（starter templateの`profile.go`。標準libraryだけ）を置き、ベンチの間だけ取ります。
+
+- `go-profile-start`（before）がapp nodeの中から`POST http://127.0.0.1:6060/debug/isuscope/start?run=<run ID>`を、`go-profile-stop`（after）が`.../stop?run=<run ID>`を呼びます。addressは`init --go-profile`で変えられます（アプリの`ISUCON_PROFILE_ADDR`と同じにします）。窓口が無いアプリでは`unavailable`になるだけです。CPUはベンチの前から取るので、initializeの数秒も入ります。
+- stopの出力は`isuscope-go-profile 1 run=<ID> started=<Unix秒> stopped=<Unix秒>`の1行と、`profile <種類> <gzipしたpprofのbase64>`の行です（種類は`cpu`、`mutex-base`・`mutex`、`block-base`・`block`、`allocs-base`・`allocs`、`goroutine`）。`parser = "go-profile"`がpprofを読み、累計のprofileは`-base`との差を取って、run全体のmetricにします。出力はそのままrunのlogに残るので、`go tool pprof`で開き直せ、starter templateの`make pgo`がPGOのprofileにします。
+
+| metric | label | 意味 |
+|---|---|---|
+| `go.cpu.seconds`・`go.cpu.window_seconds` | | sampleのCPU時間の合計と、profileを取った区間の長さ |
+| `go.cpu.flat_seconds`・`go.cpu.cum_seconds` | `function` | 関数そのもの／呼んだ先も含めた時間（多い順に80まで） |
+| `go.cpu.app_seconds` | `function` | sampleを最も内側のアプリの関数（`main.`）へ寄せた時間。外の時間は`(outside the app)` |
+| `go.cpu.class_seconds` | `class` | 葉の関数の種類ごとの時間（`gc`・`alloc`・`lock`・`channel`・`scheduler`・`syscall`・`http`・`net`・`crypto`・`json`・`sql`・`log`・`app`・`stdlib`・`library`・`runtime`・`profiling`） |
+| `go.cpu.route_seconds` | `method`, `route` | アプリが要求に付けたpprofのlabelごとの時間。labelの無いgoroutineは`(no route)` |
+| `go.mutex.delay_ms`・`go.mutex.contentions` | `site` | 取り合いになったmutexを放したアプリの関数（持っていた側）と、待たせた時間・回数 |
+| `go.block.delay_ms`・`go.block.count` | `site` | goroutineが待ったアプリの関数（アプリがblock profileを有効にしたときだけ） |
+| `go.alloc.bytes`・`go.alloc.objects` | `site` | 割り当てたアプリの関数 |
+| `go.goroutines` | `site` | stopの時点のgoroutineを、止まっているアプリの関数で数えたもの |
+
+`site`は、呼び出しの連なりのうち最も内側のアプリの関数（`main.`）、無ければruntime・sync・internalでない最も内側の関数です。`brief`は、CPUをnodeのGoのprocessのCPUに対する割合（と、区間の平均で何core使ったか）にして、`go_cpu`（`flat_percent`・`cum_percent`）、`go_cpu_app`、`go_routes`、`go_classes`、`go_waits`（`kind`が`mutex`か`block`）、`go_allocs`に並べます。`go_classes`はnodeとprocessごとに1%以上の種類を8つまでで、profileの無いnodeでは、perfのsymbol別の割合のうち同じprocessに`runtime.`のsymbolがあるもの（Goのprocess）を同じ種類に分けます（kernelの中は`kernel`、Go以外のlibraryは`other`、`source`は`perf`）。
+
+Goのアプリ計測の書き手は、`runtime/metrics`の値も1秒ごとに書きます（labelなし）。`brief`の`app_runtime`が負荷区間で要約します。
+
+| metric | 意味 |
+|---|---|
+| `app.go.gc_cpu_ms`・`app.go.user_cpu_ms` | runtimeが見積もったGCとアプリのCPU時間（前の1秒との差。同じ`/cpu/classes`どうしでだけ比べる） |
+| `app.go.mutex_wait_ms` | 全mutexの待ち（包んでいないものも含む） |
+| `app.go.sched_waits`・`app.go.sched_wait_ms`・`app.go.sched_wait_p99_ms` | 実行できるgoroutineがCPUを待った回数・時間（histogramの区間の中央で足す）・その1秒のp99 |
+| `app.go.alloc_bytes`・`app.go.gc_cycles`・`app.go.gc_pause_ms`・`app.go.gc_pause_max_ms` | 割り当て、GCの回数、停止の合計と最大 |
+| `app.go.goroutines`・`app.go.heap_live_bytes`・`app.go.gomaxprocs` | その時点の値 |
+
+`go-flight`（既定では無効）は、アプリを`ISUCON_FLIGHT_RECORDER=<秒>`で起動したときに、ベンチの後でflight recorder（直前の<秒>の`runtime/trace`）を取り、runのlogに残します。`go tool trace`で開きます。
+
+```console
+isuscope query latest --metric go.cpu.app_seconds --limit 20
+isuscope query latest --base BASE_RUN --metric go.cpu.route_seconds
+isuscope query latest --metric-prefix app.go. --scope series --window load
 ```
 
 ## License
