@@ -8,8 +8,8 @@
 //! isuscopeは問題を知らないので、種類と状態の名前はアプリが書いたものをそのまま扱う。
 //!
 //! `state-log-delta` collectorがベンチの前後の差分をそのまま運び、run の log に残す（生の行は
-//! SQLiteの索引へ入れない）。この module はその行から集計metricを作り、`states`コマンドのために
-//! 一時的なin-memoryのSQLiteへ載せる。
+//! run検索用のSQLite索引へ入れない）。この module はその行から集計metricを作り、`states`コマンドのために
+//! 再生成できるローカルのSQLiteキャッシュへ載せる。
 use crate::model::{BenchmarkResult, Metric};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -492,10 +492,45 @@ pub fn parse_collector_output(path: &Path, window: Option<Window>) -> Result<Vec
     Ok(metrics(&read(std::io::BufReader::new(decoder)), window))
 }
 
+/// 集計と同じ解析結果から、初回の状態問い合わせ用のキャッシュも作る。
+/// キャッシュは補助なので、保存できなくても計測結果は失敗にしない。
+pub fn collect(
+    path: &Path,
+    node: &str,
+    window: Option<Window>,
+    started_at: Option<DateTime<Utc>>,
+) -> Result<Vec<Metric>> {
+    let stamp = cache::SourceStamp::of(path, node);
+    let parsed = read(std::io::BufReader::new(zstd::stream::read::Decoder::new(
+        std::fs::File::open(path)?,
+    )?));
+    let output = metrics(&parsed, window);
+    if let Err(error) =
+        stamp.and_then(|stamp| cache::warm(path, stamp, &parsed, window, started_at))
+    {
+        eprintln!("! state cache could not be prepared (queries can rebuild it): {error:#}");
+    }
+    Ok(output)
+}
+
 /// あるrunの状態ログ。nodeごとの、collectorが保存したstdoutのlog。
 pub struct Source {
     pub node: String,
     pub path: PathBuf,
+}
+
+pub fn collector_names(collectors: &[crate::config::CollectorConfig]) -> BTreeSet<String> {
+    collectors
+        .iter()
+        .filter(|collector| {
+            matches!(
+                collector.parser,
+                Some(crate::config::CollectorParser::StateLog)
+            )
+        })
+        .map(|collector| collector.name.clone())
+        .chain(std::iter::once(DELTA_COLLECTOR.into()))
+        .collect()
 }
 
 /// `collectors`は`parser = "state-log"`のcollectorの名前（設定が無いときは[`DELTA_COLLECTOR`]）。
@@ -607,6 +642,73 @@ correlated subquery, filter state_stays by (kind, state, entered_t), and count o
 time with a running sum (SUM(d) OVER (ORDER BY t) over +1 at entered_t and -1 at left_t) \
 instead of counting the stays again for every row";
 
+mod cache;
+pub use cache::prepare_cache_order;
+
+fn insert_events(
+    connection: &Connection,
+    node: &str,
+    parsed: &Parsed,
+    started_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let started = started_at.map(|at| at.timestamp_micros());
+    let mut insert = connection.prepare(
+        "INSERT INTO state_events (node, t, at, since_start_ms, seq, kind, id, from_state, to_state, attrs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    let mut insert_attr = connection.prepare(
+        "INSERT INTO state_attrs (node, t, seq, kind, id, to_state, key, value)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for event in &parsed.events {
+        for (key, value) in event.attrs.iter().flatten() {
+            let value = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                Value::Bool(flag) => flag.to_string(),
+                _ => continue,
+            };
+            insert_attr.execute(rusqlite::params![
+                node, event.t, event.seq, event.kind, event.id, event.to, key, value,
+            ])?;
+        }
+        let at = DateTime::from_timestamp_micros(event.t)
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+            .unwrap_or_default();
+        insert.execute(rusqlite::params![
+            node,
+            event.t,
+            at,
+            started.map(|started| (event.t - started) as f64 / 1_000.0),
+            event.seq,
+            event.kind,
+            event.id,
+            match &event.from {
+                Previous::Created => None,
+                Previous::Known(from) => Some(from.as_str()),
+                Previous::Unknown => Some(UNKNOWN),
+            },
+            event.to,
+            event
+                .attrs
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_window(connection: &Connection, window: Option<Window>) -> Result<()> {
+    if let Some(window) = window {
+        connection.execute(
+            "INSERT INTO state_window (name, start_t, end_t) VALUES (?1, ?2, ?3)",
+            rusqlite::params![window.name, window.start, window.end],
+        )?;
+    }
+    Ok(())
+}
+
 /// あるrunの状態ログを、読み取り専用のin-memory SQLiteへ載せる。
 pub fn load(
     sources: &[Source],
@@ -662,7 +764,12 @@ fn cache_key(
     let mut hasher = Sha256::new();
     hasher.update(env!("CARGO_PKG_VERSION"));
     hasher.update(SCHEMA);
+    hasher.update(cache::VERSION.to_le_bytes());
     for source in sources {
+        hasher.update(format!(
+            "{:?}",
+            cache::SourceStamp::of(&source.path, &source.node).ok()
+        ));
         let metadata = std::fs::metadata(&source.path).ok();
         let modified = metadata
             .as_ref()
@@ -737,10 +844,15 @@ fn build_cache(
     let temporary = cache_dir.join(format!(".{run_id}.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&temporary);
     let built = (|| -> Result<()> {
+        let prepared =
+            cache::copy_prepared(&temporary, sources, window, started_at).unwrap_or(None);
         let mut connection = Connection::open(&temporary)?;
         connection.pragma_update(None, "journal_mode", "OFF")?;
         connection.pragma_update(None, "synchronous", "OFF")?;
-        let (events, invalid_lines, dropped) = build(&mut connection, sources, window, started_at)?;
+        let (events, invalid_lines, dropped) = match prepared {
+            Some(counts) => counts,
+            None => build(&mut connection, sources, window, started_at)?,
+        };
         connection.execute_batch(
             "CREATE TABLE isuscope_cache (key TEXT NOT NULL, events INTEGER NOT NULL, \
              invalid_lines INTEGER NOT NULL, dropped INTEGER NOT NULL)",
@@ -802,73 +914,19 @@ fn build(
     let mut events = 0;
     let mut invalid_lines = 0;
     let mut dropped = 0;
-    let started = started_at.map(|at| at.timestamp_micros());
     {
         let transaction = connection.transaction()?;
-        {
-            let mut insert = transaction.prepare(
-                "INSERT INTO state_events (node, t, at, since_start_ms, seq, kind, id, from_state, to_state, attrs)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            let mut insert_attr = transaction.prepare(
-                "INSERT INTO state_attrs (node, t, seq, kind, id, to_state, key, value)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            for source in sources {
-                let input = std::fs::File::open(&source.path)
-                    .with_context(|| format!("cannot open {}", source.path.display()))?;
-                let decoder = zstd::stream::read::Decoder::new(input)?;
-                let parsed = read(std::io::BufReader::new(decoder));
-                invalid_lines += parsed.invalid_lines;
-                dropped += parsed.dropped;
-                for event in parsed.events {
-                    let at = DateTime::from_timestamp_micros(event.t)
-                        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-                        .unwrap_or_default();
-                    for (key, value) in event.attrs.iter().flatten() {
-                        let value = match value {
-                            Value::String(text) => text.clone(),
-                            Value::Number(number) => number.to_string(),
-                            Value::Bool(flag) => flag.to_string(),
-                            _ => continue,
-                        };
-                        insert_attr.execute(rusqlite::params![
-                            source.node,
-                            event.t,
-                            event.seq,
-                            event.kind,
-                            event.id,
-                            event.to,
-                            key,
-                            value,
-                        ])?;
-                    }
-                    insert.execute(rusqlite::params![
-                        source.node,
-                        event.t,
-                        at,
-                        started.map(|started| (event.t - started) as f64 / 1_000.0),
-                        event.seq,
-                        event.kind,
-                        event.id,
-                        match &event.from {
-                            Previous::Created => None,
-                            Previous::Known(from) => Some(from.as_str()),
-                            Previous::Unknown => Some(UNKNOWN),
-                        },
-                        event.to,
-                        event.attrs.map(|attrs| Value::Object(attrs).to_string()),
-                    ])?;
-                    events += 1;
-                }
-            }
-            if let Some(window) = window {
-                transaction.execute(
-                    "INSERT INTO state_window (name, start_t, end_t) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![window.name, window.start, window.end],
-                )?;
-            }
+        for source in sources {
+            let input = std::fs::File::open(&source.path)
+                .with_context(|| format!("cannot open {}", source.path.display()))?;
+            let decoder = zstd::stream::read::Decoder::new(input)?;
+            let parsed = read(std::io::BufReader::new(decoder));
+            invalid_lines += parsed.invalid_lines;
+            dropped += parsed.dropped;
+            events += parsed.events.len();
+            insert_events(&transaction, &source.node, &parsed, started_at)?;
         }
+        insert_window(&transaction, window)?;
         transaction.commit()?;
     }
     connection.execute_batch(concat!(state_stays!(), state_indexes!()))?;

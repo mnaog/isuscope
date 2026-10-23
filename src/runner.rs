@@ -465,6 +465,26 @@ pub async fn execute(
     // nodeへの操作はここまで。保存の間に次のdeployを始められるよう、共通lockを先に手放す。
     crate::lock::release_run_lock();
 
+    let state_sources = crate::states::sources(
+        &manifest,
+        &staging.join("logs"),
+        &crate::states::collector_names(&config.config.collectors),
+    );
+    if state_sources.len() > 1 {
+        let window = crate::states::Window::of(&manifest.benchmark);
+        let started = manifest.benchmark.started_at;
+        timed("state_cache_finalize", &mut manifest.stages, async {
+            if let Err(error) =
+                crate::states::prepare_cache_order(&staging, &state_sources, window, started)
+            {
+                eprintln!(
+                    "! state cache order could not be prepared (queries can rebuild it): {error:#}"
+                );
+            }
+        })
+        .await;
+    }
+
     if let (Some(start), Some(end)) = (
         manifest.benchmark.initialize_started_at,
         manifest.benchmark.initialize_finished_at,

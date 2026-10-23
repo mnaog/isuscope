@@ -526,7 +526,15 @@ fn finish_output(
         let routes = spec.working_dir.join(".isuscope/routes.toml");
         let parsed = if matches!(parser, CollectorParser::StateLog) {
             // 状態ログは負荷走行（initializeの終わりが分からなければベンチ全体）で集計する。
-            crate::states::parse_collector_output(&stdout_destination, state_window(run_dir))
+            let (window, started) = state_context(run_dir);
+            crate::states::collect(
+                &stdout_destination,
+                spec.node
+                    .as_ref()
+                    .map_or("local", |node| node.name.as_str()),
+                window,
+                started,
+            )
         } else {
             parse_standard_output(
                 &stdout_destination,
@@ -1055,10 +1063,16 @@ fn bucket_grid(run_dir: &Path) -> crate::model::BucketGrid {
         .unwrap_or_default()
 }
 
-fn state_window(run_dir: &Path) -> Option<crate::states::Window> {
-    let manifest: crate::model::RunManifest =
-        serde_json::from_slice(&fs::read(run_dir.join("run.json")).ok()?).ok()?;
-    crate::states::Window::of(&manifest.benchmark)
+fn state_context(run_dir: &Path) -> (Option<crate::states::Window>, Option<chrono::DateTime<Utc>>) {
+    let manifest = fs::read(run_dir.join("run.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<crate::model::RunManifest>(&raw).ok());
+    manifest.map_or((None, None), |manifest| {
+        (
+            crate::states::Window::of(&manifest.benchmark),
+            manifest.benchmark.started_at,
+        )
+    })
 }
 
 fn benchmark_interval(run_dir: &Path) -> Option<(chrono::DateTime<Utc>, chrono::DateTime<Utc>)> {

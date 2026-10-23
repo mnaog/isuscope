@@ -399,7 +399,7 @@ enum RoutesCommand {
 
 #[derive(Subcommand)]
 enum StatesCommand {
-    /// runの状態ログをSQLiteへ載せ（runごとに残し、次からは開くだけ）、読み取り専用のSQLを実行します。表は`--schema`で見ます。
+    /// runの状態ログのSQLiteキャッシュへ読み取り専用のSQLを実行します。表は`--schema`で見ます。
     #[command(after_help = "例:
   isuscope states sql latest \"SELECT kind, to_state, COUNT(*) AS events FROM state_events GROUP BY 1, 2\"
   isuscope states sql latest \"SELECT state, COUNT(*) AS stays, SUM(duration_ms) AS total_ms FROM state_stays WHERE kind = 'ride' GROUP BY 1 ORDER BY total_ms DESC\"
@@ -2228,19 +2228,7 @@ fn show_states(config: &LoadedConfig, command: StatesCommand) -> Result<()> {
     let id = store.require_id(&requested, "run")?;
     let short = runner::short_id(&id).to_owned();
     let manifest = store.load(&id)?;
-    let mut collectors = config
-        .config
-        .collectors
-        .iter()
-        .filter(|collector| {
-            matches!(
-                collector.parser,
-                Some(isuscope::config::CollectorParser::StateLog)
-            )
-        })
-        .map(|collector| collector.name.clone())
-        .collect::<BTreeSet<_>>();
-    collectors.insert(states::DELTA_COLLECTOR.into());
+    let collectors = states::collector_names(&config.config.collectors);
     let sources = states::sources(&manifest, &store.final_dir(&id).join("logs"), &collectors);
     let mut warnings = Vec::new();
     if sources.is_empty() {

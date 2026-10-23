@@ -135,7 +135,7 @@ collectorの定義はisuscopeが配る1つのfile（`templates/config.toml`）�
 | `query` | SQLite上の保存済みmetricを絞り込み、安全な集約JSONで調べる。`--base`で2 runを比べる |
 | `series` | 時刻付きmetricをbucket化したJSONで調べる |
 | `sql` | 保存済みindexへ読み取り専用のSQLを実行する。`--schema`でtable定義、`--format tsv`で表形式 |
-| `states sql` / `states timeline` | アプリの状態ログ（runの生の行）をSQLiteへ載せて読む（runごとに残し、次からは開くだけ）。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
+| `states sql` / `states timeline` | アプリの状態ログをローカルのSQLiteキャッシュから読む。`timeline`は1つの対象の変化と、attrsでつながる対象の変化を時刻順に並べる |
 | `enrich` | 保存済みbenchmark logへ現在のparserを再適用する |
 | `routes suggest [run]` | 動的IDの残るHTTP routeから`[[routes]]`候補を作る。`--output`で書き出し先を指定する |
 | `lock -- <command>` | 変更系操作の共通lockを取ってcommandを実行する。取得済みの子processでは再取得せず、実行時間を`operation-timing.tsv`へ追記する |
@@ -450,7 +450,15 @@ isuscope query latest --base BASE_RUN --metric-prefix state.dwell.total_duration
 isuscope series latest --metric state.occupancy --label kind=ride --label state=MATCHING
 ```
 
-生の行は`states sql`で読みます。runの状態ログをSQLiteへ載せ（`state_events`表、attrsの値を1つずつ持つ`state_attrs`表、区間の`state_window`表、状態にいた時間の`state_stays`表と、それぞれの索引）、読み取り専用のSQLを当てます。作ったSQLiteはdata directoryの`cache/states/`にrunごとに残し（最近使った3 runまで。Gitには入れません）、同じrunの次の問い合わせはそれを開くだけです（40万行・64 MBのlogで、作るのに約4秒、開くのは一瞬）。元のlog・区間・isuscopeの版が変われば作り直します。
+生の行は`states sql`で読みます。runの状態ログをSQLiteへ載せ（`state_events`表、attrsを展開した`state_attrs`表、区間の`state_window`表、状態にいた時間の`state_stays`表と索引）、読み取り専用のSQLを当てます。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
+
+状態ログのcollectorは、手元でmetricを集計するときに同じ解析結果から`runs/<id>/logs/.state-cache/states.sqlite3`も作ります。初回の`states sql`・`timeline`でこれをdata directoryの`cache/states/`へコピーして使い、ログの展開・JSON解析・索引作成を繰り返しません。EC2側の処理や転送量は変わりませんが、ローカルのSQLite作成はcollectorの後処理時間に含まれます。`state_stays`も収集時に計算し、問い合わせ時は指定されたSQLだけを実行します。
+
+複数nodeのcollectorが異なる順で完了した場合は、run保存前にキャッシュ内の行を元の入力順にそろえます。生ログは再解析せず、同じ時刻・通し番号のイベントの順序を保ちます。このローカル処理の時間は`state_cache_finalize`に記録し、nodeの操作ロックを解放した後に行います。
+
+キャッシュは生ログから再生成でき、Gitに含めない`logs/`内に置きます。問い合わせ用の`cache/states/`は最近使った3 runを残します。古いrunやキャッシュを削除したrunは、初回問い合わせ時に生ログからそこへ作成します。入力ログの構成・順序・node・ファイル情報、ベンチの開始時刻・集計区間、キャッシュ形式の版が変わった場合も作り直します。保存できない場合は一時的なin-memory SQLiteへ戻り、計測や問い合わせを続けます。生ログがなくなった場合は、キャッシュだけから以前の行を返しません。
+
+キャッシュは圧縮ログより大きくなります。容量を空けたい場合はrun内の`logs/.state-cache/`を削除できます（作成・問い合わせの実行中は除く）。
 
 1つのSQLは既定で30秒で止め（`--timeout-seconds`、0で無制限。`states timeline`と`isuscope sql`も同じ）、索引を使う書き方を示します。行ごとに相関サブクエリで数え直すSQLは行数の2乗で重くなり、practice-14-seventhでは2分と5分待って手が止まりました。同じ問いは、attrsで結ぶなら`state_attrs`の索引（`key, value, kind, to_state, t`）から引き、ある状態にいる数の推移は`entered_t`で+1・`left_t`で-1した累積和（`SUM(d) OVER (ORDER BY t)`）で数えると、40万行でも0.1〜0.2秒で返ります。1秒ごとの数は`isuscope series latest --metric state.occupancy`にもあります。attrsの値で分ける集計や、問いに合わせた数え方はここで書きます。`timeline`は1つの対象の変化を時刻順に並べ、`--related`でattrsでつながる対象（対象のattrsにあるID、attrsに対象のIDを持つ行）も混ぜます。`gap_ms`は1つ前の行からの経過です。
 

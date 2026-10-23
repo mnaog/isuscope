@@ -111,7 +111,7 @@ pub fn run_limited(
     }
 }
 
-/// `sql`を`connection`で実行し、`limit`行までを返す（`states`の一時的な索引も同じ形で出す）。
+/// `sql`を`connection`で実行し、`limit`行までを返す（`states`の索引も同じ形で出す）。
 pub fn run(
     connection: &Connection,
     sql: &str,

@@ -237,6 +237,18 @@ fn a_run_summarizes_the_state_log_and_keeps_the_raw_lines_queryable() {
         &path,
     );
     assert!(run.status.success(), "{run:?}");
+    let loaded = isuscope::config::LoadedConfig::discover(project.path()).unwrap();
+    let store = isuscope::storage::Store::open(&loaded.data_dir).unwrap();
+    let id = store.require_id("latest", "run").unwrap();
+    let cache = store
+        .final_dir(&id)
+        .join("logs/.state-cache/states.sqlite3");
+    assert!(
+        cache.is_file(),
+        "run must prepare the cache before the first query"
+    );
+    let cache_modified = fs::metadata(&cache).unwrap().modified().unwrap();
+    drop(store);
 
     // 集計metric：r1は迎車（ENROUTE）に600ms、c1はBUSYに600.3ms。
     let brief = isuscope(project.path(), &["brief", "latest"], &path);
@@ -278,6 +290,11 @@ fn a_run_summarizes_the_state_log_and_keeps_the_raw_lines_queryable() {
     assert!(
         counted["warnings"].to_string().contains("dropped 3"),
         "{counted}"
+    );
+    assert_eq!(
+        cache_modified,
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        "the first states query must reuse the collector's cache"
     );
 
     // stayのviewでattrsの値ごとに分けられる。
@@ -422,7 +439,7 @@ fn a_run_summarizes_the_state_log_and_keeps_the_raw_lines_queryable() {
         "{missing}"
     );
 
-    // 一時的な索引も読み取り専用。
+    // キャッシュの索引も読み取り専用。
     let write = isuscope(
         project.path(),
         &["states", "sql", "latest", "DELETE FROM state_events"],
